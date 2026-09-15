@@ -8,7 +8,7 @@
     {
       "name": "agent-relay",
       "source": ".",
-      "description": "Delegate bounded coding work to OpenCode and Antigravity.",
+      "description": "Delegate bounded coding work to OpenCode, Antigravity, and Cursor.",
       "version": "0.2.0",
       "category": "development",
       "tags": ["agents", "delegation", "background-jobs"]

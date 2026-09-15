@@ -8,8 +8,8 @@ Before launching a provider in a restricted host, read [sandbox execution](../..
 Use this skill when delegation fails, a provider is new, or you need to establish which local coding-agent CLIs are usable.
 
 1. Resolve the plugin root as the directory two levels above the directory containing this `SKILL.md`.
-2. Run `agent-relay doctor` when available, otherwise `python3 <plugin-root>/scripts/relay.py doctor`, then run `models --provider opencode` and `models --provider antigravity`.
+2. Run `agent-relay doctor` when available, otherwise `python3 <plugin-root>/scripts/relay.py doctor`, then run `models --provider opencode`, `models --provider antigravity`, and `models --provider cursor` for the installed providers relevant to the task.
 3. For a custom adapter, pass `--provider NAME --adapter-file /abs/path/adapter.json` to both `doctor` and `models`. Add `--probe` when checking the provider's actual help invocation is useful. Built-in probes do not run inference.
 4. Report executable discovery, authentication/configuration status, model IDs, supported effort mappings, and the smallest corrective action. Doctor reports declared effort capabilities, not a live verification of every level. Do not print credentials or modify global CLI configuration.
 
-The supported initial providers are `opencode` and `antigravity`; additional adapters are documented in [adding-adapters.md](../../references/adding-adapters.md).
+The bundled providers are `opencode`, `antigravity`, and `cursor`; additional adapters are documented in [adding-adapters.md](../../references/adding-adapters.md). Before the first Cursor run, locate the stable provider workspace described in the adapter reference, open `cursor-agent` interactively there, and let the user approve Cursor's normal workspace-trust prompt. Never pass `--trust` or use the source workspace.

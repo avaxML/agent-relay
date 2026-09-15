@@ -69,7 +69,7 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
             raise RelayError(f"Adapter {field} must be a nonempty string.")
     if adapter["input"] not in ("file", "stdin", "agy-stream"):
         raise RelayError("Unknown adapter input format.")
-    if adapter["output"] not in ("opencode-jsonl", "agy-jsonl", "text"):
+    if adapter["output"] not in ("opencode-jsonl", "agy-jsonl", "cursor-jsonl", "text"):
         raise RelayError("Unknown adapter output format.")
     for field in ("args", "models_args", "probe_args"):
         value = adapter[field]
@@ -78,7 +78,9 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         for arg in value:
             for _, key, spec, conversion in Formatter().parse(arg):
                 if key is not None and (
-                    key not in {"model", "request_file", "timeout", "workdir"} or spec or conversion
+                    key not in {"model", "request_file", "timeout", "workdir", "provider_workspace"}
+                    or spec
+                    or conversion
                 ):
                     raise RelayError(f"Unsupported argument placeholder: {key}")
     if not isinstance(adapter["env"], dict) or not all(
@@ -327,11 +329,26 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
         results = [e.get("result") for e in events if e.get("event") == "result"]
         if len(results) != 1 or not isinstance(results[0], dict):
             raise RelayError("Antigravity did not return exactly one terminal result.")
-        result = results[0]
-        if result.get("status") != "SUCCESS":
+        agy_result = results[0]
+        if agy_result.get("status") != "SUCCESS":
             raise RelayError("Antigravity reported failure; inspect stdout.log.")
-        answer = result.get("response")
-        metadata = {k: result[k] for k in ("conversation_id", "usage", "duration_seconds") if k in result}
+        answer = agy_result.get("response")
+        metadata = {
+            key: agy_result[key] for key in ("conversation_id", "usage", "duration_seconds") if key in agy_result
+        }
+    elif output == "cursor-jsonl":
+        cursor_results = [event for event in events if event.get("type") == "result"]
+        if len(cursor_results) != 1:
+            raise RelayError("Cursor did not return exactly one terminal result.")
+        cursor_result = cursor_results[0]
+        if cursor_result.get("is_error") or cursor_result.get("subtype") != "success":
+            raise RelayError("Cursor reported failure; inspect stdout.log.")
+        answer = cursor_result.get("result")
+        metadata = {
+            key: cursor_result[key]
+            for key in ("session_id", "request_id", "usage", "duration_ms")
+            if key in cursor_result
+        }
     else:
         if any(e.get("type") == "error" or e.get("error") for e in events):
             raise RelayError("OpenCode reported failure; inspect stdout.log.")

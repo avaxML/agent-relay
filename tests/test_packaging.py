@@ -42,6 +42,7 @@ class PackagingTests(unittest.TestCase):
             "add-cli-adapter",
             "background-tasks",
             "bulk-read",
+            "chaos-monkey",
             "delegate",
             "propose-patch",
             "relay-doctor",
@@ -49,6 +50,9 @@ class PackagingTests(unittest.TestCase):
         }
         actual = {path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")}
         self.assertEqual(actual, expected)
+
+        adapters = {path.stem for path in (ROOT / "adapters").glob("*.json")}
+        self.assertEqual(adapters, {"antigravity", "cursor", "opencode"})
 
     def test_release_tag_must_match_every_manifest(self) -> None:
         self.assertEqual(set(validate_release("v0.2.0", ROOT).values()), {"0.2.0"})

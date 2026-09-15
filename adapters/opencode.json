@@ -1,0 +1,48 @@
+{
+  "name": "opencode",
+  "executable": "opencode",
+  "default_model": "opencode-go/deepseek-v4.1-flash",
+  "args": [
+    "run",
+    "--standalone",
+    "--model",
+    "{model}",
+    "--format",
+    "json",
+    "--file",
+    "{request_file}",
+    "Read the attached JSON task and sources. Follow its instructions. Return the requested answer without tools."
+  ],
+  "input": "file",
+  "output": "opencode-jsonl",
+  "env": {
+    "OPENCODE_CONFIG_CONTENT": "{\"permission\":{\"*\":\"deny\"}}"
+  },
+  "models_args": [
+    "models",
+    "--standalone"
+  ],
+  "probe_args": [
+    "run",
+    "--help"
+  ],
+  "effort": {
+    "models": [
+      "opencode-go/deepseek-v4.1-flash"
+    ],
+    "levels": {
+      "low": {
+        "model": "{model}#low"
+      },
+      "medium": {
+        "model": "{model}#medium"
+      },
+      "high": {
+        "model": "{model}#high"
+      },
+      "max": {
+        "model": "{model}#max"
+      }
+    }
+  }
+}

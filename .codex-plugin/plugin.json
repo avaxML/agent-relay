@@ -1,0 +1,27 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "description": "Delegate bounded coding tasks to OpenCode, Antigravity, and extensible CLI adapters.",
+  "author": {
+    "name": "avaxML",
+    "url": "https://github.com/avaxML"
+  },
+  "homepage": "https://github.com/avaxML/agent-relay",
+  "repository": "https://github.com/avaxML/agent-relay",
+  "license": "MIT",
+  "keywords": ["agents", "delegation", "opencode", "antigravity"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Relay",
+    "shortDescription": "Delegate coding work across agent CLIs.",
+    "longDescription": "Delegate bulk reading, independent review, and patch proposals to OpenCode or Antigravity. Choose reasoning effort, run detached jobs, inspect status, collect results, and cancel work through extensible CLI adapters.",
+    "developerName": "avaxML",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Run coding agents in the background and collect their results.",
+      "Get an independent review using OpenCode.",
+      "Add another coding-agent CLI adapter."
+    ]
+  }
+}

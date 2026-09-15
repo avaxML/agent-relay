@@ -1,0 +1,17 @@
+{
+  "name": "agent-relay",
+  "description": "Cross-agent delegation plugins from avaxML",
+  "owner": {
+    "name": "avaxML"
+  },
+  "plugins": [
+    {
+      "name": "agent-relay",
+      "source": ".",
+      "description": "Delegate bounded coding work to OpenCode and Antigravity.",
+      "version": "0.1.0",
+      "category": "development",
+      "tags": ["agents", "delegation", "background-jobs"]
+    }
+  ]
+}

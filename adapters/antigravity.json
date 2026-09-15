@@ -1,0 +1,60 @@
+{
+  "name": "antigravity",
+  "executable": "agy",
+  "default_model": "gemini-3.8-flash-low",
+  "args": [
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "{model}",
+    "--mode",
+    "plan",
+    "--sandbox",
+    "--print-timeout",
+    "{timeout}s",
+    "--log-file",
+    "{workdir}/agy.log",
+    "--print="
+  ],
+  "input": "agy-stream",
+  "output": "agy-jsonl",
+  "env": {},
+  "models_args": [
+    "models"
+  ],
+  "probe_args": [
+    "--help"
+  ],
+  "effort": {
+    "models": [
+      "gemini-3.8-flash-low",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-high"
+    ],
+    "levels": {
+      "low": {
+        "args": [
+          "--effort",
+          "low"
+        ],
+        "model": "gemini-3.8-flash-low"
+      },
+      "medium": {
+        "args": [
+          "--effort",
+          "medium"
+        ],
+        "model": "gemini-3.8-flash-medium"
+      },
+      "high": {
+        "args": [
+          "--effort",
+          "high"
+        ],
+        "model": "gemini-3.8-flash-high"
+      }
+    }
+  }
+}

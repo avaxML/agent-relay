@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+plugin_root="$(cd "$(dirname "$0")/.." && pwd)"
+exec python3 "$plugin_root/scripts/relay.py" "$@"

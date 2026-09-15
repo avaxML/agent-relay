@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import shutil
 import stat
+import sys
 import tomllib
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from validate_release import validate_release
 
 
 class PackagingTests(unittest.TestCase):
@@ -43,6 +49,20 @@ class PackagingTests(unittest.TestCase):
         }
         actual = {path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")}
         self.assertEqual(actual, expected)
+
+    def test_release_tag_must_match_every_manifest(self) -> None:
+        self.assertEqual(set(validate_release("v0.2.0", ROOT).values()), {"0.2.0"})
+
+        with TemporaryDirectory() as directory:
+            copy = Path(directory)
+            for source in (".codex-plugin", ".claude-plugin"):
+                shutil.copytree(ROOT / source, copy / source)
+            shutil.copy2(ROOT / "pyproject.toml", copy / "pyproject.toml")
+            manifest = json.loads((copy / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+            manifest["version"] = "9.9.9"
+            (copy / ".codex-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Codex manifest=9.9.9"):
+                validate_release("v0.2.0", copy)
 
 
 if __name__ == "__main__":

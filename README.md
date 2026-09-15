@@ -120,6 +120,12 @@ Live checks use the configured provider subscription. Each initial adapter retur
 
 An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. Both providers also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all seven skill validators passed.
 
+## Releases
+
+Codex and Claude Code both install Agent Relay from this Git repository. To publish a release, update the version in `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `pyproject.toml`, then refresh `uv.lock`. Merge the release commit before creating a matching `vMAJOR.MINOR.PATCH` tag.
+
+Pushing the tag runs the release workflow. The workflow verifies every published version, runs the complete check suite, and creates a GitHub release with generated notes. Claude Code users receive the new cached version when marketplace auto-update runs or when they run `claude plugin marketplace update agent-relay`. Codex users refresh the Git marketplace through Codex's plugin update flow.
+
 ## Background jobs
 
 Use the `background-tasks` skill when a worker may take longer than the current turn or when several independent relay tasks should run concurrently. The job lifecycle is `queued`, `running`, `cancelling`, `completed`, `failed`, `cancelled`, or `interrupted`. A completed job maps the existing worker result status to `ok`; pending results are distinguishable from failures.

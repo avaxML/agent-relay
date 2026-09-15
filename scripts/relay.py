@@ -14,10 +14,16 @@ from typing import Any
 
 import jobs
 from execution import execute
-from providers import RelayError, load_adapter
+from providers import (
+    RelayError,
+    install_adapter,
+    list_adapters,
+    load_adapter,
+    read_adapter,
+    remove_adapter,
+    resolve_adapter_path,
+)
 from task_runner import KINDS, run
-
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
 
 def positive_int(value: str) -> int:
@@ -34,8 +40,14 @@ def nonnegative_int(value: str) -> int:
     return number
 
 
-def inspect_provider(name: str, custom: Path | None, probe: bool, models: bool = False) -> dict[str, Any]:
-    adapter = load_adapter(name, custom)
+def inspect_provider(
+    name: str,
+    custom: Path | None,
+    registry_dir: Path | None,
+    probe: bool,
+    models: bool = False,
+) -> dict[str, Any]:
+    adapter = load_adapter(name, custom, registry_dir)
     executable = shutil.which(adapter["executable"])
     result: dict[str, Any] = {
         "provider": name,
@@ -60,6 +72,14 @@ def inspect_provider(name: str, custom: Path | None, probe: bool, models: bool =
     return result
 
 
+def adapter_validation_target(value: str, registry_dir: Path | None) -> tuple[str, Path | None]:
+    path = Path(value).expanduser()
+    if path.is_absolute() or path.parent != Path(".") or path.suffix == ".json" or path.exists() or path.is_symlink():
+        adapter = read_adapter(path)
+        return adapter["name"], path
+    return value, None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -67,6 +87,7 @@ def main() -> int:
         sub = commands.add_parser(command)
         sub.add_argument("--provider", required=command != "doctor")
         sub.add_argument("--adapter-file", type=Path)
+        sub.add_argument("--registry-dir", type=Path)
         if command == "doctor":
             sub.add_argument("--probe", action="store_true", help="Run CLI help, without inference.")
         if command in ("run", "submit"):
@@ -86,6 +107,21 @@ def main() -> int:
             sub.add_argument("--max-answer-chars", type=positive_int, default=12000)
         if command == "submit":
             sub.add_argument("--jobs-dir", type=Path)
+    adapter = commands.add_parser("adapter")
+    adapter_commands = adapter.add_subparsers(dest="adapter_command", required=True)
+    install = adapter_commands.add_parser("install")
+    install.add_argument("path", type=Path)
+    install.add_argument("--replace", action="store_true")
+    install.add_argument("--registry-dir", type=Path)
+    listing = adapter_commands.add_parser("list")
+    listing.add_argument("--registry-dir", type=Path)
+    validate = adapter_commands.add_parser("validate")
+    validate.add_argument("name_or_path")
+    validate.add_argument("--probe", action="store_true")
+    validate.add_argument("--registry-dir", type=Path)
+    remove = adapter_commands.add_parser("remove")
+    remove.add_argument("name")
+    remove.add_argument("--registry-dir", type=Path)
     for command in ("status", "wait", "result", "cancel"):
         sub = commands.add_parser(command)
         sub.add_argument("job_id")
@@ -95,8 +131,26 @@ def main() -> int:
                 "--timeout", type=nonnegative_int, default=30, help="Wait deadline; does not cancel the job."
             )
     args = parser.parse_args()
+    result: dict[str, Any]
     try:
-        if args.command == "run":
+        if args.command == "adapter":
+            if args.adapter_command == "install":
+                result = install_adapter(args.path, args.registry_dir, args.replace)
+                code = 0
+            elif args.adapter_command == "list":
+                result = {"adapters": list_adapters(args.registry_dir)}
+                code = 0
+            elif args.adapter_command == "remove":
+                result = remove_adapter(args.name, args.registry_dir)
+                code = 0
+            else:
+                name, custom = adapter_validation_target(args.name_or_path, args.registry_dir)
+                result = inspect_provider(name, custom, args.registry_dir, args.probe)
+                result["status"] = "valid"
+                path, source = resolve_adapter_path(name, custom, args.registry_dir)
+                result.update(path=str(path), source=source)
+                code = 0 if not args.probe or result["installed"] and result.get("exit_code") == 0 else 1
+        elif args.command == "run":
             result = run(args)
             code = 0 if result["status"] == "ok" else 1
         elif args.command == "submit":
@@ -118,13 +172,17 @@ def main() -> int:
             if args.adapter_file and not args.provider:
                 raise RelayError("--adapter-file requires --provider.")
             names = (
-                [args.provider]
-                if args.provider
-                else [p.stem for p in sorted((PLUGIN_ROOT / "adapters").glob("*.json"))]
+                [args.provider] if args.provider else [record["name"] for record in list_adapters(args.registry_dir)]
             )
             result = {
                 "providers": [
-                    inspect_provider(n, args.adapter_file, getattr(args, "probe", False), args.command == "models")
+                    inspect_provider(
+                        n,
+                        args.adapter_file,
+                        args.registry_dir,
+                        getattr(args, "probe", False),
+                        args.command == "models",
+                    )
                     for n in names
                 ]
             }

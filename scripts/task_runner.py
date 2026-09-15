@@ -103,7 +103,7 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
-    adapter = load_adapter(args.provider, args.adapter_file)
+    adapter = load_adapter(args.provider, args.adapter_file, getattr(args, "registry_dir", None))
     executable = shutil.which(adapter["executable"])
     if not executable:
         raise RelayError(f"CLI not found: {adapter['executable']}")

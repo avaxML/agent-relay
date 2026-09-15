@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -62,8 +64,10 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stdout)
         self.assertEqual(json.loads(installed.stdout)["status"], "installed")
         entry = self.registry / "custom.json"
+        lock = self.registry / ".custom.lock"
         self.assertEqual(stat.S_IMODE(self.registry.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(entry.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
 
         source.unlink()
         self.assertEqual(load_adapter("custom", registry_dir=self.registry)["default_model"], "test-model")
@@ -106,6 +110,36 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertEqual(invalid.returncode, 1)
         self.assertEqual(load_adapter("custom", registry_dir=self.registry)["default_model"], "replacement")
 
+    def test_concurrent_changed_installs_allow_exactly_one_new_registration(self) -> None:
+        models = [f"model-{index}" for index in range(8)]
+        sources = []
+        for model in models:
+            source = self.directory / f"source-{model}.json"
+            source.write_text(
+                json.dumps(adapter_payload("concurrent", default_model=model), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            sources.append(source)
+
+        start = threading.Barrier(len(sources))
+
+        def install(source: Path) -> subprocess.CompletedProcess[str]:
+            start.wait()
+            return self.relay("adapter", "install", str(source), "--registry-dir", str(self.registry))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as executor:
+            results = list(executor.map(install, sources))
+
+        successes = [(model, result) for model, result in zip(models, results, strict=True) if result.returncode == 0]
+        self.assertEqual(
+            len(successes),
+            1,
+            [(result.returncode, result.stdout) for result in results],
+        )
+        winner, result = successes[0]
+        self.assertEqual(json.loads(result.stdout)["status"], "installed")
+        self.assertEqual(load_adapter("concurrent", registry_dir=self.registry)["default_model"], winner)
+
     def test_explicit_adapter_file_precedes_registered_adapter(self) -> None:
         registered = self.write_adapter("custom")
         self.assertEqual(
@@ -146,6 +180,12 @@ class AdapterRegistryTests(unittest.TestCase):
             load_adapter("custom", registry_dir=self.registry)
         with self.assertRaisesRegex(RelayError, "symlink"):
             list_adapters(self.registry)
+
+        locked_source = self.write_adapter("locked")
+        (self.registry / ".locked.lock").symlink_to(locked_source)
+        locked_result = self.relay("adapter", "install", str(locked_source), "--registry-dir", str(self.registry))
+        self.assertEqual(locked_result.returncode, 1)
+        self.assertIn("symlink", json.loads(locked_result.stdout)["error"])
 
         shadow_registry = self.directory / "shadow-registry"
         shadow_registry.mkdir()

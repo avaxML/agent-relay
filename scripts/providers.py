@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import stat
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from string import Formatter
 from typing import Any
@@ -190,6 +194,25 @@ def _atomic_write(path: Path, data: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+@contextmanager
+def _provider_lock(registry: Path, name: str) -> Iterator[None]:
+    lock_path = registry / f".{name}.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if lock_path.is_symlink():
+            raise RelayError(f"Adapter lock must not be a symlink: {lock_path}") from exc
+        raise RelayError(f"Could not open adapter lock {lock_path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RelayError(f"Adapter lock must be a regular file: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.lockf(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def install_adapter(source: Path, registry_dir: Path | None = None, replace: bool = False) -> dict[str, str]:
     if source.is_symlink():
         raise RelayError(f"Adapter source must not be a symlink: {source}")
@@ -199,23 +222,24 @@ def install_adapter(source: Path, registry_dir: Path | None = None, replace: boo
         raise RelayError(f"Cannot register bundled provider: {name}")
     registry = _ensure_registry_directory(registry_dir)
     destination = registry / f"{name}.json"
-    if destination.is_symlink():
-        raise RelayError(f"Registered adapter must not be a symlink: {destination}")
-    if destination.exists():
-        if not destination.is_file():
-            raise RelayError(f"Registered adapter must be a regular file: {destination}")
-        try:
-            existing = read_adapter(destination, name)
-        except RelayError:
+    with _provider_lock(registry, name):
+        if destination.is_symlink():
+            raise RelayError(f"Registered adapter must not be a symlink: {destination}")
+        if destination.exists():
+            if not destination.is_file():
+                raise RelayError(f"Registered adapter must be a regular file: {destination}")
+            try:
+                existing = read_adapter(destination, name)
+            except RelayError:
+                if not replace:
+                    raise RelayError(f"Registered adapter is invalid: {name}; use --replace.") from None
+            else:
+                if existing == adapter:
+                    destination.chmod(0o600)
+                    return {"status": "unchanged", "provider": name, "path": str(destination)}
             if not replace:
-                raise RelayError(f"Registered adapter is invalid: {name}; use --replace.") from None
-        else:
-            if existing == adapter:
-                destination.chmod(0o600)
-                return {"status": "unchanged", "provider": name, "path": str(destination)}
-        if not replace:
-            raise RelayError(f"Adapter already registered with different content: {name}; use --replace.")
-    _atomic_write(destination, data)
+                raise RelayError(f"Adapter already registered with different content: {name}; use --replace.")
+        _atomic_write(destination, data)
     return {"status": "installed", "provider": name, "path": str(destination)}
 
 

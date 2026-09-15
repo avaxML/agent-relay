@@ -31,6 +31,6 @@ Independent jobs have distinct directories and artifacts and may run concurrentl
 
 The worker inherits the invoking environment and CLI credentials. Job snapshots, logs, terminal results, and provider session history can contain sensitive source material. Local job files do not provide hard OS isolation.
 
-The bundled Cursor adapter uses `--trust` only inside the detached runner's fresh temporary cwd containing the packaged request. Do not point Cursor at the source project workspace or add broader approval flags when submitting a background job.
+The bundled Cursor adapter uses the stable Relay-owned workspace that the user explicitly trusted during setup. It never passes `--trust`. Do not point Cursor at the source project workspace or add approval flags when submitting a background job.
 
 For ordinary one-shot delegation, use [delegate](../delegate/SKILL.md). For adapter flags and provider configuration, read [adding-adapters.md](../../references/adding-adapters.md).

@@ -78,7 +78,9 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         for arg in value:
             for _, key, spec, conversion in Formatter().parse(arg):
                 if key is not None and (
-                    key not in {"model", "request_file", "timeout", "workdir"} or spec or conversion
+                    key not in {"model", "request_file", "timeout", "workdir", "provider_workspace"}
+                    or spec
+                    or conversion
                 ):
                     raise RelayError(f"Unsupported argument placeholder: {key}")
     if not isinstance(adapter["env"], dict) or not all(

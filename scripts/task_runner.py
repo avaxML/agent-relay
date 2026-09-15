@@ -39,6 +39,24 @@ KINDS = {
 }
 
 
+def provider_workspace(name: str) -> Path:
+    configured = os.environ.get("AGENT_RELAY_PROVIDER_WORKSPACES_DIR")
+    if configured:
+        root = Path(configured).expanduser()
+    elif state_home := os.environ.get("XDG_STATE_HOME"):
+        root = Path(state_home).expanduser() / "agent-relay" / "providers"
+    else:
+        root = Path.home() / ".local" / "state" / "agent-relay" / "providers"
+    workspace = root / name
+    if workspace.is_symlink():
+        raise RelayError(f"Provider workspace must not be a symlink: {workspace}")
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not workspace.is_dir():
+        raise RelayError(f"Provider workspace must be a directory: {workspace}")
+    workspace.chmod(0o700)
+    return workspace.resolve()
+
+
 def build_request(
     root: Path, files: list[str], task: Path, kind: str, max_bytes: int
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -164,6 +182,11 @@ def run_prepared(
                 "request_file": str(request_file),
                 "timeout": str(task["timeout"]),
                 "workdir": str(workdir),
+                "provider_workspace": (
+                    str(provider_workspace(adapter["name"]))
+                    if any("{provider_workspace}" in argument for argument in adapter["args"])
+                    else str(workdir)
+                ),
             }
             argv = [adapter["executable"]] + [arg.format_map(values) for arg in adapter["args"]] + task["effort_args"]
             code = execute(

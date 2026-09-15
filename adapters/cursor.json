@@ -4,7 +4,8 @@
   "default_model": "cursor-grok-4.6-high",
   "args": [
     "-p",
-    "--trust",
+    "--workspace",
+    "{provider_workspace}",
     "--mode",
     "ask",
     "--sandbox",

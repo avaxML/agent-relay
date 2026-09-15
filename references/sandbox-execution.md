@@ -4,7 +4,7 @@ Relay artifacts and provider runtime files are separate. A writable job director
 
 The installed OpenCode CLI writes `~/.local/share/opencode/log/opencode.log` even for `run --help`. Antigravity starts a localhost listener and can write runtime files under `~/.gemini/antigravity-cli`; Relay already redirects its supported CLI log to the temporary workspace, which does not remove the listener requirement.
 
-The bundled Cursor adapter uses `--trust` only because Relay launches `cursor-agent` from a fresh temporary cwd containing the packaged request rather than from the source project. It also selects ask mode and enables Cursor's sandbox. This does not make the provider an OS-sandboxed process: it inherits the caller's filesystem and network permissions. Never set the source project as Cursor's working directory or add broader approval flags.
+The bundled Cursor adapter never passes `--trust`. It points `cursor-agent` at a stable Relay-owned empty provider workspace, selects ask mode, and enables Cursor's sandbox. The user must approve Cursor's normal trust prompt in that directory once before unattended runs. This does not make the provider an OS-sandboxed process: it inherits the caller's filesystem and network permissions. Never set the source project as Cursor's working directory or add approval flags.
 
 ## Before invoking a provider
 

@@ -8,13 +8,14 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from execution import execute
 from providers import RelayError, decode_response, load_adapter
-from task_runner import build_request, run
+from task_runner import build_request, provider_workspace, run
 
 
 class RelayTestCase(unittest.TestCase):
@@ -263,7 +264,10 @@ class RunIntegrationTests(RelayTestCase):
         (self.root / "source.txt").write_text("source", encoding="utf-8")
         output = self.directory / "cursor-artifacts"
         old_path = os.environ.get("PATH", "")
+        old_workspaces = os.environ.get("AGENT_RELAY_PROVIDER_WORKSPACES_DIR")
+        workspaces = self.directory / "provider-workspaces"
         os.environ["PATH"] = f"{script.parent}:{old_path}"
+        os.environ["AGENT_RELAY_PROVIDER_WORKSPACES_DIR"] = str(workspaces)
         try:
             result = run(
                 type(
@@ -288,6 +292,10 @@ class RunIntegrationTests(RelayTestCase):
             )
         finally:
             os.environ["PATH"] = old_path
+            if old_workspaces is None:
+                os.environ.pop("AGENT_RELAY_PROVIDER_WORKSPACES_DIR", None)
+            else:
+                os.environ["AGENT_RELAY_PROVIDER_WORKSPACES_DIR"] = old_workspaces
 
         self.assertEqual(result["status"], "ok")
         answer = json.loads(result["answer"])
@@ -295,7 +303,8 @@ class RunIntegrationTests(RelayTestCase):
             answer["argv"],
             [
                 "-p",
-                "--trust",
+                "--workspace",
+                str((workspaces / "cursor").resolve()),
                 "--mode",
                 "ask",
                 "--sandbox",
@@ -310,6 +319,19 @@ class RunIntegrationTests(RelayTestCase):
         self.assertEqual(answer["cwd_files"], ["request.json", "stdin.jsonl"])
         self.assertFalse(answer["workspace_source_visible"])
         self.assertEqual(result["metadata"]["session_id"], "s1")
+        self.assertEqual(stat.S_IMODE((workspaces / "cursor").stat().st_mode), 0o700)
+
+    def test_provider_workspace_rejects_symlink(self) -> None:
+        workspaces = self.directory / "provider-workspaces"
+        workspaces.mkdir()
+        target = self.directory / "target"
+        target.mkdir()
+        (workspaces / "cursor").symlink_to(target, target_is_directory=True)
+        with (
+            patch.dict(os.environ, {"AGENT_RELAY_PROVIDER_WORKSPACES_DIR": str(workspaces)}),
+            self.assertRaisesRegex(RelayError, "must not be a symlink"),
+        ):
+            provider_workspace("cursor")
 
     def test_run_uses_stdin_and_truncates_answer_while_writing_full_artifact(self) -> None:
         script = self.directory / "fake-cli"

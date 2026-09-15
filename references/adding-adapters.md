@@ -1,8 +1,8 @@
 # Adding a CLI adapter
 
-Agent Relay keeps provider wiring declarative. The runner currently has built-in `opencode` and `antigravity` adapters. An external adapter is a single JSON object passed with `--adapter-file`; it is selected for that invocation and does not modify the plugin.
+Agent Relay keeps provider wiring declarative. The runner has built-in `opencode` and `antigravity` adapters. An external adapter is one JSON object. Install it in the user registry for repeated use, or pass it with `--adapter-file` for one invocation.
 
-Adapter files are trusted execution configuration: they select an executable, its arguments, and environment overrides. Do not load an adapter discovered inside untrusted source content. Keep custom adapters outside the installed plugin cache so reinstalling the plugin does not remove them.
+Adapter files are trusted execution configuration because they select an executable, its arguments, and environment overrides. Do not install an adapter discovered inside untrusted source content. The registry lives outside the installed plugin cache, so plugin reinstall does not remove it.
 
 ## Adapter shape
 
@@ -44,12 +44,20 @@ Existing adapters need no change. To support `--effort`, add a verified mapping 
 
 ## Invocation
 
-Resolve the plugin root as the directory two levels above the directory containing a skill's `SKILL.md`. Use absolute paths for the task file, repository root, output directory, and adapter file:
+Resolve the plugin root as the directory two levels above the directory containing a skill's `SKILL.md`. Validate and install the adapter before a real task:
+
+```sh
+python3 <plugin-root>/scripts/relay.py adapter validate /abs/path/my-cli.json
+python3 <plugin-root>/scripts/relay.py adapter install /abs/path/my-cli.json
+python3 <plugin-root>/scripts/relay.py adapter validate my-cli --probe
+python3 <plugin-root>/scripts/relay.py models --provider my-cli
+```
+
+Use absolute paths for the task file, repository root, and output directory:
 
 ```sh
 python3 <plugin-root>/scripts/relay.py run \
   --provider my-cli \
-  --adapter-file /abs/path/my-cli.json \
   --model provider/model \
   --task-file /abs/path/task.txt \
   --root /abs/path/repository \
@@ -58,7 +66,11 @@ python3 <plugin-root>/scripts/relay.py run \
   --kind read
 ```
 
-Use `doctor --provider my-cli --adapter-file /abs/path/my-cli.json --probe` and `models --provider my-cli --adapter-file /abs/path/my-cli.json` before a real task. The runner executes in an isolated temporary working directory, packages explicit text files with SHA-256 hashes and numbered lines, and writes `result.json`, `answer.txt`, `stdout.log`, and `stderr.log` under a fresh private output directory. A result preview and explicit truncation metadata are returned. The runner never applies patches.
+Use `--adapter-file /abs/path/my-cli.json` on `run`, `submit`, `doctor`, or `models` when you want a one-invocation definition. The explicit file takes precedence over the registry. A registered file takes precedence over the bundled directory. Registered names cannot match bundled names.
+
+The registry stores each provider at `<registry>/<name>.json`. Agent Relay uses `AGENT_RELAY_ADAPTERS_DIR`, then `$XDG_CONFIG_HOME/agent-relay/adapters`, then `~/.config/agent-relay/adapters`. Pass `--registry-dir PATH` to use another directory. `adapter list` reports bundled and registered definitions. Reinstalling identical content succeeds. Changed content requires `adapter install PATH --replace`. `adapter remove NAME` removes only a registered definition and succeeds when that definition is already absent.
+
+The runner executes in an isolated temporary working directory, packages explicit text files with SHA-256 hashes and numbered lines, and writes `result.json`, `answer.txt`, `stdout.log`, and `stderr.log` under a fresh private output directory. It returns a result preview and explicit truncation metadata. The runner never applies patches.
 
 ## Built-in defaults
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from string import Formatter
 from typing import Any
@@ -16,11 +18,33 @@ class RelayCancelled(RelayError):
     """The owner requested that the worker stop."""
 
 
-def load_adapter(name: str, custom: Path | None = None) -> dict[str, Any]:
-    path = custom or Path(__file__).resolve().parent.parent / "adapters" / f"{name}.json"
+def bundled_adapter_directory() -> Path:
+    return Path(__file__).resolve().parent.parent / "adapters"
+
+
+def registry_directory(given: Path | None = None) -> Path:
+    if given is not None:
+        path = given.expanduser()
+    elif configured := os.environ.get("AGENT_RELAY_ADAPTERS_DIR"):
+        path = Path(configured).expanduser()
+    elif configured := os.environ.get("XDG_CONFIG_HOME"):
+        path = Path(configured).expanduser() / "agent-relay" / "adapters"
+    else:
+        path = Path.home() / ".config" / "agent-relay" / "adapters"
+    if path.is_symlink():
+        raise RelayError(f"Adapter registry must not be a symlink: {path}")
+    if path.exists() and not path.is_dir():
+        raise RelayError(f"Adapter registry must be a directory: {path}")
+    return path.resolve()
+
+
+def validate_provider_name(name: str) -> None:
     if not name or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in name):
         raise RelayError("Provider names use lowercase letters, digits and hyphens.")
-    adapter = json.loads(path.read_text())
+
+
+def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
+    validate_provider_name(name)
     required = {
         "name",
         "executable",
@@ -62,6 +86,153 @@ def load_adapter(name: str, custom: Path | None = None) -> dict[str, Any]:
     if "effort" in adapter:
         validate_effort(adapter["effort"])
     return adapter
+
+
+def _read_adapter_data(path: Path, expected_name: str | None = None) -> tuple[dict[str, Any], bytes]:
+    if path.is_symlink():
+        raise RelayError(f"Adapter file must not be a symlink: {path}")
+    if not path.is_file():
+        raise RelayError(f"Adapter file not found: {path}")
+    try:
+        data = path.read_bytes()
+        adapter = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RelayError(f"Could not read adapter JSON {path}: {exc}") from exc
+    name = expected_name if expected_name is not None else adapter.get("name") if isinstance(adapter, dict) else None
+    if not isinstance(name, str):
+        raise RelayError("Adapter name must be a nonempty string.")
+    return validate_adapter(adapter, name), data
+
+
+def read_adapter(path: Path, expected_name: str | None = None) -> dict[str, Any]:
+    adapter, _data = _read_adapter_data(path, expected_name)
+    return adapter
+
+
+def bundled_adapter_names() -> set[str]:
+    return {path.stem for path in bundled_adapter_directory().glob("*.json")}
+
+
+def resolve_adapter_path(name: str, custom: Path | None = None, registry_dir: Path | None = None) -> tuple[Path, str]:
+    validate_provider_name(name)
+    if custom is not None:
+        return custom.expanduser(), "explicit"
+    registered = registry_directory(registry_dir) / f"{name}.json"
+    if registered.is_symlink():
+        raise RelayError(f"Registered adapter must not be a symlink: {registered}")
+    if registered.exists():
+        if name in bundled_adapter_names():
+            raise RelayError(f"Registered adapter shadows bundled provider: {name}")
+        if not registered.is_file():
+            raise RelayError(f"Registered adapter must be a regular file: {registered}")
+        return registered, "registered"
+    bundled = bundled_adapter_directory() / f"{name}.json"
+    if bundled.is_file() and not bundled.is_symlink():
+        return bundled, "bundled"
+    raise RelayError(f"Adapter not found: {name}")
+
+
+def load_adapter(name: str, custom: Path | None = None, registry_dir: Path | None = None) -> dict[str, Any]:
+    path, _source = resolve_adapter_path(name, custom, registry_dir)
+    return read_adapter(path, name)
+
+
+def list_adapters(registry_dir: Path | None = None) -> list[dict[str, str]]:
+    paths: dict[str, tuple[Path, str]] = {
+        name: (bundled_adapter_directory() / f"{name}.json", "bundled") for name in bundled_adapter_names()
+    }
+    registry = registry_directory(registry_dir)
+    if registry.exists():
+        for path in registry.glob("*.json"):
+            if path.is_symlink():
+                raise RelayError(f"Registered adapter must not be a symlink: {path}")
+            if not path.is_file():
+                raise RelayError(f"Registered adapter must be a regular file: {path}")
+            validate_provider_name(path.stem)
+            if path.stem in paths:
+                raise RelayError(f"Registered adapter shadows bundled provider: {path.stem}")
+            paths[path.stem] = (path, "registered")
+    records = []
+    for name, (path, source) in sorted(paths.items()):
+        adapter = read_adapter(path, name)
+        records.append(
+            {
+                "name": name,
+                "source": source,
+                "path": str(path),
+                "executable": adapter["executable"],
+                "default_model": adapter["default_model"],
+            }
+        )
+    return records
+
+
+def _ensure_registry_directory(given: Path | None) -> Path:
+    registry = registry_directory(given)
+    registry.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if registry.is_symlink() or not registry.is_dir():
+        raise RelayError(f"Adapter registry must be a regular directory: {registry}")
+    registry.chmod(0o700)
+    return registry
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def install_adapter(source: Path, registry_dir: Path | None = None, replace: bool = False) -> dict[str, str]:
+    if source.is_symlink():
+        raise RelayError(f"Adapter source must not be a symlink: {source}")
+    adapter, data = _read_adapter_data(source)
+    name = adapter["name"]
+    if name in bundled_adapter_names():
+        raise RelayError(f"Cannot register bundled provider: {name}")
+    registry = _ensure_registry_directory(registry_dir)
+    destination = registry / f"{name}.json"
+    if destination.is_symlink():
+        raise RelayError(f"Registered adapter must not be a symlink: {destination}")
+    if destination.exists():
+        if not destination.is_file():
+            raise RelayError(f"Registered adapter must be a regular file: {destination}")
+        try:
+            existing = read_adapter(destination, name)
+        except RelayError:
+            if not replace:
+                raise RelayError(f"Registered adapter is invalid: {name}; use --replace.") from None
+        else:
+            if existing == adapter:
+                destination.chmod(0o600)
+                return {"status": "unchanged", "provider": name, "path": str(destination)}
+        if not replace:
+            raise RelayError(f"Adapter already registered with different content: {name}; use --replace.")
+    _atomic_write(destination, data)
+    return {"status": "installed", "provider": name, "path": str(destination)}
+
+
+def remove_adapter(name: str, registry_dir: Path | None = None) -> dict[str, str]:
+    validate_provider_name(name)
+    if name in bundled_adapter_names():
+        raise RelayError(f"Cannot remove bundled provider: {name}")
+    registry = registry_directory(registry_dir)
+    destination = registry / f"{name}.json"
+    if destination.is_symlink():
+        raise RelayError(f"Registered adapter must not be a symlink: {destination}")
+    if not destination.exists():
+        return {"status": "absent", "provider": name, "path": str(destination)}
+    if not destination.is_file():
+        raise RelayError(f"Registered adapter must be a regular file: {destination}")
+    destination.unlink()
+    return {"status": "removed", "provider": name, "path": str(destination)}
 
 
 def validate_effort(config: Any) -> None:

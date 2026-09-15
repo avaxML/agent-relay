@@ -3,6 +3,8 @@
 [![CI](https://github.com/avaxML/agent-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/avaxML/agent-relay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+![Agent Relay routes a bounded coding task to multiple coding-agent CLIs and collects their artifacts.](assets/agent-relay-flow.png)
+
 Agent Relay lets a lead coding agent delegate bounded inspection and review work to locally installed coding-agent CLIs. It is designed for I/O-heavy work: the relay packages explicit files, sends them through a provider adapter, and returns a bounded, inspectable result without applying patches.
 
 The initial adapters are:

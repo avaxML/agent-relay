@@ -20,6 +20,12 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(codex["version"], marketplace["plugins"][0]["version"])
         self.assertEqual(marketplace["plugins"][0]["source"], ".")
 
+        interface = codex["interface"]
+        for field in ("composerIcon", "logo", "logoDark"):
+            self.assertTrue((ROOT / interface[field]).is_file())
+        for screenshot in interface["screenshots"]:
+            self.assertTrue((ROOT / screenshot).is_file())
+
     def test_plugin_entrypoints_and_skills_are_complete(self) -> None:
         wrapper = ROOT / "bin/agent-relay"
         self.assertTrue(wrapper.stat().st_mode & stat.S_IXUSR)

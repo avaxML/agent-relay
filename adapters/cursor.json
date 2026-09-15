@@ -1,0 +1,49 @@
+{
+  "name": "cursor",
+  "executable": "cursor-agent",
+  "default_model": "cursor-grok-4.6-high",
+  "args": [
+    "-p",
+    "--workspace",
+    "{provider_workspace}",
+    "--mode",
+    "ask",
+    "--sandbox",
+    "enabled",
+    "--model",
+    "{model}",
+    "--output-format",
+    "stream-json"
+  ],
+  "input": "stdin",
+  "output": "cursor-jsonl",
+  "env": {},
+  "models_args": [
+    "models"
+  ],
+  "probe_args": [
+    "--help"
+  ],
+  "effort": {
+    "models": [
+      "cursor-grok-4.6-low",
+      "cursor-grok-4.6-medium",
+      "cursor-grok-4.6-high",
+      "cursor-grok-4.6-xhigh"
+    ],
+    "levels": {
+      "low": {
+        "model": "cursor-grok-4.6-low"
+      },
+      "medium": {
+        "model": "cursor-grok-4.6-medium"
+      },
+      "high": {
+        "model": "cursor-grok-4.6-high"
+      },
+      "xhigh": {
+        "model": "cursor-grok-4.6-xhigh"
+      }
+    }
+  }
+}

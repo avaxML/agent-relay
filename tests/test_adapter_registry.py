@@ -75,7 +75,12 @@ class AdapterRegistryTests(unittest.TestCase):
         records = json.loads(listing.stdout)["adapters"]
         self.assertEqual(
             [(record["name"], record["source"]) for record in records],
-            [("antigravity", "bundled"), ("custom", "registered"), ("opencode", "bundled")],
+            [
+                ("antigravity", "bundled"),
+                ("cursor", "bundled"),
+                ("custom", "registered"),
+                ("opencode", "bundled"),
+            ],
         )
 
         removed = self.relay("adapter", "remove", "custom", "--registry-dir", str(self.registry))

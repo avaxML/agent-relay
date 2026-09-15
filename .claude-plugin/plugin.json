@@ -1,8 +1,8 @@
 {
   "name": "agent-relay",
   "displayName": "Agent Relay",
-  "version": "0.1.0",
-  "description": "Delegate bounded coding work to OpenCode, Antigravity, and extensible CLI adapters.",
+  "version": "0.2.0",
+  "description": "Delegate bounded coding work to OpenCode, Antigravity, Cursor, and extensible CLI adapters.",
   "author": {
     "name": "avaxML",
     "url": "https://github.com/avaxML"
@@ -10,6 +10,6 @@
   "homepage": "https://github.com/avaxML/agent-relay",
   "repository": "https://github.com/avaxML/agent-relay",
   "license": "MIT",
-  "keywords": ["agents", "delegation", "opencode", "antigravity"],
+  "keywords": ["agents", "delegation", "opencode", "antigravity", "cursor", "chaos-engineering"],
   "skills": "./skills/"
 }

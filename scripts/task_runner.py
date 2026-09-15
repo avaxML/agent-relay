@@ -26,7 +26,35 @@ KINDS = {
     "read": "Answer the question concisely with exact source paths and line numbers. Flag missing evidence.",
     "review": "Review independently. Return actionable findings with severity, source locations, and reasoning. State when no findings are supported.",
     "patch": "Propose an implementation as a unified diff against the supplied paths. Return only the diff, or explain why the supplied context is insufficient. Do not apply it.",
+    "chaos": (
+        "Perform a bounded, proposal-only chaos engineering review. Begin with a stated steady-state hypothesis "
+        "and its invariants. Derive adversarial fault scenarios only from the supplied source, covering malformed "
+        "inputs, partial dependency failures, timeouts, retries, cancellation, concurrency and races, stale state, "
+        "resource exhaustion, and permission-boundary abuse when relevant. Assess blast radius and identify recovery "
+        "and observability gaps. Rank findings by severity and evidence, with exact source locations. Propose safe, "
+        "controlled experiments for supported risks, including prerequisites, expected signals, blast-radius limits, "
+        "and explicit abort criteria. Treat unsupported cases as hypotheses or missing evidence. Never claim to have "
+        "run an attack, fault injection, test, or experiment, and do not ask anyone or any provider to execute one."
+    ),
 }
+
+
+def provider_workspace(name: str) -> Path:
+    configured = os.environ.get("AGENT_RELAY_PROVIDER_WORKSPACES_DIR")
+    if configured:
+        root = Path(configured).expanduser()
+    elif state_home := os.environ.get("XDG_STATE_HOME"):
+        root = Path(state_home).expanduser() / "agent-relay" / "providers"
+    else:
+        root = Path.home() / ".local" / "state" / "agent-relay" / "providers"
+    workspace = root / name
+    if workspace.is_symlink():
+        raise RelayError(f"Provider workspace must not be a symlink: {workspace}")
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not workspace.is_dir():
+        raise RelayError(f"Provider workspace must be a directory: {workspace}")
+    workspace.chmod(0o700)
+    return workspace.resolve()
 
 
 def build_request(
@@ -154,6 +182,11 @@ def run_prepared(
                 "request_file": str(request_file),
                 "timeout": str(task["timeout"]),
                 "workdir": str(workdir),
+                "provider_workspace": (
+                    str(provider_workspace(adapter["name"]))
+                    if any("{provider_workspace}" in argument for argument in adapter["args"])
+                    else str(workdir)
+                ),
             }
             argv = [adapter["executable"]] + [arg.format_map(values) for arg in adapter["args"]] + task["effort_args"]
             code = execute(

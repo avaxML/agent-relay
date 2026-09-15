@@ -1,0 +1,44 @@
+{
+  "name": "cursor",
+  "executable": "cursor-agent",
+  "default_model": "gemini-3.8-flash-low",
+  "args": [
+    "-p",
+    "--trust",
+    "--mode",
+    "ask",
+    "--sandbox",
+    "enabled",
+    "--model",
+    "{model}",
+    "--output-format",
+    "stream-json"
+  ],
+  "input": "stdin",
+  "output": "cursor-jsonl",
+  "env": {},
+  "models_args": [
+    "models"
+  ],
+  "probe_args": [
+    "--help"
+  ],
+  "effort": {
+    "models": [
+      "gemini-3.8-flash-low",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-high"
+    ],
+    "levels": {
+      "low": {
+        "model": "gemini-3.8-flash-low"
+      },
+      "medium": {
+        "model": "gemini-3.8-flash-medium"
+      },
+      "high": {
+        "model": "gemini-3.8-flash-high"
+      }
+    }
+  }
+}

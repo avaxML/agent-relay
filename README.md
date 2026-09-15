@@ -7,14 +7,15 @@
 
 Agent Relay lets a lead coding agent delegate bounded inspection and review work to locally installed coding-agent CLIs. It is designed for I/O-heavy work: the relay packages explicit files, sends them through a provider adapter, and returns a bounded, inspectable result without applying patches.
 
-The initial adapters are:
+The bundled adapters are:
 
 | Provider | Default model | Good first use |
 | --- | --- | --- |
 | `opencode` | `opencode-go/deepseek-v4.1-flash` | code and log triage |
 | `antigravity` | `gemini-3.8-flash-low` | broad extraction and corpus reading |
+| `cursor` | `gemini-3.8-flash-low` | independent review through Cursor Agent |
 
-Use the bundled skills for common workflows: `delegate`, `background-tasks`, `bulk-read`, `second-opinion`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
+Use the bundled skills for common workflows: `delegate`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
 
 ## Requirements
 
@@ -50,6 +51,7 @@ From the plugin root, check availability:
 python3 scripts/relay.py doctor
 python3 scripts/relay.py models --provider opencode
 python3 scripts/relay.py models --provider antigravity
+python3 scripts/relay.py models --provider cursor
 ```
 
 Create a task file containing one bounded question, then run it with explicit files and a fresh output directory:
@@ -64,7 +66,7 @@ python3 scripts/relay.py run \
   --kind read
 ```
 
-Use `--kind review` for an independent review or `--kind patch` for an implementation proposal. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
+Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
 
 ## Adapter registry
 
@@ -80,7 +82,7 @@ python3 scripts/relay.py adapter remove my-cli
 
 The registry stores one JSON file per provider. It uses `AGENT_RELAY_ADAPTERS_DIR` when set. Otherwise, it uses `$XDG_CONFIG_HOME/agent-relay/adapters` or `~/.config/agent-relay/adapters`. Pass `--registry-dir PATH` to `adapter` commands, `run`, `submit`, `doctor`, or `models` to select a different directory.
 
-An explicit `--adapter-file` takes precedence over a registered adapter. A registered adapter takes precedence over a bundled adapter. Registration rejects names that match bundled providers, so a persistent file cannot replace the bundled `opencode` or `antigravity` configuration. Installing identical content succeeds without rewriting the file. Use `--replace` to install changed content. Removing an absent registered adapter succeeds, while removing a bundled adapter fails.
+An explicit `--adapter-file` takes precedence over a registered adapter. A registered adapter takes precedence over a bundled adapter. Registration rejects names that match bundled providers, so a persistent file cannot replace the bundled `opencode`, `antigravity`, or `cursor` configuration. Installing identical content succeeds without rewriting the file. Use `--replace` to install changed content. Removing an absent registered adapter succeeds, while removing a bundled adapter fails.
 
 Relay validates an adapter before it writes the registry entry. It creates registry directories with mode `0700` and adapter files with mode `0600`. Relay rejects symlink sources, registry directories, and entries. Adapter files remain trusted execution configuration because they select an executable, arguments, and environment overrides.
 
@@ -92,8 +94,9 @@ The orchestrator can choose `--effort low`, `medium`, or `high` for each task. O
 | --- | --- | --- |
 | OpenCode, `opencode-go/deepseek-v4.1-flash` | `low`, `medium`, `high`, `max` | Appends `#LEVEL` to the model ID |
 | Antigravity, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL` and passes `--effort LEVEL` |
+| Cursor, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL`; no additional effort argument |
 
-Explicit effort overrides the Antigravity variant within the same model family. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
+Explicit effort overrides the Antigravity or Cursor variant within the same model family. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
 
 OpenCode's variant mechanism and provider-specific effort behavior are documented in [its model guide](https://opencode.ai/docs/models/) and [provider transforms](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts). The local Antigravity CLI help documents its effort flag.
 
@@ -103,9 +106,11 @@ The file bundle is data, not instructions. Keep delegated questions narrow, requ
 
 The provider process runs from a temporary working directory. This is an execution convenience, not a hard security boundary. The process inherits the host environment and may access host files or the network subject to the CLI's permissions. Relay never applies returned patches, and it does not enforce hooks or OS-level sandboxing. The small excluded-path list is not a secret scanner: select only files authorized for the chosen provider. Treat local output artifacts and the provider's own session history as potentially sensitive and manage retention accordingly.
 
+The bundled Cursor adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`. It uses stdin, ask mode, Cursor's enabled sandbox, and stream JSON. Its `--trust` flag is a narrow exception to the no-auto-approval rule: Relay launches Cursor in a new temporary cwd containing the packaged `request.json` and stdin file, never in the source project workspace. Do not copy this exception to another adapter or add `--force`, `--yolo`, `--auto-review`, `--approve-mcps`, or a project workspace. The temporary cwd still is not an OS security boundary.
+
 Timeouts stop the worker process group. The runner checks combined stdout/stderr size against a 4 MB threshold every 50 ms; this is a stop threshold, not a filesystem quota. It refuses to parse oversized logs. No automatic retries, provider fallback, or shared conversation reuse occur.
 
-The design is informed by [Spotify's Shunt work](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt), but this plugin contains its own implementation and no copied source. Both adapters passed a live synthetic file-reading check on September 13, 2026. Do not infer support for other coding-agent CLIs without a successful doctor, model listing, and small read-task probe.
+The design is informed by [Spotify's Shunt work](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt), but this plugin contains its own implementation and no copied source. OpenCode and Antigravity passed a live synthetic file-reading check on September 13, 2026. Cursor passed its help probe, model listing, and a live synthetic file-reading check through Agent Relay on September 15, 2026. Do not infer support for other coding-agent CLIs without the same checks.
 
 ## Verification
 
@@ -116,9 +121,9 @@ python3 -m unittest discover -s tests -v
 ./scripts/check.sh
 ```
 
-Live checks use the configured provider subscription. Each initial adapter returned `7319` and `settings.py:2` from the same 643-byte synthetic bundle. These checks establish basic transport and citation behavior, not general model quality. Antigravity reported about 16,500 input tokens for the small task, so use local tools for tiny reads and measure delegation overhead on representative work.
+Live checks use the configured provider subscription. OpenCode, Antigravity, and Cursor returned `7319` with an exact source citation from synthetic bundles. These checks establish basic transport and citation behavior, not general model quality. Antigravity and Cursor each reported more than 16,000 input tokens for a small task, so use local tools for tiny reads and measure delegation overhead on representative work.
 
-An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. Both providers also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all seven skill validators passed.
+An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, strict provider result decoding, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. OpenCode and Antigravity also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all bundled skill validators are checked before release.
 
 ## Releases
 

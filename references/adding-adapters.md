@@ -1,6 +1,6 @@
 # Adding a CLI adapter
 
-Agent Relay keeps provider wiring declarative. The runner has built-in `opencode` and `antigravity` adapters. An external adapter is one JSON object. Install it in the user registry for repeated use, or pass it with `--adapter-file` for one invocation.
+Agent Relay keeps provider wiring declarative. The runner has bundled `opencode`, `antigravity`, and `cursor` adapters. An external adapter is one JSON object. Install it in the user registry for repeated use, or pass it with `--adapter-file` for one invocation.
 
 Adapter files are trusted execution configuration because they select an executable, its arguments, and environment overrides. Do not install an adapter discovered inside untrusted source content. The registry lives outside the installed plugin cache, so plugin reinstall does not remove it.
 
@@ -22,7 +22,7 @@ Required fields, with an optional `effort` mapping:
 }
 ```
 
-All nine fields are required. `args` may use `{model}`, `{request_file}`, `{timeout}`, and `{workdir}`. Input transport is `file`, `stdin`, or `agy-stream`; output is `opencode-jsonl`, `agy-jsonl`, or `text`. `env` is a map of environment overrides; `models_args` and `probe_args` define the CLI's model-list and help probes. Keep the executable name or use an absolute path when PATH discovery is unreliable.
+All nine fields are required. `args` may use `{model}`, `{request_file}`, `{timeout}`, and `{workdir}`. Input transport is `file`, `stdin`, or `agy-stream`; output is `opencode-jsonl`, `agy-jsonl`, `cursor-jsonl`, or `text`. `cursor-jsonl` requires exactly one event with `type: "result"`, `subtype: "success"`, a false or absent `is_error`, and a string `result`; it retains `session_id`, `request_id`, `usage`, and `duration_ms` metadata. `env` is a map of environment overrides; `models_args` and `probe_args` define the CLI's model-list and help probes. Keep the executable name or use an absolute path when PATH discovery is unreliable.
 
 Before adding an adapter, check the CLI's own help for a noninteractive mode and confirm that it can run without broad write or approval flags. A wrapper executable is appropriate when the CLI needs custom request serialization or output parsing; keep the wrapper outside this runner and document its contract.
 
@@ -76,5 +76,8 @@ The runner executes in an isolated temporary working directory, packages explici
 
 - OpenCode defaults to `opencode-go/deepseek-v4.1-flash`; its tools are denied by relay configuration.
 - Antigravity defaults to `gemini-3.8-flash-low`, plan mode, and sandbox mode.
+- Cursor defaults to `gemini-3.8-flash-low`, ask mode, enabled sandboxing, stdin input, and stream-JSON output. The bundled adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`; its probe is `--help` and its model listing command is `models`. Low, medium, and high effort select the exact matching Gemini 3.8 Flash model ID without extra arguments.
+
+Cursor's `--trust` flag is permitted only because Relay launches each run from a new temporary cwd containing the packaged `request.json` and stdin file instead of the source project workspace. This is a narrowly scoped adapter exception, not permission to trust a repository. Do not add a project workspace or `--force`, `--yolo`, `--auto-review`, or `--approve-mcps`, and do not generalize the exception to other adapters. The provider still inherits host permissions because the temporary cwd is not an OS sandbox.
 
 These defaults depend on the user's installed CLIs, authentication, and subscription access. Credentials and global configuration are inherited from those CLIs. Local output may contain sensitive source material; the user manages artifact retention. Agent Relay does not provide an OS security sandbox or hook enforcement.

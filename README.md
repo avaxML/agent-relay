@@ -62,7 +62,25 @@ python3 scripts/relay.py run \
   --kind read
 ```
 
-Use `--kind review` for an independent review or `--kind patch` for an implementation proposal. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` adds a provider definition for one invocation; see [references/adding-adapters.md](references/adding-adapters.md).
+Use `--kind review` for an independent review or `--kind patch` for an implementation proposal. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
+
+## Adapter registry
+
+Install a validated adapter once to use it by provider name:
+
+```sh
+python3 scripts/relay.py adapter install /abs/path/my-cli.json
+python3 scripts/relay.py adapter list
+python3 scripts/relay.py adapter validate my-cli --probe
+python3 scripts/relay.py run --provider my-cli ...
+python3 scripts/relay.py adapter remove my-cli
+```
+
+The registry stores one JSON file per provider. It uses `AGENT_RELAY_ADAPTERS_DIR` when set. Otherwise, it uses `$XDG_CONFIG_HOME/agent-relay/adapters` or `~/.config/agent-relay/adapters`. Pass `--registry-dir PATH` to `adapter` commands, `run`, `submit`, `doctor`, or `models` to select a different directory.
+
+An explicit `--adapter-file` takes precedence over a registered adapter. A registered adapter takes precedence over a bundled adapter. Registration rejects names that match bundled providers, so a persistent file cannot replace the bundled `opencode` or `antigravity` configuration. Installing identical content succeeds without rewriting the file. Use `--replace` to install changed content. Removing an absent registered adapter succeeds, while removing a bundled adapter fails.
+
+Relay validates an adapter before it writes the registry entry. It creates registry directories with mode `0700` and adapter files with mode `0600`. Relay rejects symlink sources, registry directories, and entries. Adapter files remain trusted execution configuration because they select an executable, arguments, and environment overrides.
 
 ## Reasoning effort
 
@@ -98,7 +116,7 @@ python3 -m unittest discover -s tests -v
 
 Live checks use the configured provider subscription. Each initial adapter returned `7319` and `settings.py:2` from the same 643-byte synthetic bundle. These checks establish basic transport and citation behavior, not general model quality. Antigravity reported about 16,500 input tokens for the small task, so use local tools for tiny reads and measure delegation overhead on representative work.
 
-An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The 31-test suite covers transport, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. Both providers also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all seven skill validators passed.
+An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. Both providers also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all seven skill validators passed.
 
 ## Background jobs
 
@@ -106,7 +124,7 @@ Use the `background-tasks` skill when a worker may take longer than the current 
 
 Submit snapshots the task, explicit source bundle, adapter, and runtime Python files before returning. It returns JSON containing `job_id`, `status`, `jobs_dir`, `job_dir`, and `output_dir`, so the submitter can continue other work and inspect the job later. Jobs use `AGENT_RELAY_JOBS_DIR` when set, otherwise `~/.local/state/agent-relay/jobs`; pass `--jobs-dir` to select a different location. Jobs and artifacts live outside the plugin cache, survive plugin reinstall, and preserve the submitted inputs against later source edits.
 
-The submit command accepts the same worker settings as `run`: `--provider`, `--model`, `--effort`, `--task-file`, `--root`, `--files`, `--kind`, `--timeout`, `--max-input-bytes`, and `--max-answer-chars`, plus `--adapter-file`. `--output` is optional; when omitted, artifacts are written under the job directory. A supplied output path must be fresh. There is no built-in queue or concurrency limiter, so keep concurrent work within provider quotas.
+The submit command accepts the same worker settings as `run`: `--provider`, `--model`, `--effort`, `--task-file`, `--root`, `--files`, `--kind`, `--timeout`, `--max-input-bytes`, and `--max-answer-chars`, plus `--adapter-file` and `--registry-dir`. `--output` is optional; when omitted, artifacts are written under the job directory. A supplied output path must be fresh. There is no built-in queue or concurrency limiter, so keep concurrent work within provider quotas.
 
 ```sh
 JOB_JSON=$(python3 scripts/relay.py submit \

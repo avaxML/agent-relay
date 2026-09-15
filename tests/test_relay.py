@@ -301,7 +301,7 @@ class RunIntegrationTests(RelayTestCase):
                 "--sandbox",
                 "enabled",
                 "--model",
-                "gemini-3.8-flash-low",
+                "cursor-grok-4.6-high",
                 "--output-format",
                 "stream-json",
             ],

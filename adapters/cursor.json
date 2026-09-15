@@ -1,7 +1,7 @@
 {
   "name": "cursor",
   "executable": "cursor-agent",
-  "default_model": "gemini-3.8-flash-low",
+  "default_model": "cursor-grok-4.6-high",
   "args": [
     "-p",
     "--trust",
@@ -25,19 +25,23 @@
   ],
   "effort": {
     "models": [
-      "gemini-3.8-flash-low",
-      "gemini-3.8-flash-medium",
-      "gemini-3.8-flash-high"
+      "cursor-grok-4.6-low",
+      "cursor-grok-4.6-medium",
+      "cursor-grok-4.6-high",
+      "cursor-grok-4.6-xhigh"
     ],
     "levels": {
       "low": {
-        "model": "gemini-3.8-flash-low"
+        "model": "cursor-grok-4.6-low"
       },
       "medium": {
-        "model": "gemini-3.8-flash-medium"
+        "model": "cursor-grok-4.6-medium"
       },
       "high": {
-        "model": "gemini-3.8-flash-high"
+        "model": "cursor-grok-4.6-high"
+      },
+      "xhigh": {
+        "model": "cursor-grok-4.6-xhigh"
       }
     }
   }

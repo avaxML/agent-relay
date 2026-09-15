@@ -13,7 +13,7 @@ The bundled adapters are:
 | --- | --- | --- |
 | `opencode` | `opencode-go/deepseek-v4.1-flash` | code and log triage |
 | `antigravity` | `gemini-3.8-flash-low` | broad extraction and corpus reading |
-| `cursor` | `gemini-3.8-flash-low` | independent review through Cursor Agent |
+| `cursor` | `cursor-grok-4.6-high` | independent review through Cursor Agent |
 
 Use the bundled skills for common workflows: `delegate`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
 
@@ -94,7 +94,7 @@ The orchestrator can choose `--effort low`, `medium`, or `high` for each task. O
 | --- | --- | --- |
 | OpenCode, `opencode-go/deepseek-v4.1-flash` | `low`, `medium`, `high`, `max` | Appends `#LEVEL` to the model ID |
 | Antigravity, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL` and passes `--effort LEVEL` |
-| Cursor, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL`; no additional effort argument |
+| Cursor, Grok 4.6 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `cursor-grok-4.6-LEVEL`; no additional effort argument |
 
 Explicit effort overrides the Antigravity or Cursor variant within the same model family. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
 

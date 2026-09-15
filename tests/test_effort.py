@@ -39,15 +39,15 @@ class EffortTests(unittest.TestCase):
             ("opencode-go/deepseek-v4.1-flash#max", []),
         )
 
-    def test_cursor_selects_exact_gemini_model_without_extra_arguments(self) -> None:
+    def test_cursor_selects_exact_grok_model_without_extra_arguments(self) -> None:
         adapter = load_adapter("cursor")
         self.assertEqual(adapter["probe_args"], ["--help"])
         self.assertEqual(adapter["models_args"], ["models"])
-        for effort in ("low", "medium", "high"):
+        for effort in ("low", "medium", "high", "xhigh"):
             with self.subTest(effort=effort):
                 self.assertEqual(
-                    resolve_effort(adapter, "gemini-3.8-flash-low", effort),
-                    (f"gemini-3.8-flash-{effort}", []),
+                    resolve_effort(adapter, "cursor-grok-4.6-high", effort),
+                    (f"cursor-grok-4.6-{effort}", []),
                 )
 
     def test_unsupported_models_levels_and_legacy_adapters_fail(self) -> None:

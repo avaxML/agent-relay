@@ -76,7 +76,7 @@ The runner executes in an isolated temporary working directory, packages explici
 
 - OpenCode defaults to `opencode-go/deepseek-v4.1-flash`; its tools are denied by relay configuration.
 - Antigravity defaults to `gemini-3.8-flash-low`, plan mode, and sandbox mode.
-- Cursor defaults to `gemini-3.8-flash-low`, ask mode, enabled sandboxing, stdin input, and stream-JSON output. The bundled adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`; its probe is `--help` and its model listing command is `models`. Low, medium, and high effort select the exact matching Gemini 3.8 Flash model ID without extra arguments.
+- Cursor defaults to `cursor-grok-4.6-high`, ask mode, enabled sandboxing, stdin input, and stream-JSON output. The bundled adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`; its probe is `--help` and its model listing command is `models`. Low, medium, high, and xhigh effort select the exact matching Grok 4.6 model ID without extra arguments.
 
 Cursor's `--trust` flag is permitted only because Relay launches each run from a new temporary cwd containing the packaged `request.json` and stdin file instead of the source project workspace. This is a narrowly scoped adapter exception, not permission to trust a repository. Do not add a project workspace or `--force`, `--yolo`, `--auto-review`, or `--approve-mcps`, and do not generalize the exception to other adapters. The provider still inherits host permissions because the temporary cwd is not an OS sandbox.
 

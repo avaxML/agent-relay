@@ -1,7 +1,7 @@
 {
   "name": "agent-relay",
   "displayName": "Agent Relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Delegate bounded coding work to OpenCode, Antigravity, and extensible CLI adapters.",
   "author": {
     "name": "avaxML",

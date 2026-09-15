@@ -3,6 +3,8 @@
 [![CI](https://github.com/avaxML/agent-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/avaxML/agent-relay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+![Agent Relay routes a bounded coding task to multiple coding-agent CLIs and collects their artifacts.](assets/agent-relay-flow.png)
+
 Agent Relay lets a lead coding agent delegate bounded inspection and review work to locally installed coding-agent CLIs. It is designed for I/O-heavy work: the relay packages explicit files, sends them through a provider adapter, and returns a bounded, inspectable result without applying patches.
 
 The initial adapters are:
@@ -117,6 +119,12 @@ python3 -m unittest discover -s tests -v
 Live checks use the configured provider subscription. Each initial adapter returned `7319` and `settings.py:2` from the same 643-byte synthetic bundle. These checks establish basic transport and citation behavior, not general model quality. Antigravity reported about 16,500 input tokens for the small task, so use local tools for tiny reads and measure delegation overhead on representative work.
 
 An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. Both providers also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all seven skill validators passed.
+
+## Releases
+
+Codex and Claude Code both install Agent Relay from this Git repository. To publish a release, update the version in `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `pyproject.toml`, then refresh `uv.lock`. Merge the release commit before creating a matching `vMAJOR.MINOR.PATCH` tag.
+
+Pushing the tag runs the release workflow. The workflow verifies every published version, runs the complete check suite, and creates a GitHub release with generated notes. Claude Code users receive the new cached version when marketplace auto-update runs or when they run `claude plugin marketplace update agent-relay`. Codex users refresh the Git marketplace through Codex's plugin update flow.
 
 ## Background jobs
 

@@ -1,6 +1,6 @@
 [project]
 name = "agent-relay"
-version = "0.1.0"
+version = "0.2.0"
 description = "Delegate bounded coding work to local coding-agent CLIs."
 requires-python = ">=3.11"
 license = "MIT"

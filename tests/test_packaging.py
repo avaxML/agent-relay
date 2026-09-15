@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -13,11 +14,13 @@ class PackagingTests(unittest.TestCase):
         codex = json.loads((ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
         claude = json.loads((ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
         marketplace = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
         self.assertEqual(codex["name"], "agent-relay")
         self.assertEqual(codex["name"], claude["name"])
         self.assertEqual(codex["version"], claude["version"])
         self.assertEqual(codex["version"], marketplace["plugins"][0]["version"])
+        self.assertEqual(codex["version"], project["project"]["version"])
         self.assertEqual(marketplace["plugins"][0]["source"], ".")
 
         interface = codex["interface"]

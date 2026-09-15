@@ -9,7 +9,7 @@
       "name": "agent-relay",
       "source": ".",
       "description": "Delegate bounded coding work to OpenCode and Antigravity.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "development",
       "tags": ["agents", "delegation", "background-jobs"]
     }

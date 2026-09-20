@@ -699,9 +699,10 @@ def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any] | N
     raw_claim = payload.get("claim_id")
     default_claim = f"{member_id}-r{round_no}"
     claim_id = raw_claim.strip() if isinstance(raw_claim, str) and raw_claim.strip() else default_claim
-    position = payload.get("position")
-    if not isinstance(position, str) or not position.strip():
+    raw_position = payload.get("position")
+    if not isinstance(raw_position, str) or not raw_position.strip():
         return None
+    position = raw_position.strip()
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
     ballots: list[dict[str, str]] = []
     raw_ballots = payload.get("ballots")
@@ -968,9 +969,11 @@ def settle_topic(
                 "SELECT * FROM ballots WHERE topic_id=? AND round=?", (topic_id, latest_round)
             ).fetchall()
         ]
+        grouped = _grouped_claims(claims)
         target, chair_override = _select_claim(claims, ballots, member_ids, claim_id, chosen)
         tally = _tally(ballots, member_ids, target["claim_id"])
-        agreed = _meets_threshold(tally, chosen, len(member_ids)) or chair_override
+        unambiguous = _canonical_claim(grouped.get(target["claim_id"], [])) is not None
+        agreed = chair_override or (unambiguous and _meets_threshold(tally, chosen, len(member_ids)))
         payload = {
             "schema_version": SCHEMA_VERSION,
             "topic_id": topic_id,
@@ -1025,6 +1028,22 @@ def settle_topic(
         return {**payload, "exported_path": str(export_path)}
 
 
+def _grouped_claims(claims: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for claim in claims:
+        grouped.setdefault(claim["claim_id"], []).append(claim)
+    return grouped
+
+
+def _canonical_claim(group: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not group:
+        return None
+    positions = {claim["position"] for claim in group}
+    if len(positions) != 1:
+        return None
+    return group[0]
+
+
 def _select_claim(
     claims: list[dict[str, Any]],
     ballots: list[dict[str, Any]],
@@ -1032,12 +1051,20 @@ def _select_claim(
     claim_id: str | None,
     threshold: str,
 ) -> tuple[dict[str, Any], bool]:
-    by_id = {claim["claim_id"]: claim for claim in claims}
+    grouped = _grouped_claims(claims)
     if claim_id is not None:
-        if claim_id not in by_id:
+        if claim_id not in grouped:
             raise RelayError(f"Unknown claim_id: {claim_id}")
-        return by_id[claim_id], True
-    scores: dict[str, int] = {claim["claim_id"]: 0 for claim in claims}
+        canonical = _canonical_claim(grouped[claim_id])
+        if canonical is None:
+            raise RelayError(f"Ambiguous claim_id: {claim_id}")
+        return canonical, True
+    unique: dict[str, dict[str, Any]] = {}
+    for cid, group in grouped.items():
+        canonical = _canonical_claim(group)
+        if canonical is not None:
+            unique[cid] = canonical
+    scores = {cid: 0 for cid in unique}
     for ballot in ballots:
         if ballot["ballot"] == "agree" and ballot["claim_id"] in scores:
             scores[ballot["claim_id"]] += 1
@@ -1045,7 +1072,7 @@ def _select_claim(
         winner = max(scores, key=lambda key: (scores[key], key))
         tally = _tally(ballots, member_ids, winner)
         if _meets_threshold(tally, threshold, len(member_ids)):
-            return by_id[winner], False
+            return unique[winner], False
     return claims[0], False
 
 

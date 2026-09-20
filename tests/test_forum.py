@@ -306,7 +306,7 @@ class ForumTests(unittest.TestCase):
                     **json.loads(right.read_text(encoding="utf-8")),
                     "env": {
                         "FAKE_CLAIM": "etag",
-                        "FAKE_POSITION": "Use ETag after review",
+                        "FAKE_POSITION": "Use ETag",
                         "FAKE_BALLOTS": json.dumps([{"on": "etag", "ballot": "agree"}]),
                     },
                 }
@@ -445,6 +445,44 @@ class ForumTests(unittest.TestCase):
         self.assertEqual(agreed["status"], "agreed")
         self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "settled")
 
+    def test_collided_claim_ids_cannot_reach_unanimous_consensus(self) -> None:
+        left = self._adapter(
+            "alpha",
+            "etag",
+            "Use ETag",
+            [{"on": "etag", "ballot": "agree"}],
+        )
+        right = self._adapter(
+            "beta",
+            "etag",
+            "Use Redis instead",
+            [{"on": "etag", "ballot": "agree"}],
+        )
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        split = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(split["status"], "split")
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
+        with self.assertRaisesRegex(RelayError, "Ambiguous claim_id: etag"):
+            forum.settle_topic(topic_id, self.forums, claim_id="etag")
+        self._adapter(
+            "beta",
+            "etag",
+            "Use ETag",
+            [{"on": "etag", "ballot": "agree"}],
+        )
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        agreed = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(agreed["status"], "agreed")
+        self.assertEqual(agreed["position"], "Use ETag")
+        self.assertFalse(agreed["chair_override"])
+
     def test_parse_answer_rejects_concatenated_json_objects(self) -> None:
         text = '{"claim_id":"first","position":"A"}\n{"claim_id":"second","position":"B"}'
         self.assertIsNone(forum.parse_answer(text, "alpha", 1))
@@ -452,6 +490,14 @@ class ForumTests(unittest.TestCase):
         parsed = forum.parse_answer(fenced, "alpha", 1)
         assert parsed is not None
         self.assertEqual(parsed["claim_id"], "etag")
+
+    def test_parse_answer_rejects_json_arrays(self) -> None:
+        stolen = '[{"claim_id":"stolen","position":"Use ETag","evidence":[]}]'
+        self.assertIsNone(forum.parse_answer(stolen, "alpha", 1))
+        self.assertIsNone(forum.parse_answer("[]", "alpha", 1))
+        padded = forum.parse_answer('  {"claim_id":"etag","position":"  Use ETag  "}  ', "alpha", 1)
+        assert padded is not None
+        self.assertEqual(padded["position"], "Use ETag")
 
     def test_concatenated_json_answers_are_malformed_failures(self) -> None:
         worker = self.directory / "two_json.py"

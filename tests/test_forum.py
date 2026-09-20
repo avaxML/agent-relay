@@ -574,6 +574,10 @@ class ForumTests(unittest.TestCase):
         padded = forum.parse_answer('  {"claim_id":"etag","position":"  Use ETag  "}  ', "alpha", 1)
         assert padded is not None
         self.assertEqual(padded["position"], "Use ETag")
+        bom = "\ufeff" + '{"claim_id":"etag","position":"Use ETag","evidence":[]}'
+        parsed = forum.parse_answer(bom, "alpha", 1)
+        assert parsed is not None
+        self.assertEqual(parsed["claim_id"], "etag")
 
     def test_concatenated_json_answers_are_malformed_failures(self) -> None:
         worker = self.directory / "two_json.py"
@@ -624,6 +628,96 @@ class ForumTests(unittest.TestCase):
         retry = forum.start_round(topic_id, self.forums)
         self._track(retry)
         self.assertEqual(retry["round"], 1)
+
+    def test_oversized_claim_is_malformed_and_does_not_wedge_round(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        alpha_job = next(item["job_id"] for item in launched["jobs"] if item["member_id"] == "alpha")
+        path = Path(forum.jobs.result(alpha_job, self.jobs)["output_dir"]) / "result.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["answer"] = json.dumps({"claim_id": "big", "position": "X" * 210000, "evidence": []})
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        ingested = forum.ingest_round(topic_id, self.forums)
+        self.assertEqual({item["member_id"] for item in ingested["ingested"]}, {"beta"})
+        self.assertEqual({item["status"] for item in ingested["failures"]}, {forum.JOB_MALFORMED})
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        self.assertEqual(second["round"], 2)
+
+    def test_malformed_result_json_does_not_crash_ingest(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        jobs_by_member = {item["member_id"]: item["job_id"] for item in launched["jobs"]}
+        alpha_path = Path(forum.jobs.result(jobs_by_member["alpha"], self.jobs)["output_dir"]) / "result.json"
+        beta_path = Path(forum.jobs.result(jobs_by_member["beta"], self.jobs)["output_dir"]) / "result.json"
+        alpha_path.write_text('{"status":"ok","answer":"', encoding="utf-8")
+        beta_path.write_text("[1, 2, 3]\n", encoding="utf-8")
+        ingested = forum.ingest_round(topic_id, self.forums)
+        self.assertEqual(ingested["ingested"], [])
+        self.assertEqual({item["status"] for item in ingested["failures"]}, {forum.JOB_MALFORMED})
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
+
+    def test_close_after_settle_updates_consensus_payload(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        forum.settle_topic(topic_id, self.forums)
+        closed = forum.close_topic(topic_id, self.forums)
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["consensus"]["status"], "closed")
+        exported = json.loads((self.forums / topic_id / "consensus.json").read_text(encoding="utf-8"))
+        self.assertEqual(exported["status"], "closed")
+        copy = forum.export_consensus(topic_id, self.forums, self.directory / "closed.json")
+        self.assertEqual(copy["status"], "closed")
+
+    def test_open_topic_rejects_path_member_ids(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        with self.assertRaisesRegex(RelayError, "Member IDs"):
+            forum.open_topic(
+                kind="plan",
+                question="How should we cache GET /items?",
+                root=self.project,
+                files=["source.txt"],
+                members=[
+                    {
+                        "member_id": "../evil",
+                        "provider": "alpha",
+                        "model": None,
+                        "effort": None,
+                        "adapter_file": str(left),
+                        "registry_dir": None,
+                    },
+                    {
+                        "member_id": "beta",
+                        "provider": "beta",
+                        "model": None,
+                        "effort": None,
+                        "adapter_file": str(right),
+                        "registry_dir": None,
+                    },
+                ],
+                forums_dir=self.forums,
+                jobs_dir=self.jobs,
+                max_rounds=2,
+                threshold="unanimous",
+                timeout=8,
+                max_input_bytes=400000,
+                max_answer_chars=12000,
+            )
 
 
 if __name__ == "__main__":

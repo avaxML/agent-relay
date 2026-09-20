@@ -29,6 +29,7 @@ FORUM_KINDS = {"plan", "research"}
 JOB_MISSING = "missing"
 JOB_MALFORMED = "malformed"
 WAIT_TERMINAL = jobs.TERMINAL | {JOB_MISSING}
+MESSAGE_BODY_LIMIT = 200000
 MEMBER_FIELDS = {"member_id", "provider", "model", "effort", "adapter_file", "registry_dir"}
 MAX_ROUNDS = 4
 
@@ -297,8 +298,8 @@ def _insert_message(
     if kind not in MESSAGE_KINDS:
         raise RelayError(f"Unknown message kind: {kind}")
     payload = json.dumps(body, ensure_ascii=False)
-    if len(payload.encode()) > 200000:
-        raise RelayError("Message body exceeds 200000 bytes.")
+    if len(payload.encode()) > MESSAGE_BODY_LIMIT:
+        raise RelayError(f"Message body exceeds {MESSAGE_BODY_LIMIT} bytes.")
     message_id = uuid.uuid4().hex
     connection.execute(
         """
@@ -343,6 +344,8 @@ def open_topic(
         member_id = member["member_id"]
         if member_id is None or member_id in seen:
             raise RelayError("Member IDs must be unique.")
+        if not MEMBER_ID.fullmatch(member_id):
+            raise RelayError("Member IDs use lowercase letters, digits, and hyphens.")
         seen.add(member_id)
         adapter_path = Path(member["adapter_file"]).expanduser().resolve() if member["adapter_file"] else None
         registry_path = Path(member["registry_dir"]).expanduser().resolve() if member["registry_dir"] else None
@@ -723,13 +726,30 @@ def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any] | N
     }
 
 
+def _claim_broadcast_body(member_id: str, parsed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "claim_id": parsed["claim_id"],
+        "position": parsed["position"],
+        "evidence": parsed["evidence"],
+        "member_id": member_id,
+    }
+
+
+def _fits_inbox(body: dict[str, Any]) -> bool:
+    return len(json.dumps(body, ensure_ascii=False).encode()) <= MESSAGE_BODY_LIMIT
+
+
+def _strip_json_text(text: str) -> str:
+    return text.strip().lstrip("\ufeff").strip()
+
+
 def _load_json_object(text: str) -> dict[str, Any] | None:
-    stripped = text.strip()
+    stripped = _strip_json_text(text)
     if "```json" in stripped:
         start = stripped.find("```json") + 7
         end = stripped.find("```", start)
         if end != -1:
-            stripped = stripped[start:end].strip()
+            stripped = _strip_json_text(stripped[start:end])
     try:
         value, index = json.JSONDecoder().raw_decode(stripped)
     except json.JSONDecodeError:
@@ -780,11 +800,17 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                 continue
             result = state.get("result") if isinstance(state.get("result"), dict) else None
             if state["status"] != "completed" or not result or result.get("status") != "ok":
-                failures.append({"member_id": row["member_id"], "job_id": job_id, "status": state["status"]})
+                failures.append(
+                    {
+                        "member_id": row["member_id"],
+                        "job_id": job_id,
+                        "status": JOB_MALFORMED if result is None else state["status"],
+                    }
+                )
                 continue
             answer = str(result.get("answer") or "")
             parsed = parse_answer(answer, row["member_id"], round_no)
-            if parsed is None:
+            if parsed is None or not _fits_inbox(_claim_broadcast_body(row["member_id"], parsed)):
                 failures.append({"member_id": row["member_id"], "job_id": job_id, "status": JOB_MALFORMED})
                 continue
             parsed_by_member[row["member_id"]] = {**parsed, "job_id": job_id, "raw_answer": answer}
@@ -850,12 +876,7 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                         """,
                         (topic_id, round_no, member_id, ballot["on"], ballot["ballot"], ballot["caveat"]),
                     )
-                body = {
-                    "claim_id": parsed["claim_id"],
-                    "position": parsed["position"],
-                    "evidence": parsed["evidence"],
-                    "member_id": member_id,
-                }
+                body = _claim_broadcast_body(member_id, parsed)
                 for recipient in member_ids:
                     if recipient == member_id:
                         continue
@@ -1096,6 +1117,8 @@ def _meets_threshold(tally: dict[str, Any], threshold: str, size: int) -> bool:
 
 def close_topic(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
     now = time.time()
+    closed_payload = {"status": "closed", "topic_id": topic_id}
+    export_path = forum_root(forums_dir) / topic_id / "consensus.json"
     with database(forums_dir) as connection:
         topic = _topic(connection, topic_id)
         if topic["status"] == "round_pending":
@@ -1105,11 +1128,17 @@ def close_topic(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
             connection.execute(
                 """
                 INSERT INTO consensus(topic_id, status, payload, exported_path, created_at)
-                VALUES (?, 'closed', ?, NULL, ?)
-                ON CONFLICT(topic_id) DO UPDATE SET status='closed', created_at=excluded.created_at
+                VALUES (?, 'closed', ?, ?, ?)
+                ON CONFLICT(topic_id) DO UPDATE SET
+                    status='closed',
+                    payload=excluded.payload,
+                    exported_path=excluded.exported_path,
+                    created_at=excluded.created_at
                 """,
-                (topic_id, json.dumps({"status": "closed", "topic_id": topic_id}), now),
+                (topic_id, json.dumps(closed_payload, ensure_ascii=False), str(export_path), now),
             )
+            export_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(export_path, closed_payload)
     return topic_status(topic_id, forums_dir)
 
 

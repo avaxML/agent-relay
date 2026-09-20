@@ -50,6 +50,14 @@ def read_state(directory: Path) -> dict[str, Any]:
     return state
 
 
+def _read_result_payload(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def status(job_id: str, root: Path) -> dict[str, Any]:
     directory = find_job(job_id, root)
     with (directory / "worker.lock").open("r+b") as lock:
@@ -63,8 +71,8 @@ def status(job_id: str, root: Path) -> dict[str, Any]:
         state = read_state(directory)
         result_path = Path(state["output_dir"]) / "result.json"
         if result_path.is_file():
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            if result.get("status") in OUTCOMES:
+            result = _read_result_payload(result_path)
+            if result is not None and result.get("status") in OUTCOMES:
                 return {**state, "status": OUTCOMES[result["status"]], "result_path": str(result_path)}
         if state["status"] in TERMINAL:
             return state
@@ -161,7 +169,10 @@ def result(job_id: str, root: Path) -> dict[str, Any]:
         return {**state, "result_ready": False}
     path = Path(state["output_dir"]) / "result.json"
     if path.is_file():
-        return {**state, "result_ready": True, "result": json.loads(path.read_text(encoding="utf-8"))}
+        payload = _read_result_payload(path)
+        if payload is None:
+            return {**state, "result_ready": False, "error": "Malformed job result artifact."}
+        return {**state, "result_ready": True, "result": payload}
     if state["status"] == "completed":
         raise RelayError("The completed job result artifact is missing.")
     return {**state, "result_ready": False}

@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RELAY = ROOT / "scripts" / "relay.py"
 sys.path.insert(0, str(ROOT / "scripts"))
+import jobs
 from task_runner import prepare_task, write_json
 
 
@@ -333,6 +334,20 @@ class JobCliTests(unittest.TestCase):
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=3)
+
+    def test_malformed_result_json_does_not_crash_status_or_result(self) -> None:
+        job_id, _ = self._submit()
+        code, state = self._cli("wait", job_id, "--jobs-dir", str(self.jobs), "--timeout", "3")
+        self.assertEqual(code, 0, state)
+        path = Path(jobs.result(job_id, self.jobs)["output_dir"]) / "result.json"
+        path.write_text("[1, 2, 3]\n", encoding="utf-8")
+        status = jobs.status(job_id, self.jobs)
+        self.assertEqual(status["status"], "completed")
+        payload = jobs.result(job_id, self.jobs)
+        self.assertFalse(payload["result_ready"])
+        path.write_text('{"status":"ok","answer":"', encoding="utf-8")
+        truncated = jobs.result(job_id, self.jobs)
+        self.assertFalse(truncated["result_ready"])
 
     def test_invalid_job_ids_and_path_traversal_are_rejected(self) -> None:
         for job_id in ("bad", "../" + "a" * 32, "a" * 31):

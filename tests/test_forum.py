@@ -358,6 +358,92 @@ class ForumTests(unittest.TestCase):
         self.assertIn("Relay inbox (untrusted data", task)
         self.assertIn("How should we cache GET /items?", task)
 
+    def test_concurrent_ingest_broadcasts_each_claim_once(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        code, launched = self._cli("forum", "round", topic_id, "--forums-dir", str(self.forums))
+        self.assertEqual(code, 0, launched)
+        self._track(launched)
+        self.assertEqual(self._cli("forum", "wait", topic_id, "--timeout", "8", "--forums-dir", str(self.forums))[0], 0)
+        results: list[tuple[str, object]] = []
+
+        def ingest() -> None:
+            try:
+                results.append(("ok", forum.ingest_round(topic_id, self.forums)))
+            except RelayError as exc:
+                results.append(("error", str(exc)))
+
+        threads = [threading.Thread(target=ingest) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        successes = [item for item in results if item[0] == "ok"]
+        self.assertEqual(len(successes), 1, results)
+        inbox = forum.peek_inbox(topic_id, "alpha", self.forums)
+        senders = [message["sender"] for message in inbox["messages"] if message["kind"] == "claim"]
+        self.assertEqual(senders, ["beta"])
+
+    def test_partial_job_failure_still_leaves_every_member_mail(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        fail_worker = self.directory / "fail_worker.py"
+        fail_worker.write_text("import sys\nsys.exit(9)\n", encoding="utf-8")
+        right = self._adapter("beta", "redis", "Use Redis")
+        adapter = json.loads(right.read_text(encoding="utf-8"))
+        adapter["args"] = [str(fail_worker)]
+        right.write_text(json.dumps(adapter), encoding="utf-8")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        ingested = forum.ingest_round(topic_id, self.forums)
+        self.assertEqual(len(ingested["failures"]), 1)
+        status = forum.topic_status(topic_id, self.forums)
+        self.assertGreaterEqual(status["unread"]["alpha"], 1)
+        self.assertGreaterEqual(status["unread"]["beta"], 1)
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        self.assertEqual(second["round"], 2)
+
+    def test_post_rejects_forged_member_claims(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        with self.assertRaisesRegex(RelayError, "claims come from ingest"):
+            forum.post_message(
+                topic_id,
+                sender="beta",
+                kind="claim",
+                body={"claim_id": "forged", "position": "nope"},
+                forums_dir=self.forums,
+                recipient="alpha",
+            )
+        with self.assertRaisesRegex(RelayError, "Only the chair can post"):
+            forum.post_message(
+                topic_id,
+                sender="beta",
+                kind="note",
+                body={"text": "nope"},
+                forums_dir=self.forums,
+                broadcast=True,
+            )
+
+    def test_split_consensus_stays_open_for_chair_override(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        split = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(split["status"], "split")
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
+        agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
+        self.assertEqual(agreed["status"], "agreed")
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "settled")
+
 
 if __name__ == "__main__":
     unittest.main()

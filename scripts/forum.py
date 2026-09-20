@@ -22,6 +22,7 @@ SCHEMA_VERSION = 1
 TOPIC_ID = re.compile(r"^[0-9a-f]{32}$")
 MEMBER_ID = re.compile(r"^[a-z0-9-]{1,32}$")
 MESSAGE_KINDS = {"task", "claim", "rebuttal", "ballot", "consensus", "note"}
+POST_KINDS = {"note", "task"}
 BALLOTS = {"agree", "dissent", "abstain"}
 THRESHOLDS = {"unanimous", "majority"}
 FORUM_KINDS = {"plan", "research"}
@@ -83,6 +84,11 @@ SCHEMA = [
     """
     CREATE INDEX IF NOT EXISTS inbox_undelivered
     ON messages (topic_id, recipient, delivered_at, created_at)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS messages_once
+    ON messages (topic_id, recipient, sender, kind, round)
+    WHERE kind IN ('task', 'claim', 'rebuttal', 'consensus')
     """,
     """
     CREATE TABLE IF NOT EXISTS rounds (
@@ -468,12 +474,14 @@ def post_message(
     recipient: str | None = None,
     broadcast: bool = False,
 ) -> dict[str, Any]:
-    if kind not in MESSAGE_KINDS:
-        raise RelayError(f"Unknown message kind: {kind}")
+    if kind not in POST_KINDS:
+        raise RelayError("Only the chair can post note or task messages; claims come from ingest.")
+    if sender != "chair":
+        raise RelayError("Only the chair can post to a forum inbox.")
     if broadcast == (recipient is not None):
         raise RelayError("Post with --to MEMBER or --broadcast, not both.")
     now = time.time()
-    with database(forums_dir) as connection:
+    with database(forums_dir) as connection, immediate(connection):
         topic = _topic(connection, topic_id)
         if topic["status"] in {"settled", "closed"}:
             raise RelayError("Cannot post to a settled or closed topic.")
@@ -483,15 +491,12 @@ def post_message(
                 raise RelayError(f"Unknown member: {recipient}")
             targets = [recipient]
         else:
-            targets = [member_id for member_id in members if member_id != sender]
-            if sender == "chair":
-                targets = members
-        ids: list[str] = []
-        with immediate(connection):
-            for target in targets:
-                ids.append(_insert_message(connection, topic_id, target, sender, kind, topic["round"], body, now))
-            connection.execute("UPDATE topics SET updated_at=? WHERE topic_id=?", (now, topic_id))
-        return {"topic_id": topic_id, "message_ids": ids, "recipients": targets, "kind": kind}
+            targets = members
+        ids = [
+            _insert_message(connection, topic_id, target, sender, kind, topic["round"], body, now) for target in targets
+        ]
+        connection.execute("UPDATE topics SET updated_at=? WHERE topic_id=?", (now, topic_id))
+    return {"topic_id": topic_id, "message_ids": ids, "recipients": targets, "kind": kind}
 
 
 def _require_member(connection: sqlite3.Connection, topic_id: str, member_id: str) -> dict[str, Any]:
@@ -741,6 +746,14 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
             }
         kind = "claim" if round_no == 1 else "rebuttal"
         with immediate(connection):
+            fresh = _topic(connection, topic_id)
+            if fresh["status"] != "round_pending" or int(fresh["round"]) != round_no:
+                raise RelayError("No pending forum round to ingest.")
+            round_row = connection.execute(
+                "SELECT status FROM rounds WHERE topic_id=? AND round=?", (topic_id, round_no)
+            ).fetchone()
+            if round_row is not None and round_row["status"] in {"ingested", "failed"}:
+                raise RelayError("No pending forum round to ingest.")
             for member_id, parsed in parsed_by_member.items():
                 connection.execute(
                     """
@@ -787,6 +800,25 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                         continue
                     _insert_message(connection, topic_id, recipient, member_id, kind, round_no, body, now)
                 ingested.append({"member_id": member_id, "claim_id": parsed["claim_id"], "job_id": parsed["job_id"]})
+            for member_id in member_ids:
+                unread = connection.execute(
+                    """
+                    SELECT COUNT(*) AS n FROM messages
+                    WHERE topic_id=? AND recipient=? AND delivered_at IS NULL
+                    """,
+                    (topic_id, member_id),
+                ).fetchone()["n"]
+                if unread == 0:
+                    _insert_message(
+                        connection,
+                        topic_id,
+                        member_id,
+                        "chair",
+                        "note",
+                        round_no,
+                        {"text": "Round ingest produced no peer claims for this member.", "failures": failures},
+                        now,
+                    )
             round_status = "failed" if failures and not ingested else "ingested"
             connection.execute(
                 "UPDATE rounds SET status=?, finished_at=? WHERE topic_id=? AND round=?",
@@ -846,6 +878,8 @@ def settle_topic(
             raise RelayError("Ingest the pending round before settling.")
         if topic["status"] == "closed":
             raise RelayError("Topic is closed.")
+        if topic["status"] == "settled":
+            raise RelayError("Topic is already settled.")
         members = _members(connection, topic_id)
         member_ids = [member["member_id"] for member in members]
         claims = [
@@ -903,6 +937,9 @@ def settle_topic(
         export_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         write_json(export_path, payload)
         with immediate(connection):
+            fresh = _topic(connection, topic_id)
+            if fresh["status"] in {"settled", "closed", "round_pending"}:
+                raise RelayError("Topic cannot be settled in its current state.")
             connection.execute(
                 """
                 INSERT INTO consensus(topic_id, status, payload, exported_path, created_at)
@@ -915,11 +952,15 @@ def settle_topic(
                 """,
                 (topic_id, payload["status"], json.dumps(payload, ensure_ascii=False), str(export_path), now),
             )
+            connection.execute(
+                "DELETE FROM messages WHERE topic_id=? AND kind='consensus'",
+                (topic_id,),
+            )
             for member_id in member_ids:
                 _insert_message(connection, topic_id, member_id, "chair", "consensus", latest_round, payload, now)
             connection.execute(
-                "UPDATE topics SET status='settled', threshold=?, updated_at=? WHERE topic_id=?",
-                (chosen, now, topic_id),
+                "UPDATE topics SET status=?, threshold=?, updated_at=? WHERE topic_id=?",
+                ("settled" if agreed else "open", chosen, now, topic_id),
             )
         return {**payload, "exported_path": str(export_path)}
 
@@ -1022,7 +1063,7 @@ def register_cli(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         if name == "post":
             parser.add_argument("--to")
             parser.add_argument("--broadcast", action="store_true")
-            parser.add_argument("--kind", default="note")
+            parser.add_argument("--kind", default="note", choices=sorted(POST_KINDS))
             parser.add_argument("--body-file", type=Path, required=True)
             parser.add_argument("--sender", default="chair")
         if name == "wait":

@@ -171,7 +171,7 @@ python3 scripts/relay.py forum ingest TOPIC_ID
 python3 scripts/relay.py forum settle TOPIC_ID
 ```
 
-`round` takes each inbox in one `BEGIN IMMEDIATE` transaction so two chairs cannot steal the same messages. `ingest` broadcasts claims to the other members. `settle` writes `consensus.json` and fans that notice out as ordinary inbox rows. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
+`round` takes each inbox in one `BEGIN IMMEDIATE` transaction so two chairs cannot steal the same messages. `ingest` broadcasts claims once; a failed peer still leaves every member mail. `settle` writes `consensus.json` and fans that notice out as ordinary inbox rows. Split stays open for a chair override. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
 
 ## Restricted execution environments
 

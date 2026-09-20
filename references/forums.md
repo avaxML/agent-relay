@@ -31,9 +31,9 @@ python3 scripts/relay.py forum close TOPIC_ID
 
 `--member opencode` sets both `member_id` and `provider`. Use `member_id=reviewer,provider=cursor,effort=high,adapter_file=/abs/adapter.json` for distinct IDs or per-member settings. Open validates each adapter. A forum needs at least two members. `--max-rounds` defaults to 2 and cannot exceed 4.
 
-`round` submits one detached job per member with `--kind plan` or `--kind research`, the original `--files`, and a task that contains the question plus the taken inbox. `wait` waits on that round's jobs and does not cancel them. `ingest` reads completed `result.json` files, stores claims and ballots, and inserts new undelivered messages for the other members. Ingest of a still-running round exits 2 with `pending`.
+`round` submits one detached job per member with `--kind plan` or `--kind research`, the original `--files`, and a task that contains the question plus the taken inbox. `wait` waits on that round's jobs and does not cancel them. `ingest` reads completed `result.json` files, stores claims and ballots, and inserts new undelivered messages for the other members. A second ingest of the same round is rejected inside the write lock so claims are not duplicated. If a member fails and a peer would otherwise have an empty inbox, ingest posts a chair note so the next round can start. Ingest of a still-running round exits 2 with `pending`.
 
-`settle` writes `consensus.json` under the topic directory and broadcasts that payload to every member. Agreement follows ballots against the topic threshold, or a chair `--claim-id` override. Split consensus is a valid terminal result: the lead still chooses. Relay never applies a change because members agreed.
+`forum post` is chair-only and accepts `note` or `task`. Claims, rebuttals, ballots, and consensus are produced by ingest and settle. `settle` writes `consensus.json` and fans that notice out as inbox rows. Agreement follows ballots against the topic threshold, or a chair `--claim-id` override. Split consensus leaves the topic `open` so the chair can override or run another round. Agreed topics become `settled`. Relay never applies a change because members agreed.
 
 ## Concurrency
 
@@ -43,6 +43,7 @@ Independent forum commands may run in different processes. Typical races:
 - Two `forum round` calls: one updates the topic to `round_pending` and takes mail; the other fails because the topic is not `open`.
 - `forum inbox` during a round: peek sees remaining undelivered rows; it cannot steal the taken batch.
 - `ingest` while a job is running: returns pending; it does not broadcast a partial claim set.
+- Two `forum ingest` calls: one commits claims; the other sees the topic is no longer `round_pending` and does not duplicate mail.
 
 There is still no global concurrency limiter for provider CLIs. Keep member count and overlapping topics within quota, as with ordinary `submit`.
 

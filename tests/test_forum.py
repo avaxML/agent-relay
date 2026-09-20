@@ -9,6 +9,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -482,6 +483,81 @@ class ForumTests(unittest.TestCase):
         self.assertEqual(agreed["status"], "agreed")
         self.assertEqual(agreed["position"], "Use ETag")
         self.assertFalse(agreed["chair_override"])
+
+    def test_rejected_settle_does_not_write_consensus_file(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        export = self.forums / topic_id / "consensus.json"
+        original = forum._select_claim
+
+        def poison(*args: object, **kwargs: object) -> tuple[dict, bool]:
+            chosen = original(*args, **kwargs)
+            with forum.database(self.forums) as connection, forum.immediate(connection):
+                connection.execute(
+                    "UPDATE topics SET status='round_pending', updated_at=? WHERE topic_id=?",
+                    (time.time(), topic_id),
+                )
+            return chosen
+
+        with (
+            patch.object(forum, "_select_claim", side_effect=poison),
+            self.assertRaisesRegex(RelayError, "cannot be settled"),
+        ):
+            forum.settle_topic(topic_id, self.forums)
+        self.assertFalse(export.exists())
+        with forum.database(self.forums) as connection:
+            row = connection.execute("SELECT * FROM consensus WHERE topic_id=?", (topic_id,)).fetchone()
+        self.assertIsNone(row)
+
+    def test_concurrent_settles_keep_consensus_file_aligned_with_db(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        real_write = forum.write_json
+
+        def slow_write(path: Path, payload: object) -> None:
+            time.sleep(0.05)
+            real_write(path, payload)
+
+        def attempt(claim_id: str | None) -> None:
+            try:
+                forum.settle_topic(topic_id, self.forums, claim_id=claim_id)
+            except RelayError:
+                return
+
+        with patch.object(forum, "write_json", side_effect=slow_write):
+            threads = [
+                threading.Thread(target=attempt, args=(None,)),
+                threading.Thread(target=attempt, args=("etag",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        export = self.forums / topic_id / "consensus.json"
+        with forum.database(self.forums) as connection:
+            row = connection.execute("SELECT payload FROM consensus WHERE topic_id=?", (topic_id,)).fetchone()
+        self.assertIsNotNone(row)
+        db_payload = json.loads(row["payload"])
+        file_payload = json.loads(export.read_text(encoding="utf-8"))
+        self.assertEqual(file_payload["status"], db_payload["status"])
+        self.assertEqual(file_payload["claim_id"], db_payload["claim_id"])
+        self.assertEqual(file_payload["chair_override"], db_payload["chair_override"])
+        status = forum.topic_status(topic_id, self.forums)["status"]
+        if status == "settled":
+            self.assertEqual(file_payload["status"], "agreed")
+        else:
+            self.assertEqual(status, "open")
+            self.assertEqual(file_payload["status"], "split")
 
     def test_parse_answer_rejects_concatenated_json_objects(self) -> None:
         text = '{"claim_id":"first","position":"A"}\n{"claim_id":"second","position":"B"}'

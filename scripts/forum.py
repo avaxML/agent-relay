@@ -997,8 +997,6 @@ def settle_topic(
             ],
         }
         export_path = forum_root(forums_dir) / topic_id / "consensus.json"
-        export_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        write_json(export_path, payload)
         with immediate(connection):
             fresh = _topic(connection, topic_id)
             if fresh["status"] in {"settled", "closed", "round_pending"}:
@@ -1025,6 +1023,8 @@ def settle_topic(
                 "UPDATE topics SET status=?, threshold=?, updated_at=? WHERE topic_id=?",
                 ("settled" if agreed else "open", chosen, now, topic_id),
             )
+            export_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write_json(export_path, payload)
         return {**payload, "exported_path": str(export_path)}
 
 

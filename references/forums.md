@@ -24,6 +24,7 @@ python3 scripts/relay.py forum post TOPIC_ID --body-file FILE [--to MEMBER | --b
 python3 scripts/relay.py forum round TOPIC_ID
 python3 scripts/relay.py forum wait TOPIC_ID [--timeout 30]
 python3 scripts/relay.py forum ingest TOPIC_ID
+python3 scripts/relay.py forum abandon TOPIC_ID
 python3 scripts/relay.py forum settle TOPIC_ID [--claim-id ID] [--threshold unanimous|majority]
 python3 scripts/relay.py forum export TOPIC_ID [--output FILE]
 python3 scripts/relay.py forum close TOPIC_ID
@@ -31,7 +32,7 @@ python3 scripts/relay.py forum close TOPIC_ID
 
 `--member opencode` sets both `member_id` and `provider`. Use `member_id=reviewer,provider=cursor,effort=high,adapter_file=/abs/adapter.json` for distinct IDs or per-member settings. Open validates each adapter. A forum needs at least two members. `--max-rounds` defaults to 2 and cannot exceed 4.
 
-`round` submits one detached job per member with `--kind plan` or `--kind research`, the original `--files`, and a task that contains the question plus the taken inbox. `wait` waits on that round's jobs and does not cancel them. `ingest` reads completed `result.json` files, stores claims and ballots, and inserts new undelivered messages for the other members. A second ingest of the same round is rejected inside the write lock so claims are not duplicated. If a member fails and a peer would otherwise have an empty inbox, ingest posts a chair note so the next round can start. Ingest of a still-running round exits 2 with `pending`.
+`round` submits one detached job per member with `--kind plan` or `--kind research`, the original `--files`, and a task that contains the question plus the taken inbox. `wait` waits on that round's jobs and does not cancel them. Missing job directories are reported as `missing` instead of raising. `ingest` reads completed `result.json` files, stores claims and ballots, and inserts new undelivered messages for the other members. A second ingest of the same round is rejected inside the write lock so claims are not duplicated. Concatenated or non-object JSON answers are `malformed` failures, not fabricated claims. If every job record is gone, ingest abandons the round, restores inboxes, and returns the topic to `open`. `forum abandon` does the same on request. If a member fails and a peer would otherwise have an empty inbox, ingest posts a chair note so the next round can start. Ingest of a still-running round exits 2 with `pending`.
 
 `forum post` is chair-only and accepts `note` or `task`. Claims, rebuttals, ballots, and consensus are produced by ingest and settle. `settle` writes `consensus.json` and fans that notice out as inbox rows. Agreement follows ballots against the topic threshold, or a chair `--claim-id` override. Split consensus leaves the topic `open` so the chair can override or run another round. Agreed topics become `settled`. Relay never applies a change because members agreed.
 

@@ -14,7 +14,7 @@ Resolve the plugin root as the directory two levels above the directory containi
 1. State one planning or research question, the repository root, and the smallest relevant file set. Use `--kind plan` or `--kind research`. Honor an explicit provider, model, and effort per member. Run `doctor` first when a provider has not been checked in this session.
 2. Open a topic with at least two `--member` specs. A bare name is `member_id` and `provider`. Distinct IDs are required when two members share a provider: `member_id=reviewer,provider=cursor`.
 3. Launch `forum round`. That transactionally takes each inbox, writes a task snapshot, and `submit`s one job per member. Do not emulate this with shell `&`. Peek with `forum inbox --member ID`; peeking does not consume mail.
-4. `forum wait TOPIC_ID --timeout 30`, then `forum ingest`. Ingest stores claims and broadcasts them into the other members' inboxes. If claims already agree, skip another round.
+4. `forum wait TOPIC_ID --timeout 30`, then `forum ingest`. Ingest stores claims and broadcasts them into the other members' inboxes. If claims already agree, skip another round. If jobs disappeared, ingest abandons the round and restores mail; `forum abandon TOPIC_ID` does that explicitly.
 5. At most one rebuttal round. Then `forum settle`. Unanimous or majority ballots can agree; a split leaves the topic open so the chair can `--claim-id` override or close. Treat `consensus.json` as advisory. Verify every surviving citation in source. Never apply a patch because members agreed.
 
 Example:

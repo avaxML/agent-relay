@@ -26,6 +26,9 @@ POST_KINDS = {"note", "task"}
 BALLOTS = {"agree", "dissent", "abstain"}
 THRESHOLDS = {"unanimous", "majority"}
 FORUM_KINDS = {"plan", "research"}
+JOB_MISSING = "missing"
+JOB_MALFORMED = "malformed"
+WAIT_TERMINAL = jobs.TERMINAL | {JOB_MISSING}
 MEMBER_FIELDS = {"member_id", "provider", "model", "effort", "adapter_file", "registry_dir"}
 MAX_ROUNDS = 4
 
@@ -601,6 +604,27 @@ def _abandon_round(connection: sqlite3.Connection, topic_id: str, round_no: int)
         )
 
 
+def abandon_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
+    with database(forums_dir) as connection:
+        topic = _topic(connection, topic_id)
+        if topic["status"] != "round_pending":
+            raise RelayError("No pending forum round to abandon.")
+        round_no = int(topic["round"])
+        rows = connection.execute(
+            "SELECT job_id FROM round_jobs WHERE topic_id=? AND round=?",
+            (topic_id, round_no),
+        ).fetchall()
+        jobs_dir = Path(topic["jobs_dir"])
+        for row in rows:
+            if not row["job_id"]:
+                continue
+            with suppress(RelayError, OSError):
+                jobs.cancel(row["job_id"], jobs_dir)
+                jobs.wait(row["job_id"], jobs_dir, 3)
+        _abandon_round(connection, topic_id, round_no)
+    return {**topic_status(topic_id, forums_dir), "abandoned": True}
+
+
 def _write_round_task(
     forums_root: Path,
     topic_id: str,
@@ -654,14 +678,30 @@ def _submit_args(topic: dict[str, Any], member: dict[str, Any], task_path: Path)
     )
 
 
-def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any]:
+def _inspect_job(job_id: str, jobs_dir: Path) -> dict[str, Any]:
+    try:
+        return jobs.status(job_id, jobs_dir)
+    except RelayError as exc:
+        return {"status": JOB_MISSING, "error": str(exc), "job_id": job_id}
+
+
+def _job_result(job_id: str, jobs_dir: Path) -> dict[str, Any]:
+    try:
+        return jobs.result(job_id, jobs_dir)
+    except RelayError as exc:
+        return {"status": JOB_MISSING, "error": str(exc), "job_id": job_id, "result_ready": False}
+
+
+def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any] | None:
     payload = _load_json_object(text)
+    if payload is None:
+        return None
     raw_claim = payload.get("claim_id")
     default_claim = f"{member_id}-r{round_no}"
     claim_id = raw_claim.strip() if isinstance(raw_claim, str) and raw_claim.strip() else default_claim
     position = payload.get("position")
     if not isinstance(position, str) or not position.strip():
-        position = text.strip()
+        return None
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
     ballots: list[dict[str, str]] = []
     raw_ballots = payload.get("ballots")
@@ -682,24 +722,22 @@ def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any]:
     }
 
 
-def _load_json_object(text: str) -> dict[str, Any]:
+def _load_json_object(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
-    candidates = [stripped]
     if "```json" in stripped:
         start = stripped.find("```json") + 7
         end = stripped.find("```", start)
         if end != -1:
-            candidates.insert(0, stripped[start:end].strip())
-    if "{" in stripped and "}" in stripped:
-        candidates.append(stripped[stripped.find("{") : stripped.rfind("}") + 1])
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return {}
+            stripped = stripped[start:end].strip()
+    try:
+        value, index = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if stripped[index:].strip():
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
 
 
 def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
@@ -725,7 +763,17 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
             if not job_id:
                 pending.append(row["member_id"])
                 continue
-            state = jobs.result(job_id, jobs_root)
+            state = _job_result(job_id, jobs_root)
+            if state["status"] == JOB_MISSING:
+                failures.append(
+                    {
+                        "member_id": row["member_id"],
+                        "job_id": job_id,
+                        "status": JOB_MISSING,
+                        "error": state.get("error"),
+                    }
+                )
+                continue
             if state["status"] not in jobs.TERMINAL:
                 pending.append(row["member_id"])
                 continue
@@ -735,6 +783,9 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                 continue
             answer = str(result.get("answer") or "")
             parsed = parse_answer(answer, row["member_id"], round_no)
+            if parsed is None:
+                failures.append({"member_id": row["member_id"], "job_id": job_id, "status": JOB_MALFORMED})
+                continue
             parsed_by_member[row["member_id"]] = {**parsed, "job_id": job_id, "raw_answer": answer}
         if pending:
             return {
@@ -742,6 +793,15 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                 "round": round_no,
                 "status": "round_pending",
                 "pending": pending,
+                "failures": failures,
+            }
+        if not parsed_by_member and failures and all(item.get("status") == JOB_MISSING for item in failures):
+            _abandon_round(connection, topic_id, round_no)
+            return {
+                "topic_id": topic_id,
+                "round": round_no - 1,
+                "status": "open",
+                "abandoned": True,
                 "failures": failures,
             }
         kind = "claim" if round_no == 1 else "rebuttal"
@@ -858,9 +918,9 @@ def wait_round(topic_id: str, forums_dir: Path | None, timeout: int) -> dict[str
             if not row["job_id"]:
                 states.append({"member_id": row["member_id"], "status": "launching"})
                 continue
-            state = jobs.status(row["job_id"], jobs_dir)
+            state = _inspect_job(row["job_id"], jobs_dir)
             states.append({"member_id": row["member_id"], "job_id": row["job_id"], "status": state["status"]})
-        if all(item["status"] in jobs.TERMINAL for item in states):
+        if all(item["status"] in WAIT_TERMINAL for item in states):
             return {"topic_id": topic_id, "round": round_no, "wait_timed_out": False, "jobs": states}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1055,7 +1115,7 @@ def register_cli(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
     open_cmd.add_argument("--max-input-bytes", type=int, default=400000)
     open_cmd.add_argument("--max-answer-chars", type=int, default=12000)
     open_cmd.add_argument("--jobs-dir", type=Path)
-    for name in ("status", "inbox", "round", "ingest", "wait", "settle", "close", "export", "post"):
+    for name in ("status", "inbox", "round", "ingest", "wait", "abandon", "settle", "close", "export", "post"):
         parser = sub.add_parser(name)
         parser.add_argument("topic_id")
         if name == "inbox":
@@ -1126,16 +1186,18 @@ def dispatch(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         result = ingest_round(topic_id, forums_dir)
         if result.get("pending"):
             return result, 2
-        if result.get("failures"):
+        if result.get("failures") or result.get("abandoned"):
             return result, 1
         return result, 0
     if command == "wait":
         result = wait_round(topic_id, forums_dir, args.timeout)
         if result["wait_timed_out"]:
             return result, 2
-        if any(item["status"] in {"failed", "cancelled", "interrupted"} for item in result["jobs"]):
+        if any(item["status"] in {"failed", "cancelled", "interrupted", JOB_MISSING} for item in result["jobs"]):
             return result, 1
         return result, 0
+    if command == "abandon":
+        return abandon_round(topic_id, forums_dir), 0
     if command == "settle":
         result = settle_topic(topic_id, forums_dir, args.claim_id, args.threshold)
         return result, 0 if result["status"] == "agreed" else 1

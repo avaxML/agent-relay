@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -443,6 +444,64 @@ class ForumTests(unittest.TestCase):
         agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
         self.assertEqual(agreed["status"], "agreed")
         self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "settled")
+
+    def test_parse_answer_rejects_concatenated_json_objects(self) -> None:
+        text = '{"claim_id":"first","position":"A"}\n{"claim_id":"second","position":"B"}'
+        self.assertIsNone(forum.parse_answer(text, "alpha", 1))
+        fenced = '```json\n{"claim_id":"etag","position":"Use ETag","evidence":[]}\n```'
+        parsed = forum.parse_answer(fenced, "alpha", 1)
+        assert parsed is not None
+        self.assertEqual(parsed["claim_id"], "etag")
+
+    def test_concatenated_json_answers_are_malformed_failures(self) -> None:
+        worker = self.directory / "two_json.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                import json, sys
+                json.load(sys.stdin)
+                print(json.dumps({"claim_id": "first", "position": "A"}))
+                print(json.dumps({"claim_id": "second", "position": "B"}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        for path in (left, right):
+            adapter = json.loads(path.read_text(encoding="utf-8"))
+            adapter["args"] = [str(worker)]
+            path.write_text(json.dumps(adapter), encoding="utf-8")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        ingested = forum.ingest_round(topic_id, self.forums)
+        self.assertEqual({item["status"] for item in ingested["failures"]}, {forum.JOB_MALFORMED})
+        self.assertEqual(ingested["ingested"], [])
+        inbox = forum.peek_inbox(topic_id, "alpha", self.forums)
+        self.assertFalse(any(message["kind"] == "claim" for message in inbox["messages"]))
+
+    def test_deleted_jobs_dir_abandons_round_and_restores_mail(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        shutil.rmtree(self.jobs)
+        waited = forum.wait_round(topic_id, self.forums, 0)
+        self.assertTrue(all(item["status"] == forum.JOB_MISSING for item in waited["jobs"]))
+        ingested = forum.ingest_round(topic_id, self.forums)
+        self.assertTrue(ingested["abandoned"])
+        status = forum.topic_status(topic_id, self.forums)
+        self.assertEqual(status["status"], "open")
+        self.assertEqual(status["round"], 0)
+        self.assertEqual(status["unread"]["alpha"], 1)
+        self.assertEqual(status["unread"]["beta"], 1)
+        retry = forum.start_round(topic_id, self.forums)
+        self._track(retry)
+        self.assertEqual(retry["round"], 1)
 
 
 if __name__ == "__main__":

@@ -12,3 +12,6 @@ build/
 artifacts/
 jobs/
 .coverage
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

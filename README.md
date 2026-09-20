@@ -15,7 +15,7 @@ The bundled adapters are:
 | `antigravity` | `gemini-3.8-flash-low` | broad extraction and corpus reading |
 | `cursor` | `cursor-grok-4.6-high` | independent review through Cursor Agent |
 
-Use the bundled skills for common workflows: `delegate`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
+Use the bundled skills for common workflows: `delegate`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `plan-research`, `relay-doctor`, and `add-cli-adapter`.
 
 ## Requirements
 
@@ -66,7 +66,7 @@ python3 scripts/relay.py run \
   --kind read
 ```
 
-Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
+Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, `--kind patch` for an implementation proposal, `--kind plan` or `--kind research` for a multi-member forum. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
 
 ## Adapter registry
 
@@ -123,7 +123,7 @@ python3 -m unittest discover -s tests -v
 
 Live checks use the configured provider subscription. OpenCode, Antigravity, and Cursor returned `7319` with an exact source citation from synthetic bundles. These checks establish basic transport and citation behavior, not general model quality. Antigravity and Cursor each reported more than 16,000 input tokens for a small task, so use local tools for tiny reads and measure delegation overhead on representative work.
 
-An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, strict provider result decoding, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, and startup locking. OpenCode and Antigravity also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all bundled skill validators are checked before release.
+An OpenCode implementation proposal also passed `git apply --check` for a one-line fixture change. The source file remained unchanged during delegation. The runner uses only the Python standard library. The test suite covers transport, strict provider result decoding, adapter registration and resolution, reasoning-effort mapping, detached jobs, concurrent workers, snapshots, bounded waits, cancellation, startup locking, and SQLite-backed plan/research forums. OpenCode and Antigravity also completed overlapping detached jobs, retrieved successfully from later CLI processes. Explicit high-effort requests returned the correct fixture answer on both providers; Antigravity also reported thinking-token usage. Ruff, mypy, plugin validation, and all bundled skill validators are checked before release.
 
 ## Releases
 
@@ -155,6 +155,23 @@ python3 scripts/relay.py result "$JOB_ID"
 `wait` waits at most the requested seconds and returns exit code 2 with `wait_timed_out: true` if the worker is still active; it does not cancel the worker. `status` is an inspection command and exits 0 even when the job failed. `result` prints the saved result JSON for completed jobs, exits 2 while a job is pending, and exits 1 for failures. `cancel` makes an idempotent cooperative request and may report `cancelling` until the worker drains; the client never kills a PID.
 
 Detached runners can outlive the submitter and a new Codex session while the operating system keeps them alive. A reboot or hard kill marks work `interrupted`; there is no automatic retry or resume, and an abruptly killed runner may leave the provider CLI process behind, so cancellation cannot guarantee cleanup in that case. Jobs inherit the invoking environment and CLI credentials. Snapshots, logs, terminal results, and provider session history may contain sensitive source material; retain them deliberately. Job records are local files and do not provide hard OS isolation.
+
+## Plan and research forums
+
+Use the `plan-research` skill when two or more providers should propose a plan or investigate a question, optionally rebut, and record agreement. Workers stay isolated one-shot jobs. A SQLite inbox in `AGENT_RELAY_FORUMS_DIR` or `~/.local/state/agent-relay/forums` is the coordination plane; job snapshots stay on the filesystem. The chair copies undelivered messages into the next task file. Running workers cannot receive mail.
+
+```sh
+python3 scripts/relay.py forum open \
+  --kind plan --question-file /abs/path/question.txt \
+  --root /abs/path/repository --files src/module.py \
+  --member opencode --member cursor
+python3 scripts/relay.py forum round TOPIC_ID
+python3 scripts/relay.py forum wait TOPIC_ID --timeout 30
+python3 scripts/relay.py forum ingest TOPIC_ID
+python3 scripts/relay.py forum settle TOPIC_ID
+```
+
+`round` takes each inbox in one `BEGIN IMMEDIATE` transaction so two chairs cannot steal the same messages. `ingest` broadcasts claims to the other members. `settle` writes `consensus.json` and fans that notice out as ordinary inbox rows. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
 
 ## Restricted execution environments
 

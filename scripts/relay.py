@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import forum
 import jobs
 from execution import execute
 from providers import (
@@ -130,6 +131,7 @@ def main() -> int:
             sub.add_argument(
                 "--timeout", type=nonnegative_int, default=30, help="Wait deadline; does not cancel the job."
             )
+    forum.register_cli(commands)
     args = parser.parse_args()
     result: dict[str, Any]
     try:
@@ -168,6 +170,8 @@ def main() -> int:
                 code = 1
             else:
                 code = 2
+        elif args.command == "forum":
+            result, code = forum.dispatch(args)
         else:
             if args.adapter_file and not args.provider:
                 raise RelayError("--adapter-file requires --provider.")

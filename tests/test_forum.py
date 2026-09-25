@@ -221,6 +221,89 @@ class ForumTests(unittest.TestCase):
         self.assertEqual(code, 0, again)
         self.assertGreaterEqual(len(again["messages"]), 2)
 
+    def test_chair_can_post_a_second_task_before_first_round(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        body = self.directory / "task.json"
+        body.write_text(json.dumps({"question": "Compare cache invalidation"}), encoding="utf-8")
+
+        code, posted = self._cli(
+            "forum",
+            "post",
+            topic_id,
+            "--kind",
+            "task",
+            "--to",
+            "alpha",
+            "--body-file",
+            str(body),
+            "--forums-dir",
+            str(self.forums),
+        )
+
+        self.assertEqual(code, 0, posted)
+        code, inbox = self._cli("forum", "inbox", topic_id, "--member", "alpha", "--forums-dir", str(self.forums))
+        self.assertEqual(code, 0, inbox)
+        tasks = [message["body"]["question"] for message in inbox["messages"] if message["kind"] == "task"]
+        self.assertEqual(tasks, ["How should we cache GET /items?", "Compare cache invalidation"])
+
+    def test_first_round_ballots_do_not_create_unreviewed_agreement(self) -> None:
+        vote = [{"on": "etag", "ballot": "agree"}]
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag", vote),
+            self._adapter("beta", "etag", "Use ETag", vote),
+        )
+        code, launched = self._cli("forum", "round", topic_id, "--forums-dir", str(self.forums))
+        self.assertEqual(code, 0, launched)
+        self._track(launched)
+        self.assertEqual(self._cli("forum", "wait", topic_id, "--timeout", "8", "--forums-dir", str(self.forums))[0], 0)
+        self.assertEqual(self._cli("forum", "ingest", topic_id, "--forums-dir", str(self.forums))[0], 0)
+
+        code, settled = self._cli("forum", "settle", topic_id, "--forums-dir", str(self.forums))
+
+        self.assertEqual(code, 0, settled)
+        self.assertEqual(settled["status"], "split")
+        self.assertEqual(settled["tally"]["counts"]["agree"], 0)
+
+    def test_forum_uses_the_source_revision_present_when_it_opened(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        self.source.write_text("cache now uses redis\n", encoding="utf-8")
+
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        for item in launched["jobs"]:
+            task = json.loads((self.jobs / item["job_id"] / "task.json").read_text(encoding="utf-8"))
+            request = json.loads(task["request"])
+            self.assertEqual(request["sources"][0]["numbered_content"], "1: cache uses files")
+
+    def test_second_round_rejects_ballots_for_claims_outside_its_candidate_set(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        first = forum.start_round(topic_id, self.forums)
+        self._track(first)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        for adapter_path in (left, right):
+            adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
+            adapter["env"]["FAKE_BALLOTS"] = json.dumps([{"on": "invented", "ballot": "agree"}])
+            adapter_path.write_text(json.dumps(adapter), encoding="utf-8")
+
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        forum.wait_round(topic_id, self.forums, 8)
+        ingested = forum.ingest_round(topic_id, self.forums)
+
+        self.assertEqual(
+            [(item["member_id"], item["status"]) for item in ingested["failures"]],
+            [("alpha", "malformed"), ("beta", "malformed")],
+        )
+
     def test_second_round_is_rejected_while_jobs_are_pending(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")
@@ -245,6 +328,84 @@ class ForumTests(unittest.TestCase):
         self.assertIn("round_pending", loser["error"])
         wait_code, waited = self._cli("forum", "wait", topic_id, "--timeout", "8", "--forums-dir", str(self.forums))
         self.assertEqual(wait_code, 0, waited)
+
+    def test_close_cannot_pass_a_round_that_started_before_its_write_lock(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        paused = threading.Event()
+        resume = threading.Event()
+        close_result: list[str] = []
+        original_immediate = forum.immediate
+
+        def delayed_immediate(connection):  # type: ignore[no-untyped-def]
+            if threading.current_thread().name == "closer":
+                paused.set()
+                self.assertTrue(resume.wait(5))
+            return original_immediate(connection)
+
+        def close() -> None:
+            try:
+                forum.close_topic(topic_id, self.forums)
+                close_result.append("closed")
+            except RelayError as exc:
+                close_result.append(str(exc))
+
+        with patch("forum.immediate", side_effect=delayed_immediate):
+            thread = threading.Thread(target=close, name="closer")
+            thread.start()
+            self.assertTrue(paused.wait(5))
+            launched = forum.start_round(topic_id, self.forums)
+            self._track(launched)
+            resume.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "round_pending")
+        self.assertEqual(len(close_result), 1)
+        self.assertIn("pending", close_result[0])
+
+    def test_abandon_owns_the_round_before_cancelling_jobs(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        paused = threading.Event()
+        resume = threading.Event()
+        original_cancel = forum.jobs.cancel
+        abandon_result: list[dict] = []
+
+        def delayed_cancel(job_id, jobs_dir):  # type: ignore[no-untyped-def]
+            paused.set()
+            self.assertTrue(resume.wait(5))
+            return original_cancel(job_id, jobs_dir)
+
+        def abandon() -> None:
+            abandon_result.append(forum.abandon_round(topic_id, self.forums))
+
+        with patch("forum.jobs.cancel", side_effect=delayed_cancel):
+            thread = threading.Thread(target=abandon)
+            thread.start()
+            self.assertTrue(paused.wait(5))
+            ingest_error: RelayError | None = None
+            try:
+                forum.ingest_round(topic_id, self.forums)
+            except RelayError as exc:
+                ingest_error = exc
+            finally:
+                resume.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNotNone(ingest_error)
+        self.assertEqual(abandon_result[0]["status"], "open")
+        with forum.database(self.forums) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM claims WHERE topic_id=?", (topic_id,)).fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_round_ingest_broadcasts_claims_and_settle_can_override(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -325,6 +486,25 @@ class ForumTests(unittest.TestCase):
         self.assertFalse(settled["chair_override"])
         self.assertEqual(settled["tally"]["counts"]["agree"], 2)
 
+    def test_second_round_tasks_contain_the_same_complete_candidate_set(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        first = forum.start_round(topic_id, self.forums)
+        self._track(first)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        for member in ("alpha", "beta"):
+            task = (self.forums / topic_id / "rounds" / "2" / member / "task.txt").read_text(encoding="utf-8")
+            self.assertIn('"member_id": "alpha"', task)
+            self.assertIn('"member_id": "beta"', task)
+            self.assertIn('"claim_id": "etag"', task)
+            self.assertIn('"claim_id": "redis"', task)
+
     def test_failed_round_launch_restores_undelivered_mail(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")
@@ -404,6 +584,11 @@ class ForumTests(unittest.TestCase):
         status = forum.topic_status(topic_id, self.forums)
         self.assertGreaterEqual(status["unread"]["alpha"], 1)
         self.assertGreaterEqual(status["unread"]["beta"], 1)
+        beta_inbox = forum.peek_inbox(topic_id, "beta", self.forums)
+        self.assertEqual(
+            [message["body"]["question"] for message in beta_inbox["messages"] if message["kind"] == "task"],
+            ["How should we cache GET /items?"],
+        )
         second = forum.start_round(topic_id, self.forums)
         self._track(second)
         self.assertEqual(second["round"], 2)

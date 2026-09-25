@@ -90,9 +90,9 @@ SCHEMA = [
     ON messages (topic_id, recipient, delivered_at, created_at)
     """,
     """
-    CREATE UNIQUE INDEX IF NOT EXISTS messages_once
+    CREATE UNIQUE INDEX IF NOT EXISTS messages_once_ingest
     ON messages (topic_id, recipient, sender, kind, round)
-    WHERE kind IN ('task', 'claim', 'rebuttal', 'consensus')
+    WHERE kind IN ('claim', 'rebuttal', 'consensus')
     """,
     """
     CREATE TABLE IF NOT EXISTS rounds (
@@ -186,16 +186,20 @@ def connect(root: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous=FULL")
     for statement in SCHEMA:
         connection.execute(statement)
+    connection.execute("DROP INDEX IF EXISTS messages_once")
     _ensure_schema_version(connection)
     os.chmod(db, 0o600)
     return connection
 
 
 def _ensure_schema_version(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO NOTHING",
+        (str(SCHEMA_VERSION),),
+    )
     row = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row is None:
-        connection.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-        return
+        raise RelayError("Forum schema version could not be initialized.")
     version = int(row["value"])
     if version != SCHEMA_VERSION:
         raise RelayError(f"Unsupported forum schema version {version}; expected {SCHEMA_VERSION}.")
@@ -585,9 +589,19 @@ def start_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
     return {"topic_id": topic_id, "round": round_no, "status": "round_pending", "jobs": launched}
 
 
-def _abandon_round(connection: sqlite3.Connection, topic_id: str, round_no: int) -> None:
+def _abandon_round(
+    connection: sqlite3.Connection, topic_id: str, round_no: int, *, require_failed: bool = False
+) -> None:
     now = time.time()
     with immediate(connection):
+        topic = _topic(connection, topic_id)
+        round_row = connection.execute(
+            "SELECT status FROM rounds WHERE topic_id=? AND round=?", (topic_id, round_no)
+        ).fetchone()
+        if topic["status"] != "round_pending" or int(topic["round"]) != round_no or round_row is None:
+            raise RelayError("Round changed before abandonment completed.")
+        if require_failed and round_row["status"] != "failed":
+            raise RelayError("Round is not owned by abandonment.")
         rows = connection.execute(
             "SELECT message_ids FROM round_jobs WHERE topic_id=? AND round=?", (topic_id, round_no)
         ).fetchall()
@@ -609,22 +623,31 @@ def _abandon_round(connection: sqlite3.Connection, topic_id: str, round_no: int)
 
 def abandon_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
     with database(forums_dir) as connection:
-        topic = _topic(connection, topic_id)
-        if topic["status"] != "round_pending":
-            raise RelayError("No pending forum round to abandon.")
-        round_no = int(topic["round"])
-        rows = connection.execute(
-            "SELECT job_id FROM round_jobs WHERE topic_id=? AND round=?",
-            (topic_id, round_no),
-        ).fetchall()
-        jobs_dir = Path(topic["jobs_dir"])
+        with immediate(connection):
+            topic = _topic(connection, topic_id)
+            if topic["status"] != "round_pending":
+                raise RelayError("No pending forum round to abandon.")
+            round_no = int(topic["round"])
+            round_row = connection.execute(
+                "SELECT status FROM rounds WHERE topic_id=? AND round=?", (topic_id, round_no)
+            ).fetchone()
+            if round_row is None:
+                raise RelayError("Pending forum round has no record.")
+            connection.execute(
+                "UPDATE rounds SET status='failed' WHERE topic_id=? AND round=?", (topic_id, round_no)
+            )
+            rows = connection.execute(
+                "SELECT job_id FROM round_jobs WHERE topic_id=? AND round=?",
+                (topic_id, round_no),
+            ).fetchall()
+            jobs_dir = Path(topic["jobs_dir"])
         for row in rows:
             if not row["job_id"]:
                 continue
             with suppress(RelayError, OSError):
                 jobs.cancel(row["job_id"], jobs_dir)
                 jobs.wait(row["job_id"], jobs_dir, 3)
-        _abandon_round(connection, topic_id, round_no)
+        _abandon_round(connection, topic_id, round_no, require_failed=True)
     return {**topic_status(topic_id, forums_dir), "abandoned": True}
 
 
@@ -768,6 +791,11 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
         if topic["status"] != "round_pending":
             raise RelayError("No pending forum round to ingest.")
         round_no = int(topic["round"])
+        round_state = connection.execute(
+            "SELECT status FROM rounds WHERE topic_id=? AND round=?", (topic_id, round_no)
+        ).fetchone()
+        if round_state is None or round_state["status"] == "failed":
+            raise RelayError("Round is being abandoned.")
         jobs_root = Path(topic["jobs_dir"])
         members = _members(connection, topic_id)
         member_ids = [member["member_id"] for member in members]
@@ -841,6 +869,14 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
             ).fetchone()
             if round_row is not None and round_row["status"] in {"ingested", "failed"}:
                 raise RelayError("No pending forum round to ingest.")
+            failed_members = {item["member_id"] for item in failures}
+            for row in round_jobs:
+                if row["member_id"] in failed_members:
+                    for message_id in json.loads(row["message_ids"]):
+                        connection.execute(
+                            "UPDATE messages SET delivered_at=NULL WHERE topic_id=? AND message_id=?",
+                            (topic_id, message_id),
+                        )
             for member_id, parsed in parsed_by_member.items():
                 connection.execute(
                     """
@@ -1119,14 +1155,13 @@ def close_topic(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
     now = time.time()
     closed_payload = {"status": "closed", "topic_id": topic_id}
     export_path = forum_root(forums_dir) / topic_id / "consensus.json"
-    with database(forums_dir) as connection:
+    with database(forums_dir) as connection, immediate(connection):
         topic = _topic(connection, topic_id)
         if topic["status"] == "round_pending":
             raise RelayError("Ingest or abandon the pending round before closing.")
-        with immediate(connection):
-            connection.execute("UPDATE topics SET status='closed', updated_at=? WHERE topic_id=?", (now, topic_id))
-            connection.execute(
-                """
+        connection.execute("UPDATE topics SET status='closed', updated_at=? WHERE topic_id=?", (now, topic_id))
+        connection.execute(
+            """
                 INSERT INTO consensus(topic_id, status, payload, exported_path, created_at)
                 VALUES (?, 'closed', ?, ?, ?)
                 ON CONFLICT(topic_id) DO UPDATE SET
@@ -1135,10 +1170,10 @@ def close_topic(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                     exported_path=excluded.exported_path,
                     created_at=excluded.created_at
                 """,
-                (topic_id, json.dumps(closed_payload, ensure_ascii=False), str(export_path), now),
-            )
-            export_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            write_json(export_path, closed_payload)
+            (topic_id, json.dumps(closed_payload, ensure_ascii=False), str(export_path), now),
+        )
+        export_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        write_json(export_path, closed_payload)
     return topic_status(topic_id, forums_dir)
 
 

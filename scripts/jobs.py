@@ -79,10 +79,7 @@ def status(job_id: str, root: Path) -> dict[str, Any]:
         launch_started_at = state.get("launch_started_at", state["created_at"])
         if not active and (
             state["status"] != "queued"
-            or (
-                state.get("launch_requested", False)
-                and time.time() - launch_started_at > STARTUP_GRACE
-            )
+            or (state.get("launch_requested", False) and time.time() - launch_started_at > STARTUP_GRACE)
         ):
             return {
                 **state,
@@ -149,18 +146,6 @@ def prepare(args: argparse.Namespace, *, job_id: str | None = None) -> dict[str,
     return state
 
 
-def _process_exists(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def launch(job_id: str, root: Path) -> dict[str, Any]:
     directory = find_job(job_id, root)
     with (directory / "worker.lock").open("r+b") as lock:
@@ -171,8 +156,6 @@ def launch(job_id: str, root: Path) -> dict[str, Any]:
         state = read_state(directory)
         if state["status"] in TERMINAL:
             return state
-        if state.get("launch_requested") and _process_exists(state.get("supervisor_pid")):
-            return state
         state.update(
             status="queued",
             launch_requested=True,
@@ -182,6 +165,7 @@ def launch(job_id: str, root: Path) -> dict[str, Any]:
         )
         state.pop("finished_at", None)
         state.pop("error", None)
+        state.pop("launch_error", None)
         write_json(directory / "state.json", state)
         runtime = directory / "runtime"
         try:

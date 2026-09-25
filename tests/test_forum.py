@@ -11,6 +11,7 @@ import textwrap
 import threading
 import time
 import unittest
+from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -195,6 +196,29 @@ class ForumTests(unittest.TestCase):
         self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         db.close()
 
+    def test_concurrent_first_connections_initialize_one_schema_version(self) -> None:
+        ready = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def connect() -> None:
+            try:
+                ready.wait(5)
+                with forum.database(self.forums):
+                    pass
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=connect) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        with forum.database(self.forums) as connection:
+            rows = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchall()
+        self.assertEqual([row["value"] for row in rows], ["1"])
+
     def test_peek_does_not_consume_and_broadcast_fans_out(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")
@@ -263,7 +287,7 @@ class ForumTests(unittest.TestCase):
 
         code, settled = self._cli("forum", "settle", topic_id, "--forums-dir", str(self.forums))
 
-        self.assertEqual(code, 0, settled)
+        self.assertEqual(code, 1, settled)
         self.assertEqual(settled["status"], "split")
         self.assertEqual(settled["tally"]["counts"]["agree"], 0)
 
@@ -292,6 +316,30 @@ class ForumTests(unittest.TestCase):
         for adapter_path in (left, right):
             adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
             adapter["env"]["FAKE_BALLOTS"] = json.dumps([{"on": "invented", "ballot": "agree"}])
+            adapter_path.write_text(json.dumps(adapter), encoding="utf-8")
+
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        forum.wait_round(topic_id, self.forums, 8)
+        ingested = forum.ingest_round(topic_id, self.forums)
+
+        self.assertEqual(
+            [(item["member_id"], item["status"]) for item in ingested["failures"]],
+            [("alpha", "malformed"), ("beta", "malformed")],
+        )
+
+    def test_one_member_cannot_approve_two_competing_claims(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        first = forum.start_round(topic_id, self.forums)
+        self._track(first)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        votes = [{"on": "etag", "ballot": "agree"}, {"on": "redis", "ballot": "agree"}]
+        for adapter_path in (left, right):
+            adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
+            adapter["env"]["FAKE_BALLOTS"] = json.dumps(votes)
             adapter_path.write_text(json.dumps(adapter), encoding="utf-8")
 
         second = forum.start_round(topic_id, self.forums)
@@ -339,7 +387,7 @@ class ForumTests(unittest.TestCase):
         close_result: list[str] = []
         original_immediate = forum.immediate
 
-        def delayed_immediate(connection):  # type: ignore[no-untyped-def]
+        def delayed_immediate(connection: sqlite3.Connection) -> AbstractContextManager[sqlite3.Connection]:
             if threading.current_thread().name == "closer":
                 paused.set()
                 self.assertTrue(resume.wait(5))
@@ -379,7 +427,7 @@ class ForumTests(unittest.TestCase):
         original_cancel = forum.jobs.cancel
         abandon_result: list[dict] = []
 
-        def delayed_cancel(job_id, jobs_dir):  # type: ignore[no-untyped-def]
+        def delayed_cancel(job_id: str, jobs_dir: Path) -> dict[str, object]:
             paused.set()
             self.assertTrue(resume.wait(5))
             return original_cancel(job_id, jobs_dir)
@@ -406,6 +454,25 @@ class ForumTests(unittest.TestCase):
         with forum.database(self.forums) as connection:
             count = connection.execute("SELECT COUNT(*) FROM claims WHERE topic_id=?", (topic_id,)).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_abandoned_round_restarts_with_new_job_ids(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        first = forum.start_round(topic_id, self.forums)
+        self._track(first)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.abandon_round(topic_id, self.forums)
+
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+
+        self.assertEqual(second["round"], 1)
+        self.assertTrue(
+            {item["job_id"] for item in first["jobs"]}.isdisjoint({item["job_id"] for item in second["jobs"]})
+        )
+        self.assertEqual(forum.wait_round(topic_id, self.forums, 8)["wait_timed_out"], False)
 
     def test_round_ingest_broadcasts_claims_and_settle_can_override(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -486,6 +553,33 @@ class ForumTests(unittest.TestCase):
         self.assertFalse(settled["chair_override"])
         self.assertEqual(settled["tally"]["counts"]["agree"], 2)
 
+    def test_ballots_select_reviewed_candidates_even_if_rebuttal_claims_change(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        first = forum.start_round(topic_id, self.forums)
+        self._track(first)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        for adapter_path, member in ((left, "alpha"), (right, "beta")):
+            adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
+            adapter["env"].update(
+                FAKE_CLAIM=f"{member}-revision",
+                FAKE_POSITION=f"{member} still prefers ETag",
+                FAKE_BALLOTS=json.dumps([{"on": "etag", "ballot": "agree"}]),
+            )
+            adapter_path.write_text(json.dumps(adapter), encoding="utf-8")
+        second = forum.start_round(topic_id, self.forums)
+        self._track(second)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+
+        agreed = forum.settle_topic(topic_id, self.forums)
+
+        self.assertEqual(agreed["status"], "agreed")
+        self.assertEqual(agreed["claim_id"], "etag")
+        self.assertEqual(agreed["position"], "Use ETag")
+
     def test_second_round_tasks_contain_the_same_complete_candidate_set(self) -> None:
         topic_id = self._open(
             self._adapter("alpha", "etag", "Use ETag"),
@@ -505,28 +599,41 @@ class ForumTests(unittest.TestCase):
             self.assertIn('"claim_id": "etag"', task)
             self.assertIn('"claim_id": "redis"', task)
 
-    def test_failed_round_launch_restores_undelivered_mail(self) -> None:
+    def test_failed_round_launch_resumes_known_jobs_without_repeating_work(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")
         topic_id = self._open(left, right)
         calls = {"n": 0}
-        real_submit = forum.jobs.submit
+        real_launch = forum.jobs.launch
 
-        def once(args):  # type: ignore[no-untyped-def]
+        def once(job_id: str, jobs_dir: Path) -> dict[str, object]:
             calls["n"] += 1
-            if calls["n"] == 2:
+            launched = real_launch(job_id, jobs_dir)
+            if calls["n"] == 1:
                 raise OSError("boom")
-            return real_submit(args)
+            return launched
 
-        with patch("forum.jobs.submit", side_effect=once), self.assertRaisesRegex(RelayError, "inboxes restored"):
+        with patch("forum.jobs.launch", side_effect=once), self.assertRaisesRegex(OSError, "boom"):
             forum.start_round(topic_id, self.forums)
-        if self.jobs.exists():
-            self.active_jobs.extend(path.name for path in self.jobs.iterdir() if path.is_dir())
-        inbox = forum.peek_inbox(topic_id, "alpha", self.forums)
-        self.assertEqual(len(inbox["messages"]), 1)
         status = forum.topic_status(topic_id, self.forums)
-        self.assertEqual(status["status"], "open")
-        self.assertEqual(status["round"], 0)
+        self.assertEqual(status["status"], "round_pending")
+        self.assertEqual(status["rounds"][0]["status"], "launching")
+        with forum.database(self.forums) as connection:
+            reserved = {
+                row["member_id"]: row["job_id"]
+                for row in connection.execute("SELECT member_id, job_id FROM round_jobs WHERE topic_id=?", (topic_id,))
+            }
+        self.assertEqual(set(reserved), {"alpha", "beta"})
+        self.assertTrue(all(reserved.values()))
+        self.active_jobs.extend(reserved.values())
+        self.assertEqual(forum.jobs.wait(reserved["alpha"], self.jobs, 8)["status"], "completed")
+        self.assertTrue(forum.wait_round(topic_id, self.forums, 0)["wait_timed_out"])
+        original_pid = forum.jobs.read_state(self.jobs / reserved["alpha"])["supervisor_pid"]
+        resumed = forum.start_round(topic_id, self.forums)
+        self._track(resumed)
+        self.assertEqual({item["member_id"]: item["job_id"] for item in resumed["jobs"]}, reserved)
+        self.assertEqual(forum.jobs.read_state(self.jobs / reserved["alpha"])["supervisor_pid"], original_pid)
+        self.assertEqual(forum.wait_round(topic_id, self.forums, 8)["wait_timed_out"], False)
 
     def test_round_task_includes_inbox_as_untrusted_data(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -654,20 +761,18 @@ class ForumTests(unittest.TestCase):
         self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
         with self.assertRaisesRegex(RelayError, "Ambiguous claim_id: etag"):
             forum.settle_topic(topic_id, self.forums, claim_id="etag")
-        self._adapter(
-            "beta",
-            "etag",
-            "Use ETag",
-            [{"on": "etag", "ballot": "agree"}],
-        )
+        self._adapter("alpha", "etag", "Use ETag")
+        self._adapter("beta", "etag", "Use ETag")
         second = forum.start_round(topic_id, self.forums)
         self._track(second)
         forum.wait_round(topic_id, self.forums, 8)
         forum.ingest_round(topic_id, self.forums)
-        agreed = forum.settle_topic(topic_id, self.forums)
+        still_split = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(still_split["status"], "split")
+        agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
         self.assertEqual(agreed["status"], "agreed")
         self.assertEqual(agreed["position"], "Use ETag")
-        self.assertFalse(agreed["chair_override"])
+        self.assertTrue(agreed["chair_override"])
 
     def test_rejected_settle_does_not_write_consensus_file(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -743,6 +848,88 @@ class ForumTests(unittest.TestCase):
         else:
             self.assertEqual(status, "open")
             self.assertEqual(file_payload["status"], "split")
+
+    def test_export_repairs_a_publication_failure_after_settle_commits(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        with (
+            patch.object(forum, "write_json", side_effect=OSError("disk unavailable")),
+            self.assertRaisesRegex(OSError, "disk unavailable"),
+        ):
+            forum.settle_topic(topic_id, self.forums, claim_id="etag")
+
+        with forum.database(self.forums) as connection:
+            row = connection.execute("SELECT payload FROM consensus WHERE topic_id=?", (topic_id,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row["payload"])["status"], "agreed")
+        exported = forum.export_consensus(topic_id, self.forums, None)
+        cache = json.loads((self.forums / topic_id / "consensus.json").read_text(encoding="utf-8"))
+        self.assertEqual(cache, json.loads(row["payload"]))
+        self.assertEqual(exported["status"], "agreed")
+
+    def test_old_export_cannot_overwrite_a_newer_settlement(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        self.assertEqual(forum.settle_topic(topic_id, self.forums)["status"], "split")
+        paused = threading.Event()
+        resume = threading.Event()
+        settle_done = threading.Event()
+        errors: list[BaseException] = []
+        real_write = forum.write_json
+
+        def slow_write(path: Path, payload: object) -> None:
+            if threading.current_thread().name == "exporter":
+                paused.set()
+                if not resume.wait(5):
+                    raise TimeoutError("export was not resumed")
+            real_write(path, payload)
+
+        def export() -> None:
+            try:
+                forum.export_consensus(topic_id, self.forums, None)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def settle() -> None:
+            try:
+                forum.settle_topic(topic_id, self.forums, claim_id="etag")
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                settle_done.set()
+
+        with patch.object(forum, "write_json", side_effect=slow_write):
+            exporter = threading.Thread(target=export, name="exporter")
+            exporter.start()
+            self.assertTrue(paused.wait(5))
+            settler = threading.Thread(target=settle)
+            settler.start()
+            settle_done.wait(0.2)
+            resume.set()
+            exporter.join(5)
+            settler.join(5)
+
+        self.assertFalse(exporter.is_alive())
+        self.assertFalse(settler.is_alive())
+        self.assertEqual(errors, [])
+        with forum.database(self.forums) as connection:
+            row = connection.execute("SELECT payload FROM consensus WHERE topic_id=?", (topic_id,)).fetchone()
+        self.assertIsNotNone(row)
+        cache = json.loads((self.forums / topic_id / "consensus.json").read_text(encoding="utf-8"))
+        self.assertEqual(cache, json.loads(row["payload"]))
+        self.assertEqual(cache["status"], "agreed")
 
     def test_parse_answer_rejects_concatenated_json_objects(self) -> None:
         text = '{"claim_id":"first","position":"A"}\n{"claim_id":"second","position":"B"}'

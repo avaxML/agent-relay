@@ -187,8 +187,9 @@ class JobCliTests(unittest.TestCase):
 
     def test_prepare_cleans_staging_directory_after_atomic_publish_failure(self) -> None:
         job_id = uuid.uuid4().hex
-        with patch("jobs.os.replace", side_effect=OSError("publish failed")), self.assertRaisesRegex(
-            OSError, "publish failed"
+        with (
+            patch("jobs.os.replace", side_effect=OSError("publish failed")),
+            self.assertRaisesRegex(OSError, "publish failed"),
         ):
             jobs.prepare(self._args(), job_id=job_id)
         self.assertFalse((self.jobs / job_id).exists())
@@ -213,6 +214,36 @@ class JobCliTests(unittest.TestCase):
         self.assertIn(retry["status"], {"queued", "running"})
         self.assertEqual(jobs.wait(prepared["job_id"], self.jobs, 3)["status"], "completed")
 
+    def test_launch_retry_ignores_a_reused_supervisor_pid(self) -> None:
+        prepared = jobs.prepare(self._args())
+        job_id = prepared["job_id"]
+        self.active.append(job_id)
+        directory = self.jobs / job_id
+        state = jobs.read_state(directory)
+        state.update(launch_requested=True, launch_started_at=time.time() - 30, supervisor_pid=os.getpid())
+        write_json(directory / "state.json", state)
+
+        jobs.launch(job_id, self.jobs)
+
+        self.assertEqual(jobs.wait(job_id, self.jobs, 3)["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_launch_retry_clears_a_transient_spawn_error(self) -> None:
+        prepared = jobs.prepare(self._args())
+        job_id = prepared["job_id"]
+        self.active.append(job_id)
+
+        with patch("jobs.subprocess.Popen", side_effect=OSError("synthetic spawn failure")):
+            failed = jobs.launch(job_id, self.jobs)
+        self.assertIn("synthetic spawn failure", failed["launch_error"])
+
+        retry = jobs.launch(job_id, self.jobs)
+        self.assertNotIn("launch_error", retry)
+        finished = jobs.wait(job_id, self.jobs, 3)
+        self.assertEqual(finished["status"], "completed")
+        self.assertNotIn("launch_error", finished)
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
     def test_concurrent_launches_execute_provider_once(self) -> None:
         adapter = json.loads(self.adapter.read_text())
         adapter["env"]["FAKE_MODE"] = "sleep"
@@ -224,6 +255,26 @@ class JobCliTests(unittest.TestCase):
             results = list(pool.map(lambda _: jobs.launch(prepared["job_id"], self.jobs), range(2)))
         self.assertTrue(all(result["job_id"] == prepared["job_id"] for result in results))
         self.assertEqual(jobs.wait(prepared["job_id"], self.jobs, 3)["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_two_supervisors_spawned_before_lock_claim_execute_provider_once(self) -> None:
+        prepared = jobs.prepare(self._args())
+        job_id = prepared["job_id"]
+        self.active.append(job_id)
+        directory = self.jobs / job_id
+        with (directory / "worker.lock").open("r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            supervisors = [
+                subprocess.Popen(
+                    [sys.executable, str(directory / "runtime" / "jobs.py"), str(directory)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                for _ in range(2)
+            ]
+        self.assertEqual(sorted(process.wait(timeout=5) for process in supervisors), [0, 1])
+        self.assertEqual(jobs.status(job_id, self.jobs)["status"], "completed")
         self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
 
     def test_submit_returns_promptly_and_detached_job_is_retrievable_from_new_process(self) -> None:

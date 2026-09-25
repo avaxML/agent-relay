@@ -241,6 +241,42 @@ class ExecutionTests(unittest.TestCase):
 
 
 class RunIntegrationTests(RelayTestCase):
+    def test_antigravity_localhost_denial_identifies_host_sandbox(self) -> None:
+        script = self.directory / "fake-agy"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print('Failed to start: listen tcp 127.0.0.1:0: bind: operation not permitted', file=sys.stderr)\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        adapter = self.write_adapter("antigravity", script.name, "agy-stream", "agy-jsonl")
+        with patch.dict(os.environ, {"PATH": f"{script.parent}:{os.environ.get('PATH', '')}"}):
+            result = run(
+                type(
+                    "Args",
+                    (),
+                    {
+                        "provider": "antigravity",
+                        "adapter_file": adapter,
+                        "model": None,
+                        "effort": None,
+                        "root": self.root,
+                        "files": [],
+                        "task_file": self.task,
+                        "kind": "read",
+                        "max_input_bytes": 10000,
+                        "output": self.directory / "artifacts",
+                        "timeout": 2,
+                        "max_answer_chars": 2000,
+                    },
+                )()
+            )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("localhost listener", result["error"])
+        self.assertIn("host-approved", result["error"])
+
     def test_bundled_cursor_adapter_uses_stdin_and_isolated_workdir(self) -> None:
         script = self.directory / "cursor-agent"
         script.write_text(

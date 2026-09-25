@@ -309,6 +309,19 @@ def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> t
     ]
 
 
+def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -> RelayError:
+    if adapter["name"] == "antigravity" and (
+        "listen tcp 127.0.0.1:0: bind: operation not permitted"
+        in stderr_path.read_text(encoding="utf-8", errors="replace")
+    ):
+        return RelayError(
+            "Antigravity could not start: the host sandbox blocked its localhost listener. "
+            "Run or submit with host-approved execution scope for localhost binding and CLI runtime access; "
+            "inspect stderr.log. The failed task was not retried."
+        )
+    return RelayError(f"Worker exited with code {code}; inspect stdout.log and stderr.log.")
+
+
 def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if output == "text":
         if not raw.strip():

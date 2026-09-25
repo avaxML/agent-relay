@@ -3,6 +3,8 @@ name: chaos-monkey
 description: Review supplied code for resilience with bounded, proposal-only chaos scenarios and safe experiment designs.
 ---
 
+Before running Relay in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). Antigravity needs a localhost listener even with its own `--sandbox` flag; request the host's approved execution scope for `run` when that listener is blocked.
+
 Use this skill when the user requests a chaos engineering, fault-injection, or resilience review. It produces hypotheses and experiment proposals; it does not run attacks, fault injection, tests, tools, or external actions.
 
 Resolve the plugin root as the directory two levels above the directory containing this `SKILL.md`. Before delegating, state the expected steady state and concrete invariants in the task. If the user did not supply them, infer the narrowest source-supported hypothesis and label assumptions explicitly.

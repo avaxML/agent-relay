@@ -3,7 +3,7 @@ name: delegate
 description: Delegate a bounded, read-only or proposal-oriented coding task to a local coding-agent CLI through Agent Relay.
 ---
 
-Before launching a provider in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). These CLIs need runtime/log access and may need a localhost listener. A detached job inherits the submitter's restrictions. Use the host's approval mechanism for necessary permissions; do not treat a writable output directory or executable discovery as readiness.
+Before launching a provider in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). These CLIs need runtime/log access and may need a localhost listener. Antigravity's `--sandbox` flag does not grant host permission for its startup listener. A detached job inherits the submitter's restrictions. Use the host's approval mechanism for necessary permissions; do not treat a writable output directory or executable discovery as readiness.
 
 Use this skill when another coding agent can inspect a set of files and return a focused result while the lead agent keeps ownership of decisions and verification.
 

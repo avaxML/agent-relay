@@ -158,7 +158,7 @@ Detached runners can outlive the submitter and a new Codex session while the ope
 
 ## Plan and research forums
 
-Use the `plan-research` skill when two or more providers should propose a plan or investigate a question, optionally rebut, and record agreement. Workers stay isolated one-shot jobs. A SQLite inbox in `AGENT_RELAY_FORUMS_DIR` or `~/.local/state/agent-relay/forums` is the coordination plane; job snapshots stay on the filesystem. The chair copies undelivered messages into the next task file. Running workers cannot receive mail.
+Use the `plan-research` skill when two or more providers should propose a plan or investigate a question, optionally rebut, and record agreement. Workers stay isolated one-shot jobs. A SQLite inbox in `AGENT_RELAY_FORUMS_DIR` or `~/.local/state/agent-relay/forums` stores coordination state. `forum open` copies the selected source files into the topic directory. Every round reads that copy. The chair copies undelivered messages and the same prior candidate set into each member's next task file. Running workers cannot receive mail.
 
 ```sh
 python3 scripts/relay.py forum open \
@@ -171,7 +171,7 @@ python3 scripts/relay.py forum ingest TOPIC_ID
 python3 scripts/relay.py forum settle TOPIC_ID
 ```
 
-`round` takes each inbox in one `BEGIN IMMEDIATE` transaction so two chairs cannot steal the same messages. `ingest` broadcasts claims once; a failed peer still leaves every member mail. `settle` writes `consensus.json` and fans that notice out as ordinary inbox rows. Ballots on a `claim_id` agree only when every latest claim with that id shares the same position. Split stays open for a chair override. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
+`round` reserves every member's job ID before launch. Retry `forum round` if a launch stops midway; it resumes the reserved jobs. `ingest` broadcasts claims once and restores the exact input of a failed member. Round 1 collects proposals without counting ballots. Later rounds show every member the same prior candidate set and accept at most one affirmative ballot on an unambiguous `claim_id` in that set. `settle` uses those ballots or a chair `--claim-id` override. It commits consensus to SQLite before writing `consensus.json`; `forum export` repairs that file if publication was interrupted. Split leaves the topic open. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
 
 ## Restricted execution environments
 

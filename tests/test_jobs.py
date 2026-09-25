@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
@@ -12,11 +13,15 @@ import textwrap
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 RELAY = ROOT / "scripts" / "relay.py"
 sys.path.insert(0, str(ROOT / "scripts"))
+import jobs
+from providers import RelayError
 from task_runner import prepare_task, write_json
 
 
@@ -136,6 +141,141 @@ class JobCliTests(unittest.TestCase):
         job_id = payload["job_id"]
         self.active.append(job_id)
         return job_id, payload
+
+    def _args(self, **overrides: object) -> argparse.Namespace:
+        values: dict[str, object] = {
+            "provider": "fake",
+            "adapter_file": self.adapter,
+            "registry_dir": None,
+            "model": None,
+            "effort": None,
+            "root": self.project,
+            "files": ["source.txt"],
+            "task_file": self.task,
+            "kind": "read",
+            "max_input_bytes": 10000,
+            "timeout": 2,
+            "max_answer_chars": 12000,
+            "jobs_dir": self.jobs,
+            "output": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_prepare_persists_without_execution_and_launch_is_explicit(self) -> None:
+        prepared = jobs.prepare(self._args())
+        self.active.append(prepared["job_id"])
+        self.assertEqual(prepared["status"], "queued")
+        self.assertFalse((self.directory / "started").exists())
+        time.sleep(0.2)
+        self.assertEqual(jobs.status(prepared["job_id"], self.jobs)["status"], "queued")
+        launched = jobs.launch(prepared["job_id"], self.jobs)
+        self.assertIn(launched["status"], {"queued", "running", "completed"})
+        finished = jobs.wait(prepared["job_id"], self.jobs, 3)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_prepare_is_idempotent_for_same_snapshot_and_rejects_mismatch(self) -> None:
+        job_id = uuid.uuid4().hex
+        first = jobs.prepare(self._args(), job_id=job_id)
+        second = jobs.prepare(self._args(), job_id=job_id)
+        self.assertEqual(second["job_id"], first["job_id"])
+        self.assertEqual(second["status"], "queued")
+        self.task.write_text("A different task.", encoding="utf-8")
+        with self.assertRaisesRegex(RelayError, "different task snapshot"):
+            jobs.prepare(self._args(), job_id=job_id)
+
+    def test_prepare_cleans_staging_directory_after_atomic_publish_failure(self) -> None:
+        job_id = uuid.uuid4().hex
+        with (
+            patch("jobs.os.replace", side_effect=OSError("publish failed")),
+            self.assertRaisesRegex(OSError, "publish failed"),
+        ):
+            jobs.prepare(self._args(), job_id=job_id)
+        self.assertFalse((self.jobs / job_id).exists())
+        prepared = jobs.prepare(self._args(), job_id=job_id)
+        self.active.append(prepared["job_id"])
+        self.assertEqual(prepared["status"], "queued")
+
+    def test_launch_retry_returns_promptly_when_worker_lock_is_busy(self) -> None:
+        adapter = json.loads(self.adapter.read_text())
+        adapter["env"]["FAKE_MODE"] = "sleep"
+        adapter["env"]["FAKE_DELAY"] = "1"
+        self.adapter.write_text(json.dumps(adapter), encoding="utf-8")
+        prepared = jobs.prepare(self._args())
+        self.active.append(prepared["job_id"])
+        jobs.launch(prepared["job_id"], self.jobs)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not (self.directory / "started").exists():
+            time.sleep(0.02)
+        started = time.monotonic()
+        retry = jobs.launch(prepared["job_id"], self.jobs)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertIn(retry["status"], {"queued", "running"})
+        self.assertEqual(jobs.wait(prepared["job_id"], self.jobs, 3)["status"], "completed")
+
+    def test_launch_retry_ignores_a_reused_supervisor_pid(self) -> None:
+        prepared = jobs.prepare(self._args())
+        job_id = prepared["job_id"]
+        self.active.append(job_id)
+        directory = self.jobs / job_id
+        state = jobs.read_state(directory)
+        state.update(launch_requested=True, launch_started_at=time.time() - 30, supervisor_pid=os.getpid())
+        write_json(directory / "state.json", state)
+
+        jobs.launch(job_id, self.jobs)
+
+        self.assertEqual(jobs.wait(job_id, self.jobs, 3)["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_launch_retry_clears_a_transient_spawn_error(self) -> None:
+        prepared = jobs.prepare(self._args())
+        job_id = prepared["job_id"]
+        self.active.append(job_id)
+
+        with patch("jobs.subprocess.Popen", side_effect=OSError("synthetic spawn failure")):
+            failed = jobs.launch(job_id, self.jobs)
+        self.assertIn("synthetic spawn failure", failed["launch_error"])
+
+        retry = jobs.launch(job_id, self.jobs)
+        self.assertNotIn("launch_error", retry)
+        finished = jobs.wait(job_id, self.jobs, 3)
+        self.assertEqual(finished["status"], "completed")
+        self.assertNotIn("launch_error", finished)
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_concurrent_launches_execute_provider_once(self) -> None:
+        adapter = json.loads(self.adapter.read_text())
+        adapter["env"]["FAKE_MODE"] = "sleep"
+        adapter["env"]["FAKE_DELAY"] = "0.4"
+        self.adapter.write_text(json.dumps(adapter), encoding="utf-8")
+        prepared = jobs.prepare(self._args())
+        self.active.append(prepared["job_id"])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: jobs.launch(prepared["job_id"], self.jobs), range(2)))
+        self.assertTrue(all(result["job_id"] == prepared["job_id"] for result in results))
+        self.assertEqual(jobs.wait(prepared["job_id"], self.jobs, 3)["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_two_supervisors_spawned_before_lock_claim_execute_provider_once(self) -> None:
+        prepared = jobs.prepare(self._args())
+        job_id = prepared["job_id"]
+        self.active.append(job_id)
+        directory = self.jobs / job_id
+        with (directory / "worker.lock").open("r+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            supervisors = [
+                subprocess.Popen(
+                    [sys.executable, str(directory / "runtime" / "jobs.py"), str(directory)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                for _ in range(2)
+            ]
+        self.assertEqual(sorted(process.wait(timeout=5) for process in supervisors), [0, 1])
+        self.assertEqual(jobs.status(job_id, self.jobs)["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
 
     def test_submit_returns_promptly_and_detached_job_is_retrievable_from_new_process(self) -> None:
         started = time.monotonic()
@@ -334,6 +474,20 @@ class JobCliTests(unittest.TestCase):
                 process.terminate()
                 process.wait(timeout=3)
 
+    def test_malformed_result_json_does_not_crash_status_or_result(self) -> None:
+        job_id, _ = self._submit()
+        code, state = self._cli("wait", job_id, "--jobs-dir", str(self.jobs), "--timeout", "3")
+        self.assertEqual(code, 0, state)
+        path = Path(jobs.result(job_id, self.jobs)["output_dir"]) / "result.json"
+        path.write_text("[1, 2, 3]\n", encoding="utf-8")
+        status = jobs.status(job_id, self.jobs)
+        self.assertEqual(status["status"], "completed")
+        payload = jobs.result(job_id, self.jobs)
+        self.assertFalse(payload["result_ready"])
+        path.write_text('{"status":"ok","answer":"', encoding="utf-8")
+        truncated = jobs.result(job_id, self.jobs)
+        self.assertFalse(truncated["result_ready"])
+
     def test_invalid_job_ids_and_path_traversal_are_rejected(self) -> None:
         for job_id in ("bad", "../" + "a" * 32, "a" * 31):
             code, payload = self._cli("status", job_id, "--jobs-dir", str(self.jobs))
@@ -348,6 +502,8 @@ class JobCliTests(unittest.TestCase):
             "job_id": job_id,
             "status": "queued",
             "created_at": time.time() - 30,
+            "launch_requested": True,
+            "launch_started_at": time.time() - 30,
             "output_dir": str(directory / "artifacts"),
         }
         (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")

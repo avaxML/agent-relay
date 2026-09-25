@@ -115,34 +115,37 @@ def prepare(args: argparse.Namespace, *, job_id: str | None = None) -> dict[str,
         if not isinstance(existing_task, dict) or not _same_task(existing_task, task):
             raise RelayError(f"Job {selected_id} already exists with a different task snapshot.")
         return status(selected_id, root)
-    directory.mkdir(mode=0o700)
+    staging = root / f".{selected_id}.tmp-{uuid.uuid4().hex}"
+    staging.mkdir(mode=0o700)
     output = args.output.expanduser().resolve() if args.output else directory / "artifacts"
+    staging_output = staging / "artifacts" if args.output is None else output
     try:
-        output.mkdir(mode=0o700, parents=True, exist_ok=False)
-    except OSError:
-        directory.rmdir()
+        staging_output.mkdir(mode=0o700, parents=True, exist_ok=False)
+        state = {
+            "schema_version": 1,
+            "job_id": directory.name,
+            "status": "queued",
+            "jobs_dir": str(root),
+            "job_dir": str(directory),
+            "output_dir": str(output),
+            "created_at": time.time(),
+            "provider": task["result"]["provider"],
+            "model": task["result"]["model"],
+            "effort": task["result"]["effort"],
+            "kind": task["result"]["kind"],
+            "launch_requested": False,
+        }
+        (staging / "worker.lock").touch(mode=0o600)
+        write_json(staging / "state.json", state)
+        write_json(staging / "task.json", task)
+        runtime = staging / "runtime"
+        runtime.mkdir(mode=0o700)
+        for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py"):
+            shutil.copy2(Path(__file__).resolve().parent / name, runtime / name)
+        os.replace(staging, directory)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
         raise
-    state = {
-        "schema_version": 1,
-        "job_id": directory.name,
-        "status": "queued",
-        "jobs_dir": str(root),
-        "job_dir": str(directory),
-        "output_dir": str(output),
-        "created_at": time.time(),
-        "provider": task["result"]["provider"],
-        "model": task["result"]["model"],
-        "effort": task["result"]["effort"],
-        "kind": task["result"]["kind"],
-        "launch_requested": False,
-    }
-    (directory / "worker.lock").touch(mode=0o600)
-    write_json(directory / "state.json", state)
-    write_json(directory / "task.json", task)
-    runtime = directory / "runtime"
-    runtime.mkdir(mode=0o700)
-    for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py"):
-        shutil.copy2(Path(__file__).resolve().parent / name, runtime / name)
     return state
 
 
@@ -161,7 +164,10 @@ def _process_exists(pid: int | None) -> bool:
 def launch(job_id: str, root: Path) -> dict[str, Any]:
     directory = find_job(job_id, root)
     with (directory / "worker.lock").open("r+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return status(job_id, root)
         state = read_state(directory)
         if state["status"] in TERMINAL:
             return state

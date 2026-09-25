@@ -15,11 +15,13 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 RELAY = ROOT / "scripts" / "relay.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import jobs
+from providers import RelayError
 from task_runner import prepare_task, write_json
 
 
@@ -180,8 +182,36 @@ class JobCliTests(unittest.TestCase):
         self.assertEqual(second["job_id"], first["job_id"])
         self.assertEqual(second["status"], "queued")
         self.task.write_text("A different task.", encoding="utf-8")
-        with self.assertRaisesRegex(jobs.RelayError, "different task snapshot"):
+        with self.assertRaisesRegex(RelayError, "different task snapshot"):
             jobs.prepare(self._args(), job_id=job_id)
+
+    def test_prepare_cleans_staging_directory_after_atomic_publish_failure(self) -> None:
+        job_id = uuid.uuid4().hex
+        with patch("jobs.os.replace", side_effect=OSError("publish failed")), self.assertRaisesRegex(
+            OSError, "publish failed"
+        ):
+            jobs.prepare(self._args(), job_id=job_id)
+        self.assertFalse((self.jobs / job_id).exists())
+        prepared = jobs.prepare(self._args(), job_id=job_id)
+        self.active.append(prepared["job_id"])
+        self.assertEqual(prepared["status"], "queued")
+
+    def test_launch_retry_returns_promptly_when_worker_lock_is_busy(self) -> None:
+        adapter = json.loads(self.adapter.read_text())
+        adapter["env"]["FAKE_MODE"] = "sleep"
+        adapter["env"]["FAKE_DELAY"] = "1"
+        self.adapter.write_text(json.dumps(adapter), encoding="utf-8")
+        prepared = jobs.prepare(self._args())
+        self.active.append(prepared["job_id"])
+        jobs.launch(prepared["job_id"], self.jobs)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not (self.directory / "started").exists():
+            time.sleep(0.02)
+        started = time.monotonic()
+        retry = jobs.launch(prepared["job_id"], self.jobs)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertIn(retry["status"], {"queued", "running"})
+        self.assertEqual(jobs.wait(prepared["job_id"], self.jobs, 3)["status"], "completed")
 
     def test_concurrent_launches_execute_provider_once(self) -> None:
         adapter = json.loads(self.adapter.read_text())

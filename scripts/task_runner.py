@@ -201,6 +201,15 @@ def run_prepared(
             )
             result["exit_code"] = code
             if code:
+                if adapter["name"] == "antigravity" and (
+                    "listen tcp 127.0.0.1:0: bind: operation not permitted"
+                    in (output / "stderr.log").read_text(encoding="utf-8", errors="replace")
+                ):
+                    raise RelayError(
+                        "Antigravity could not start: the host sandbox blocked its localhost listener. "
+                        "Run or submit with host-approved execution scope for localhost binding and CLI runtime access; "
+                        "inspect stderr.log. The failed task was not retried."
+                    )
                 raise RelayError(f"Worker exited with code {code}; inspect stdout.log and stderr.log.")
             answer, metadata = decode_response((output / "stdout.log").read_text(encoding="utf-8"), adapter["output"])
             if cancel_file is not None and cancel_file.exists():

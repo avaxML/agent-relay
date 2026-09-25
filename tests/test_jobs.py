@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
@@ -12,6 +13,7 @@ import textwrap
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,6 +139,62 @@ class JobCliTests(unittest.TestCase):
         job_id = payload["job_id"]
         self.active.append(job_id)
         return job_id, payload
+
+    def _args(self, **overrides: object) -> argparse.Namespace:
+        values: dict[str, object] = {
+            "provider": "fake",
+            "adapter_file": self.adapter,
+            "registry_dir": None,
+            "model": None,
+            "effort": None,
+            "root": self.project,
+            "files": ["source.txt"],
+            "task_file": self.task,
+            "kind": "read",
+            "max_input_bytes": 10000,
+            "timeout": 2,
+            "max_answer_chars": 12000,
+            "jobs_dir": self.jobs,
+            "output": None,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_prepare_persists_without_execution_and_launch_is_explicit(self) -> None:
+        prepared = jobs.prepare(self._args())
+        self.active.append(prepared["job_id"])
+        self.assertEqual(prepared["status"], "queued")
+        self.assertFalse((self.directory / "started").exists())
+        time.sleep(0.2)
+        self.assertEqual(jobs.status(prepared["job_id"], self.jobs)["status"], "queued")
+        launched = jobs.launch(prepared["job_id"], self.jobs)
+        self.assertIn(launched["status"], {"queued", "running", "completed"})
+        finished = jobs.wait(prepared["job_id"], self.jobs, 3)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
+
+    def test_prepare_is_idempotent_for_same_snapshot_and_rejects_mismatch(self) -> None:
+        job_id = uuid.uuid4().hex
+        first = jobs.prepare(self._args(), job_id=job_id)
+        second = jobs.prepare(self._args(), job_id=job_id)
+        self.assertEqual(second["job_id"], first["job_id"])
+        self.assertEqual(second["status"], "queued")
+        self.task.write_text("A different task.", encoding="utf-8")
+        with self.assertRaisesRegex(jobs.RelayError, "different task snapshot"):
+            jobs.prepare(self._args(), job_id=job_id)
+
+    def test_concurrent_launches_execute_provider_once(self) -> None:
+        adapter = json.loads(self.adapter.read_text())
+        adapter["env"]["FAKE_MODE"] = "sleep"
+        adapter["env"]["FAKE_DELAY"] = "0.4"
+        self.adapter.write_text(json.dumps(adapter), encoding="utf-8")
+        prepared = jobs.prepare(self._args())
+        self.active.append(prepared["job_id"])
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: jobs.launch(prepared["job_id"], self.jobs), range(2)))
+        self.assertTrue(all(result["job_id"] == prepared["job_id"] for result in results))
+        self.assertEqual(jobs.wait(prepared["job_id"], self.jobs, 3)["status"], "completed")
+        self.assertEqual((self.directory / "started").read_text(encoding="utf-8").splitlines(), ["started"])
 
     def test_submit_returns_promptly_and_detached_job_is_retrievable_from_new_process(self) -> None:
         started = time.monotonic()
@@ -363,6 +421,8 @@ class JobCliTests(unittest.TestCase):
             "job_id": job_id,
             "status": "queued",
             "created_at": time.time() - 30,
+            "launch_requested": True,
+            "launch_started_at": time.time() - 30,
             "output_dir": str(directory / "artifacts"),
         }
         (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")

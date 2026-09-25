@@ -76,7 +76,14 @@ def status(job_id: str, root: Path) -> dict[str, Any]:
                 return {**state, "status": OUTCOMES[result["status"]], "result_path": str(result_path)}
         if state["status"] in TERMINAL:
             return state
-        if not active and (state["status"] != "queued" or time.time() - state["created_at"] > STARTUP_GRACE):
+        launch_started_at = state.get("launch_started_at", state["created_at"])
+        if not active and (
+            state["status"] != "queued"
+            or (
+                state.get("launch_requested", False)
+                and time.time() - launch_started_at > STARTUP_GRACE
+            )
+        ):
             return {
                 **state,
                 "status": "interrupted",
@@ -87,11 +94,27 @@ def status(job_id: str, root: Path) -> dict[str, Any]:
         return state
 
 
-def submit(args: argparse.Namespace) -> dict[str, Any]:
+def _same_task(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return json.dumps(left, sort_keys=True, separators=(",", ":")) == json.dumps(
+        right, sort_keys=True, separators=(",", ":")
+    )
+
+
+def prepare(args: argparse.Namespace, *, job_id: str | None = None) -> dict[str, Any]:
     task = prepare_task(args)
     root = job_root(args.jobs_dir)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory = root / uuid.uuid4().hex
+    selected_id = job_id or uuid.uuid4().hex
+    if not re.fullmatch(r"[0-9a-f]{32}", selected_id):
+        raise RelayError("Invalid job ID; use a 32-character hexadecimal ID.")
+    directory = root / selected_id
+    if directory.exists():
+        if directory.is_symlink() or not directory.is_dir():
+            raise RelayError(f"Job path is not a directory: {directory}")
+        existing_task = json.loads((directory / "task.json").read_text(encoding="utf-8"))
+        if not isinstance(existing_task, dict) or not _same_task(existing_task, task):
+            raise RelayError(f"Job {selected_id} already exists with a different task snapshot.")
+        return status(selected_id, root)
     directory.mkdir(mode=0o700)
     output = args.output.expanduser().resolve() if args.output else directory / "artifacts"
     try:
@@ -111,30 +134,73 @@ def submit(args: argparse.Namespace) -> dict[str, Any]:
         "model": task["result"]["model"],
         "effort": task["result"]["effort"],
         "kind": task["result"]["kind"],
+        "launch_requested": False,
     }
     (directory / "worker.lock").touch(mode=0o600)
     write_json(directory / "state.json", state)
+    write_json(directory / "task.json", task)
+    runtime = directory / "runtime"
+    runtime.mkdir(mode=0o700)
+    for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py"):
+        shutil.copy2(Path(__file__).resolve().parent / name, runtime / name)
+    return state
+
+
+def _process_exists(pid: int | None) -> bool:
+    if not pid:
+        return False
     try:
-        write_json(directory / "task.json", task)
-        runtime = directory / "runtime"
-        runtime.mkdir(mode=0o700)
-        for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py"):
-            shutil.copy2(Path(__file__).resolve().parent / name, runtime / name)
-        with (directory / "supervisor.log").open("wb") as log:
-            subprocess.Popen(
-                [sys.executable, str(runtime / "jobs.py"), str(directory)],
-                cwd=directory,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
-                start_new_session=True,
-                close_fds=True,
-            )
-    except OSError as exc:
-        state.update(status="failed", error=f"Could not launch job: {exc}", finished_at=time.time())
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def launch(job_id: str, root: Path) -> dict[str, Any]:
+    directory = find_job(job_id, root)
+    with (directory / "worker.lock").open("r+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_state(directory)
+        if state["status"] in TERMINAL:
+            return state
+        if state.get("launch_requested") and _process_exists(state.get("supervisor_pid")):
+            return state
+        state.update(
+            status="queued",
+            launch_requested=True,
+            launch_started_at=time.time(),
+            launch_attempts=state.get("launch_attempts", 0) + 1,
+            updated_at=time.time(),
+        )
+        state.pop("finished_at", None)
+        state.pop("error", None)
         write_json(directory / "state.json", state)
-        return state
-    return status(directory.name, root)
+        runtime = directory / "runtime"
+        try:
+            with (directory / "supervisor.log").open("ab") as log:
+                process = subprocess.Popen(
+                    [sys.executable, str(runtime / "jobs.py"), str(directory)],
+                    cwd=directory,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError as exc:
+            state["launch_error"] = f"Could not launch job: {exc}"
+            write_json(directory / "state.json", state)
+            return state
+        state["supervisor_pid"] = process.pid
+        write_json(directory / "state.json", state)
+    return status(job_id, root)
+
+
+def submit(args: argparse.Namespace) -> dict[str, Any]:
+    prepared = prepare(args)
+    return launch(prepared["job_id"], Path(prepared["jobs_dir"]))
 
 
 def cancel(job_id: str, root: Path) -> dict[str, Any]:
@@ -187,14 +253,6 @@ def worker(directory: Path) -> int:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read_state(directory)
         if state["status"] != "queued":
-            return 1
-        if time.time() - state["created_at"] > STARTUP_GRACE:
-            state.update(
-                status="interrupted",
-                error="Worker missed the startup deadline; task was not executed.",
-                finished_at=time.time(),
-            )
-            write_json(directory / "state.json", state)
             return 1
         state.update(status="running", started_at=time.time(), updated_at=time.time(), runner_pid=os.getpid())
         write_json(directory / "state.json", state)

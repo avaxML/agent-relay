@@ -55,7 +55,9 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(adapters, {"antigravity", "cursor", "opencode"})
 
     def test_release_tag_must_match_every_manifest(self) -> None:
-        self.assertEqual(set(validate_release("v0.2.0", ROOT).values()), {"0.2.0"})
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        version = project["project"]["version"]
+        self.assertEqual(set(validate_release(f"v{version}", ROOT).values()), {version})
 
         with TemporaryDirectory() as directory:
             copy = Path(directory)
@@ -66,7 +68,7 @@ class PackagingTests(unittest.TestCase):
             manifest["version"] = "9.9.9"
             (copy / ".codex-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Codex manifest=9.9.9"):
-                validate_release("v0.2.0", copy)
+                validate_release(f"v{version}", copy)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import time
 import unittest
 from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1074,6 +1075,146 @@ class ForumTests(unittest.TestCase):
         exported = json.loads((self.forums / topic_id / "consensus.json").read_text(encoding="utf-8"))
         self.assertEqual(exported["status"], "agreed")
         self.assertEqual(exported["position"], "Use ETag")
+
+    def test_reads_do_not_wait_for_another_writer(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        with forum.database(self.forums) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            try:
+                status = forum.topic_status(topic_id, self.forums)
+                inbox = forum.peek_inbox(topic_id, "alpha", self.forums)
+            finally:
+                writer.execute("ROLLBACK")
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(status["status"], "open")
+        self.assertEqual(len(inbox["messages"]), 1)
+
+    def test_round_launch_does_not_hold_the_forum_write_lock(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        other = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        original = forum.jobs.launch
+        posted: list[dict[str, Any]] = []
+
+        def launch_while_posting(job_id: str, root: Path) -> dict[str, Any]:
+            if not posted:
+                posted.append(
+                    forum.post_message(
+                        other,
+                        sender="chair",
+                        kind="note",
+                        body={"text": "parallel"},
+                        forums_dir=self.forums,
+                        broadcast=True,
+                    )
+                )
+            return original(job_id, root)
+
+        with patch.object(forum.jobs, "launch", side_effect=launch_while_posting):
+            launched = forum.start_round(topic_id, self.forums)
+        self._track(launched)
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(forum.topic_status(topic_id, self.forums)["rounds"][0]["status"], "running")
+
+    def test_abandon_during_launch_cancels_the_jobs_that_launched(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        original = forum.jobs.launch
+        launched_ids: list[str] = []
+        abandoner: list[threading.Thread] = []
+
+        def launch_then_abandon(job_id: str, root: Path) -> dict[str, Any]:
+            result = original(job_id, root)
+            launched_ids.append(job_id)
+            if len(launched_ids) == 1:
+                thread = threading.Thread(target=forum.abandon_round, args=(topic_id, self.forums))
+                thread.start()
+                abandoner.append(thread)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    rounds = forum.topic_status(topic_id, self.forums)["rounds"]
+                    if rounds and rounds[0]["status"] == "failed":
+                        break
+                    time.sleep(0.02)
+            return result
+
+        with (
+            patch.object(forum.jobs, "launch", side_effect=launch_then_abandon),
+            self.assertRaisesRegex(RelayError, "abandoned"),
+        ):
+            forum.start_round(topic_id, self.forums)
+        self.active_jobs.extend(launched_ids)
+        abandoner[0].join(15)
+        self.assertFalse(abandoner[0].is_alive())
+        self.assertEqual(len(launched_ids), 2)
+        for job_id in launched_ids:
+            self.assertIn(forum.jobs.status(job_id, self.jobs)["status"], {"cancelled", "completed", "interrupted"})
+        status = forum.topic_status(topic_id, self.forums)
+        self.assertEqual((status["status"], status["round"], status["rounds"]), ("open", 0, []))
+
+    def test_round_that_would_exceed_the_input_limit_is_not_reserved(self) -> None:
+        members = [
+            forum.parse_member(f"member_id=alpha,provider=alpha,adapter_file={self._adapter('alpha', 'a', 'A')}"),
+            forum.parse_member(f"member_id=beta,provider=beta,adapter_file={self._adapter('beta', 'b', 'B')}"),
+        ]
+        topic_id = forum.open_topic(
+            kind="plan",
+            question="Q?",
+            root=self.project,
+            files=["source.txt"],
+            members=members,
+            forums_dir=self.forums,
+            jobs_dir=self.jobs,
+            max_rounds=2,
+            threshold="unanimous",
+            timeout=8,
+            max_input_bytes=20000,
+            max_answer_chars=1000,
+        )["topic_id"]
+        forum.post_message(
+            topic_id, sender="chair", kind="note", body={"text": "n" * 19800}, forums_dir=self.forums, recipient="alpha"
+        )
+
+        with self.assertRaisesRegex(RelayError, "round 1 task for alpha exceeds the input limit"):
+            forum.start_round(topic_id, self.forums)
+
+        status = forum.topic_status(topic_id, self.forums)
+        self.assertEqual((status["status"], status["round"], status["rounds"]), ("open", 0, []))
+        self.assertEqual(status["unread"], {"alpha": 2, "beta": 1})
+        self.assertFalse(self.jobs.exists() and any(self.jobs.iterdir()))
+
+    def test_open_reserves_input_room_for_member_claims(self) -> None:
+        self.source.write_text("x" * 3000 + "\n", encoding="utf-8")
+        members = [
+            forum.parse_member(f"member_id=alpha,provider=alpha,adapter_file={self._adapter('alpha', 'a', 'A')}"),
+            forum.parse_member(f"member_id=beta,provider=beta,adapter_file={self._adapter('beta', 'b', 'B')}"),
+        ]
+        with self.assertRaisesRegex(RelayError, "max-answer-chars"):
+            forum.open_topic(
+                kind="plan",
+                question="Q?",
+                root=self.project,
+                files=["source.txt"],
+                members=members,
+                forums_dir=self.forums,
+                jobs_dir=self.jobs,
+                max_rounds=2,
+                threshold="unanimous",
+                timeout=8,
+                max_input_bytes=8000,
+                max_answer_chars=2000,
+            )
 
     def test_open_topic_rejects_path_member_ids(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")

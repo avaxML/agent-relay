@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from typing import Any
 
 import jobs
 from providers import RelayError, load_adapter, validate_provider_name
-from task_runner import snapshot_sources, write_json
+from task_runner import build_request, snapshot_sources, write_json
 
 SCHEMA_VERSION = 1
 TOPIC_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -32,6 +33,7 @@ WAIT_TERMINAL = jobs.TERMINAL | {JOB_MISSING}
 MESSAGE_BODY_LIMIT = 200000
 MEMBER_FIELDS = {"member_id", "provider", "model", "effort", "adapter_file", "registry_dir"}
 MAX_ROUNDS = 4
+ROUND_TASK_RESERVE = 8192
 
 SCHEMA = [
     """
@@ -148,6 +150,19 @@ SCHEMA = [
     )
     """,
 ]
+SCHEMA_OBJECTS = {
+    "meta",
+    "topics",
+    "members",
+    "messages",
+    "inbox_undelivered",
+    "messages_once_ingest",
+    "rounds",
+    "round_jobs",
+    "claims",
+    "ballots",
+    "consensus",
+}
 
 
 def forum_root(given: Path | None) -> Path:
@@ -193,19 +208,33 @@ def connect(root: Path) -> sqlite3.Connection:
         connection.close()
         raise RelayError("Forum database could not enable WAL mode.")
     connection.execute("PRAGMA synchronous=FULL")
-    for statement in SCHEMA:
-        connection.execute(statement)
-    connection.execute("DROP INDEX IF EXISTS messages_once")
-    _ensure_schema_version(connection)
+    try:
+        if not _schema_ready(connection):
+            with immediate(connection):
+                for statement in SCHEMA:
+                    connection.execute(statement)
+                connection.execute("DROP INDEX IF EXISTS messages_once")
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO NOTHING",
+                    (str(SCHEMA_VERSION),),
+                )
+        _check_schema_version(connection)
+    except BaseException:
+        connection.close()
+        raise
     os.chmod(db, 0o600)
     return connection
 
 
-def _ensure_schema_version(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        "INSERT INTO meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO NOTHING",
-        (str(SCHEMA_VERSION),),
-    )
+def _schema_ready(connection: sqlite3.Connection) -> bool:
+    """Check the schema without writing, so readers never queue behind a writer."""
+    names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+    if not names >= SCHEMA_OBJECTS or "messages_once" in names:
+        return False
+    return connection.execute("SELECT 1 FROM meta WHERE key='schema_version'").fetchone() is not None
+
+
+def _check_schema_version(connection: sqlite3.Connection) -> None:
     row = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row is None:
         raise RelayError("Forum schema version could not be initialized.")
@@ -381,7 +410,20 @@ def open_topic(
     topic_id = uuid.uuid4().hex
     jobs_path = str(jobs.job_root(jobs_dir))
     source_root = forum_root(forums_dir) / topic_id / "source"
-    files = snapshot_sources(resolved_root, files, source_root, max_input_bytes - len(question.encode()))
+    # Later round tasks also carry every member's latest claim; keep room for them in the input limit.
+    claim_reserve = len(prepared) * max_answer_chars * 2 + ROUND_TASK_RESERVE
+    source_budget = max_input_bytes - len(question.encode()) - claim_reserve
+    if source_budget <= 0:
+        raise RelayError(
+            f"--max-input-bytes leaves no room for sources after reserving {claim_reserve} bytes for "
+            f"{len(prepared)} members' claims; raise --max-input-bytes or lower --max-answer-chars."
+        )
+    try:
+        files = snapshot_sources(resolved_root, files, source_root, source_budget)
+    except RelayError as exc:
+        raise RelayError(
+            f"{exc} The forum keeps {claim_reserve} bytes of --max-input-bytes for members' claims."
+        ) from exc
     with database(forums_dir) as connection, immediate(connection):
         connection.execute(
             """
@@ -582,6 +624,9 @@ def start_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                         """,
                         (topic_id, round_no, member["member_id"], job_id, json.dumps(message_ids)),
                     )
+                # Reject an oversized round before it is reserved; launch would fail on every retry.
+                for plan in _round_plans(connection, topic_id, round_no, members):
+                    _check_round_input(root, topic_id, round_no, topic, plan)
             elif topic["status"] == "round_pending":
                 round_no = int(topic["round"])
                 round_row = connection.execute(
@@ -591,41 +636,100 @@ def start_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                     raise RelayError(f"Topic {topic_id} is round_pending; wait or ingest before another round.")
             else:
                 raise RelayError(f"Topic {topic_id} is {topic['status']}; cannot start a round.")
-        with immediate(connection):
-            topic = _topic(connection, topic_id)
-            round_row = connection.execute(
-                "SELECT status FROM rounds WHERE topic_id=? AND round=?", (topic_id, round_no)
-            ).fetchone()
-            if topic["status"] != "round_pending" or round_row is None or round_row["status"] != "launching":
-                raise RelayError("Round changed before its jobs launched.")
+        # Launching spawns processes, so it holds only this topic's launch lock, never the database write lock.
+        # abandon takes the same lock before cancelling, so it sees every job this launch started.
+        with _launch_lock(root, topic_id):
+            with immediate(connection):
+                _require_launching(connection, topic_id, round_no)
+                topic = _topic(connection, topic_id)
+                plans = _round_plans(connection, topic_id, round_no, members)
             launched: list[dict[str, Any]] = []
-            candidates = _candidate_set(connection, topic_id, round_no)
-            for member in members:
-                row = connection.execute(
-                    "SELECT job_id, message_ids FROM round_jobs WHERE topic_id=? AND round=? AND member_id=?",
-                    (topic_id, round_no, member["member_id"]),
-                ).fetchone()
-                if row is None or row["job_id"] is None:
-                    raise RelayError("Reserved round job is missing its ID.")
-                messages = []
-                for message_id in json.loads(row["message_ids"]):
-                    message = connection.execute(
-                        "SELECT * FROM messages WHERE topic_id=? AND recipient=? AND message_id=?",
-                        (topic_id, member["member_id"], message_id),
-                    ).fetchone()
-                    if message is None:
-                        raise RelayError("Reserved round inbox message is missing.")
-                    messages.append(_message_record(message))
-                task_path = _write_round_task(root, topic_id, round_no, topic, member, messages, candidates)
-                prepared = jobs.prepare(_submit_args(topic, member, task_path, root, topic_id), job_id=row["job_id"])
+            for plan in plans:
+                member = plan["member"]
+                task_path = _write_round_task(
+                    root, topic_id, round_no, topic, member, plan["messages"], plan["candidates"]
+                )
+                prepared = jobs.prepare(_submit_args(topic, member, task_path, root, topic_id), job_id=plan["job_id"])
                 submitted = jobs.launch(prepared["job_id"], Path(topic["jobs_dir"]))
                 if submitted.get("launch_error"):
                     raise RelayError(str(submitted["launch_error"]))
                 launched.append(
                     {"member_id": member["member_id"], "job_id": submitted["job_id"], "status": submitted["status"]}
                 )
-            connection.execute("UPDATE rounds SET status='running' WHERE topic_id=? AND round=?", (topic_id, round_no))
+            with immediate(connection):
+                _require_launching(connection, topic_id, round_no)
+                connection.execute(
+                    "UPDATE rounds SET status='running' WHERE topic_id=? AND round=?", (topic_id, round_no)
+                )
     return {"topic_id": topic_id, "round": round_no, "status": "round_pending", "jobs": launched}
+
+
+@contextmanager
+def _launch_lock(forums_root: Path, topic_id: str) -> Iterator[None]:
+    directory = forums_root / topic_id
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(directory / "launch.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "r+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _require_launching(connection: sqlite3.Connection, topic_id: str, round_no: int) -> None:
+    topic = _topic(connection, topic_id)
+    round_row = connection.execute(
+        "SELECT status FROM rounds WHERE topic_id=? AND round=?", (topic_id, round_no)
+    ).fetchone()
+    if topic["status"] != "round_pending" or int(topic["round"]) != round_no or round_row is None:
+        raise RelayError("Round changed before its jobs launched.")
+    if round_row["status"] == "failed":
+        raise RelayError("Round was abandoned while its jobs launched; abandon cancels the launched jobs.")
+    if round_row["status"] != "launching":
+        raise RelayError(f"Topic {topic_id} is round_pending and its jobs already launched; wait or ingest.")
+
+
+def _round_plans(
+    connection: sqlite3.Connection, topic_id: str, round_no: int, members: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    candidates = _candidate_set(connection, topic_id, round_no)
+    plans: list[dict[str, Any]] = []
+    for member in members:
+        row = connection.execute(
+            "SELECT job_id, message_ids FROM round_jobs WHERE topic_id=? AND round=? AND member_id=?",
+            (topic_id, round_no, member["member_id"]),
+        ).fetchone()
+        if row is None or row["job_id"] is None:
+            raise RelayError("Reserved round job is missing its ID.")
+        messages = []
+        for message_id in json.loads(row["message_ids"]):
+            message = connection.execute(
+                "SELECT * FROM messages WHERE topic_id=? AND recipient=? AND message_id=?",
+                (topic_id, member["member_id"], message_id),
+            ).fetchone()
+            if message is None:
+                raise RelayError("Reserved round inbox message is missing.")
+            messages.append(_message_record(message))
+        plans.append({"member": member, "job_id": row["job_id"], "messages": messages, "candidates": candidates})
+    return plans
+
+
+def _check_round_input(
+    forums_root: Path, topic_id: str, round_no: int, topic: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    member = plan["member"]
+    task_path = _write_round_task(forums_root, topic_id, round_no, topic, member, plan["messages"], plan["candidates"])
+    try:
+        build_request(
+            forums_root / topic_id / "source",
+            json.loads(topic["files"]),
+            task_path,
+            topic["kind"],
+            topic["max_input_bytes"],
+        )
+    except RelayError as exc:
+        raise RelayError(
+            f"Forum round {round_no} task for {member['member_id']} exceeds the input limit ({exc}). "
+            "The round was not reserved; close the topic or open a new one with a smaller file set."
+        ) from exc
 
 
 def _abandon_round(
@@ -678,12 +782,13 @@ def abandon_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                 (topic_id, round_no),
             ).fetchall()
             jobs_dir = Path(topic["jobs_dir"])
-        for row in rows:
-            if not row["job_id"]:
-                continue
-            with suppress(RelayError, OSError):
-                jobs.cancel(row["job_id"], jobs_dir)
-                jobs.wait(row["job_id"], jobs_dir, 3)
+        with _launch_lock(forum_root(forums_dir), topic_id):
+            for row in rows:
+                if not row["job_id"]:
+                    continue
+                with suppress(RelayError, OSError):
+                    jobs.cancel(row["job_id"], jobs_dir)
+                    jobs.wait(row["job_id"], jobs_dir, 3)
         _abandon_round(connection, topic_id, round_no, require_failed=True)
     return {**topic_status(topic_id, forums_dir), "abandoned": True}
 
@@ -699,6 +804,8 @@ def _write_round_task(
 ) -> Path:
     directory = forums_root / topic_id / "rounds" / str(round_no) / str(member["member_id"])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # A peer claim already listed in the candidate set is not repeated in the inbox.
+    in_candidates = {(candidate["member_id"], candidate["round"]) for candidate in candidates}
     inbox = [
         {
             "message_id": message["message_id"],
@@ -708,6 +815,7 @@ def _write_round_task(
             "body": message["body"],
         }
         for message in messages
+        if not (message["kind"] in {"claim", "rebuttal"} and (message["sender"], message["round"]) in in_candidates)
     ]
     task = (
         topic["question"].rstrip()

@@ -1275,8 +1275,16 @@ def close_topic(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
         if topic["status"] == "round_pending":
             raise RelayError("Ingest or abandon the pending round before closing.")
         connection.execute("UPDATE topics SET status='closed', updated_at=? WHERE topic_id=?", (now, topic_id))
-        connection.execute(
-            """
+        previous = connection.execute("SELECT status, payload FROM consensus WHERE topic_id=?", (topic_id,)).fetchone()
+        closing: dict[str, Any] | None = closed_payload
+        if previous is not None and previous["status"] in {"agreed", "closed"}:
+            # Closing a settled topic only ends it; the agreement stays the published result.
+            closing = None
+        elif previous is not None:
+            closing = {**closed_payload, "last_settlement": json.loads(previous["payload"])}
+        if closing is not None:
+            connection.execute(
+                """
                 INSERT INTO consensus(topic_id, status, payload, exported_path, created_at)
                 VALUES (?, 'closed', ?, ?, ?)
                 ON CONFLICT(topic_id) DO UPDATE SET
@@ -1285,8 +1293,8 @@ def close_topic(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                     exported_path=excluded.exported_path,
                     created_at=excluded.created_at
                 """,
-            (topic_id, json.dumps(closed_payload, ensure_ascii=False), str(export_path), now),
-        )
+                (topic_id, json.dumps(closing, ensure_ascii=False), str(export_path), now),
+            )
     export_consensus(topic_id, forums_dir, None)
     return topic_status(topic_id, forums_dir)
 

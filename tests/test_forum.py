@@ -1055,6 +1055,26 @@ class ForumTests(unittest.TestCase):
         copy = forum.export_consensus(topic_id, self.forums, self.directory / "closed.json")
         self.assertEqual(copy["status"], "closed")
 
+    def test_close_keeps_an_agreed_consensus(self) -> None:
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag"),
+            self._adapter("beta", "redis", "Use Redis"),
+        )
+        self._track(forum.start_round(topic_id, self.forums))
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
+        self.assertEqual(agreed["status"], "agreed")
+
+        closed = forum.close_topic(topic_id, self.forums)
+
+        self.assertEqual(closed["status"], "closed")
+        self.assertEqual(closed["consensus"]["status"], "agreed")
+        self.assertEqual(closed["consensus"]["position"], "Use ETag")
+        exported = json.loads((self.forums / topic_id / "consensus.json").read_text(encoding="utf-8"))
+        self.assertEqual(exported["status"], "agreed")
+        self.assertEqual(exported["position"], "Use ETag")
+
     def test_open_topic_rejects_path_member_ids(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")

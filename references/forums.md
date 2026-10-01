@@ -36,7 +36,7 @@ python3 scripts/relay.py forum close TOPIC_ID
 
 `forum post` is chair-only and accepts `note` or `task`. Claims, rebuttals, ballots, and consensus are produced by ingest and settle. Round 1 ballots are ignored because members have not seen a shared proposal set. Later ballots must name a `claim_id` in the prior candidate set. An unknown or conflicting ID, or two affirmative choices from one member, makes that member's answer malformed. Automatic settlement counts ballots for the reviewed candidate set, even if a member's latest rebuttal has a different claim ID. A `claim_id` is eligible only when every prior claim with that ID has the same position. Split consensus leaves the topic `open` so the chair can choose an unambiguous latest claim with `--claim-id` or run another round. Agreed topics become `settled`. Relay never applies a change because members agreed.
 
-SQLite is the authority for consensus. `settle` and `close` commit their rows before writing `consensus.json`. A crash between those actions can leave the file absent or stale. `forum export` reads the committed row while holding the write lock and repairs the file. `forum close` writes `{status: closed}` to the database and then publishes that payload.
+SQLite is the authority for consensus. `settle` and `close` commit their rows before writing `consensus.json`. A crash between those actions can leave the file absent or stale. `forum export` reads the committed row while holding the write lock and repairs the file. `forum close` on a settled topic keeps the agreed consensus as the published result. Otherwise it writes `{status: closed}`, keeping any split settlement under `last_settlement`, and then publishes that payload.
 
 ## Concurrency
 

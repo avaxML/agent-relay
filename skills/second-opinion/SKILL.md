@@ -3,6 +3,8 @@ name: second-opinion
 description: Obtain an independent review of a proposed diagnosis, design, or change from another coding-agent CLI.
 ---
 
+Before running Relay in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). Antigravity needs a localhost listener even with its own `--sandbox` flag; request the host's approved execution scope for `run` when that listener is blocked.
+
 Use this skill before a consequential implementation decision or when a fresh reviewer may expose a missed edge case.
 
 Give the reviewer the exact question and relevant files. For an independent review, omit your conclusions; include a hypothesis when the task is specifically to challenge it. Ask for findings first, then evidence, severity, and a recommendation. Use `--kind review`; do not ask it to edit files or apply a patch.

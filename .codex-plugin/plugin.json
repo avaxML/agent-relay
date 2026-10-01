@@ -1,6 +1,6 @@
 {
   "name": "agent-relay",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Delegate bounded coding tasks to OpenCode, Antigravity, Cursor, and extensible CLI adapters.",
   "author": {
     "name": "avaxML",

@@ -3,6 +3,8 @@ name: bulk-read
 description: Ask a coding-agent CLI to inspect a large corpus and return bounded findings with file and line references.
 ---
 
+Before running Relay in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). Antigravity needs a localhost listener even with its own `--sandbox` flag; request the host's approved execution scope for `run` when that listener is blocked.
+
 Use this skill when reading every relevant file would consume lead-agent context: logs, OCR output, generated artifacts, or a broad repository slice.
 
 - Formulate a question that has an observable answer: locate rules, compare artifacts, enumerate callers, or extract structured facts.

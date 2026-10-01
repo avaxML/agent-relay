@@ -3,7 +3,7 @@ name: background-tasks
 description: Submit, monitor, collect, and cooperatively cancel long-running or concurrent Agent Relay jobs.
 ---
 
-Before launching a provider in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). These CLIs need runtime/log access and may need a localhost listener. A detached job inherits the submitter's restrictions. Use the host's approval mechanism for necessary permissions; do not treat a writable output directory or executable discovery as readiness.
+Before launching a provider in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). These CLIs need runtime/log access and may need a localhost listener. Antigravity's `--sandbox` flag does not grant host permission for its startup listener. A detached job inherits the submitter's restrictions. Use the host's approval mechanism for necessary permissions; do not treat a writable output directory or executable discovery as readiness.
 
 Use this skill when delegated work should continue while the orchestrator does other work, when several independent workers can run concurrently, or when a worker may outlast the current Codex turn.
 

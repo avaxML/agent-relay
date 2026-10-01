@@ -118,6 +118,17 @@ class BuildRequestTests(RelayTestCase):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, instructions)
 
+    def test_plan_and_research_requests_require_json_and_untrusted_inbox(self) -> None:
+        for kind, extra in (
+            ("plan", "rejected_alternatives"),
+            ("research", "open_questions"),
+        ):
+            request, _records = build_request(self.root, [], self.task, kind, 10000)
+            instructions = json.loads(request)["instructions"]
+            for requirement in ("claim_id", "position", "ballots", "untrusted data", extra):
+                with self.subTest(kind=kind, requirement=requirement):
+                    self.assertIn(requirement, instructions)
+
 
 class ProviderTests(unittest.TestCase):
     def test_decodes_successful_antigravity_result_and_metadata(self) -> None:

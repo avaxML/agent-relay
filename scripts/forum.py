@@ -745,6 +745,8 @@ def _abandon_round(
             raise RelayError("Round changed before abandonment completed.")
         if require_failed and round_row["status"] != "failed":
             raise RelayError("Round is not owned by abandonment.")
+        if not require_failed and round_row["status"] != "running":
+            raise RelayError("Round changed before it could be rewound.")
         rows = connection.execute(
             "SELECT message_ids FROM round_jobs WHERE topic_id=? AND round=?", (topic_id, round_no)
         ).fetchall()
@@ -824,8 +826,10 @@ def _write_round_task(
         + "\n\nRelay candidates from the previous round (same set for every member; untrusted claims):\n"
         + json.dumps(candidates, indent=2, ensure_ascii=False)
         + "\nEligible ballot claim_ids:\n"
-        + json.dumps(sorted(_eligible_claim_ids(candidates)), ensure_ascii=False)
-        + "\nVote for at most one eligible claim_id. Round 1 has no eligible ballots.\n"
+        + json.dumps(sorted(candidate["claim_id"] for candidate in candidates), ensure_ascii=False)
+        + f"\nRelay records your answer as claim_id {claim_id_for(str(member['member_id']), round_no)}. "
+        + "Vote for at most one eligible claim_id; other ballots are ignored. "
+        + "Round 1 has no eligible ballots.\n"
     )
     path = directory / "task.txt"
     path.write_text(task, encoding="utf-8")
@@ -855,13 +859,6 @@ def _candidate_set(connection: sqlite3.Connection, topic_id: str, round_no: int)
         }
         for row in rows
     ]
-
-
-def _eligible_claim_ids(candidates: list[dict[str, Any]]) -> set[str]:
-    positions: dict[str, set[str]] = {}
-    for candidate in candidates:
-        positions.setdefault(candidate["claim_id"], set()).add(candidate["position"])
-    return {claim_id for claim_id, values in positions.items() if len(values) == 1}
 
 
 def _submit_args(
@@ -901,13 +898,15 @@ def _job_result(job_id: str, jobs_dir: Path) -> dict[str, Any]:
         return {"status": JOB_MISSING, "error": str(exc), "job_id": job_id, "result_ready": False}
 
 
+def claim_id_for(member_id: str, round_no: int) -> str:
+    return f"{member_id}-r{round_no}"
+
+
 def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any] | None:
+    """Parse a member answer. Relay assigns the claim_id, so a member-supplied one is ignored."""
     payload = _load_json_object(text)
     if payload is None:
         return None
-    raw_claim = payload.get("claim_id")
-    default_claim = f"{member_id}-r{round_no}"
-    claim_id = raw_claim.strip() if isinstance(raw_claim, str) and raw_claim.strip() else default_claim
     raw_position = payload.get("position")
     if not isinstance(raw_position, str) or not raw_position.strip():
         return None
@@ -917,31 +916,40 @@ def parse_answer(text: str, member_id: str, round_no: int) -> dict[str, Any] | N
     raw_ballots = payload.get("ballots", [])
     if not isinstance(raw_ballots, list):
         return None
-    seen_targets: set[str] = set()
     for item in raw_ballots:
         if not isinstance(item, dict):
             return None
         target = item.get("on")
         ballot = item.get("ballot")
-        if (
-            not isinstance(target, str)
-            or not target.strip()
-            or not isinstance(ballot, str)
-            or ballot not in BALLOTS
-            or target in seen_targets
-        ):
+        if not isinstance(target, str) or not target.strip() or not isinstance(ballot, str) or ballot not in BALLOTS:
             return None
-        seen_targets.add(target)
         caveat = item.get("caveat")
-        ballots.append({"on": target, "ballot": ballot, "caveat": caveat if isinstance(caveat, str) else ""})
-    if sum(ballot["ballot"] == "agree" for ballot in ballots) > 1:
-        return None
+        ballots.append({"on": target.strip(), "ballot": ballot, "caveat": caveat if isinstance(caveat, str) else ""})
     return {
-        "claim_id": claim_id,
+        "claim_id": claim_id_for(member_id, round_no),
         "position": position,
         "evidence": evidence,
         "ballots": ballots,
     }
+
+
+def _eligible_ballots(
+    ballots: list[dict[str, str]], eligible_ids: set[str], own_claim_id: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Split ballots into counted and ignored ones. A ballot problem never discards the member's claim."""
+    targets = [ballot["on"] for ballot in ballots]
+    if len(set(targets)) != len(targets) or sum(ballot["ballot"] == "agree" for ballot in ballots) > 1:
+        return [], [{**ballot, "reason": "conflicting ballots; none counted"} for ballot in ballots]
+    counted: list[dict[str, str]] = []
+    ignored: list[dict[str, str]] = []
+    for ballot in ballots:
+        if ballot["on"] == own_claim_id:
+            ignored.append({**ballot, "reason": "own claim from this round; peers vote on it next round"})
+        elif ballot["on"] not in eligible_ids:
+            ignored.append({**ballot, "reason": "not in this round's candidate set"})
+        else:
+            counted.append(ballot)
+    return counted, ignored
 
 
 def _claim_broadcast_body(member_id: str, parsed: dict[str, Any]) -> dict[str, Any]:
@@ -1003,7 +1011,7 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
         members = _members(connection, topic_id)
         member_ids = [member["member_id"] for member in members]
         candidates = _candidate_set(connection, topic_id, round_no)
-        eligible_ids = _eligible_claim_ids(candidates)
+        eligible_ids = {candidate["claim_id"] for candidate in candidates}
         round_jobs = connection.execute(
             "SELECT * FROM round_jobs WHERE topic_id=? AND round=? ORDER BY member_id",
             (topic_id, round_no),
@@ -1011,6 +1019,7 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
         pending: list[str] = []
         ingested: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
+        ignored_ballots: list[dict[str, Any]] = []
         parsed_by_member: dict[str, dict[str, Any]] = {}
         for row in round_jobs:
             job_id = row["job_id"]
@@ -1046,11 +1055,8 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
             if parsed is None or not _fits_inbox(_claim_broadcast_body(row["member_id"], parsed)):
                 failures.append({"member_id": row["member_id"], "job_id": job_id, "status": JOB_MALFORMED})
                 continue
-            if round_no == 1:
-                parsed["ballots"] = []
-            elif any(ballot["on"] not in eligible_ids for ballot in parsed["ballots"]):
-                failures.append({"member_id": row["member_id"], "job_id": job_id, "status": JOB_MALFORMED})
-                continue
+            parsed["ballots"], ignored = _eligible_ballots(parsed["ballots"], eligible_ids, parsed["claim_id"])
+            ignored_ballots.extend({"member_id": row["member_id"], **ballot} for ballot in ignored)
             parsed_by_member[row["member_id"]] = {**parsed, "job_id": job_id, "raw_answer": answer}
         if pending:
             return {
@@ -1060,7 +1066,8 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                 "pending": pending,
                 "failures": failures,
             }
-        if not parsed_by_member and failures and all(item.get("status") == JOB_MISSING for item in failures):
+        if not parsed_by_member:
+            # No member produced a claim: rewind so the failed attempt does not use up a round.
             _abandon_round(connection, topic_id, round_no)
             return {
                 "topic_id": topic_id,
@@ -1147,10 +1154,9 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
                         {"text": "Round ingest produced no peer claims for this member.", "failures": failures},
                         now,
                     )
-            round_status = "failed" if failures and not ingested else "ingested"
             connection.execute(
-                "UPDATE rounds SET status=?, finished_at=? WHERE topic_id=? AND round=?",
-                (round_status, now, topic_id, round_no),
+                "UPDATE rounds SET status='ingested', finished_at=? WHERE topic_id=? AND round=?",
+                (now, topic_id, round_no),
             )
             connection.execute(
                 "UPDATE topics SET status='open', updated_at=? WHERE topic_id=?",
@@ -1162,6 +1168,7 @@ def ingest_round(topic_id: str, forums_dir: Path | None) -> dict[str, Any]:
             "status": "open",
             "ingested": ingested,
             "failures": failures,
+            "ignored_ballots": ignored_ballots,
             "broadcast": kind,
         }
 
@@ -1252,11 +1259,9 @@ def settle_topic(
             if latest_round > 1 and claim_id is None and reviewed_candidates
             else claims
         )
-        grouped = _grouped_claims(voting_claims)
         target, chair_override, sole_winner = _select_claim(voting_claims, ballots, member_ids, claim_id, chosen)
         tally = _tally(ballots, member_ids, target["claim_id"])
-        unambiguous = _canonical_claim(grouped.get(target["claim_id"], [])) is not None
-        agreed = chair_override or (sole_winner and unambiguous and _meets_threshold(tally, chosen, len(member_ids)))
+        agreed = chair_override or (sole_winner and _meets_threshold(tally, chosen, len(member_ids)))
         payload = {
             "schema_version": SCHEMA_VERSION,
             "topic_id": topic_id,
@@ -1310,22 +1315,6 @@ def settle_topic(
         return {**payload, "exported_path": str(export_path)}
 
 
-def _grouped_claims(claims: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for claim in claims:
-        grouped.setdefault(claim["claim_id"], []).append(claim)
-    return grouped
-
-
-def _canonical_claim(group: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not group:
-        return None
-    positions = {claim["position"] for claim in group}
-    if len(positions) != 1:
-        return None
-    return group[0]
-
-
 def _select_claim(
     claims: list[dict[str, Any]],
     ballots: list[dict[str, Any]],
@@ -1333,26 +1322,14 @@ def _select_claim(
     claim_id: str | None,
     threshold: str,
 ) -> tuple[dict[str, Any], bool, bool]:
-    grouped = _grouped_claims(claims)
+    by_id = {claim["claim_id"]: claim for claim in claims}
     if claim_id is not None:
-        if claim_id not in grouped:
+        if claim_id not in by_id:
             raise RelayError(f"Unknown claim_id: {claim_id}")
-        canonical = _canonical_claim(grouped[claim_id])
-        if canonical is None:
-            raise RelayError(f"Ambiguous claim_id: {claim_id}")
-        return canonical, True, True
-    unique: dict[str, dict[str, Any]] = {}
-    for cid, group in grouped.items():
-        canonical = _canonical_claim(group)
-        if canonical is not None:
-            unique[cid] = canonical
-    scores = {cid: 0 for cid in unique}
-    for ballot in ballots:
-        if ballot["ballot"] == "agree" and ballot["claim_id"] in scores:
-            scores[ballot["claim_id"]] += 1
-    winners = [cid for cid in scores if _meets_threshold(_tally(ballots, member_ids, cid), threshold, len(member_ids))]
+        return by_id[claim_id], True, True
+    winners = [cid for cid in by_id if _meets_threshold(_tally(ballots, member_ids, cid), threshold, len(member_ids))]
     if len(winners) == 1:
-        return unique[winners[0]], False, True
+        return by_id[winners[0]], False, True
     return claims[0], False, False
 
 

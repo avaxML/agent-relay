@@ -306,7 +306,7 @@ class ForumTests(unittest.TestCase):
             request = json.loads(task["request"])
             self.assertEqual(request["sources"][0]["numbered_content"], "1: cache uses files")
 
-    def test_second_round_rejects_ballots_for_claims_outside_its_candidate_set(self) -> None:
+    def test_ballots_outside_the_candidate_set_are_ignored_without_dropping_claims(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")
         topic_id = self._open(left, right)
@@ -324,10 +324,16 @@ class ForumTests(unittest.TestCase):
         forum.wait_round(topic_id, self.forums, 8)
         ingested = forum.ingest_round(topic_id, self.forums)
 
+        self.assertEqual(ingested["failures"], [])
+        self.assertEqual({item["claim_id"] for item in ingested["ingested"]}, {"alpha-r2", "beta-r2"})
         self.assertEqual(
-            [(item["member_id"], item["status"]) for item in ingested["failures"]],
-            [("alpha", "malformed"), ("beta", "malformed")],
+            [(item["member_id"], item["on"], item["reason"]) for item in ingested["ignored_ballots"]],
+            [
+                ("alpha", "invented", "not in this round's candidate set"),
+                ("beta", "invented", "not in this round's candidate set"),
+            ],
         )
+        self.assertEqual(forum.settle_topic(topic_id, self.forums)["tally"]["counts"]["agree"], 0)
 
     def test_one_member_cannot_approve_two_competing_claims(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -337,7 +343,7 @@ class ForumTests(unittest.TestCase):
         self._track(first)
         forum.wait_round(topic_id, self.forums, 8)
         forum.ingest_round(topic_id, self.forums)
-        votes = [{"on": "etag", "ballot": "agree"}, {"on": "redis", "ballot": "agree"}]
+        votes = [{"on": "alpha-r1", "ballot": "agree"}, {"on": "beta-r1", "ballot": "agree"}]
         for adapter_path in (left, right):
             adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
             adapter["env"]["FAKE_BALLOTS"] = json.dumps(votes)
@@ -348,10 +354,39 @@ class ForumTests(unittest.TestCase):
         forum.wait_round(topic_id, self.forums, 8)
         ingested = forum.ingest_round(topic_id, self.forums)
 
+        self.assertEqual(ingested["failures"], [])
+        self.assertEqual(len(ingested["ingested"]), 2)
         self.assertEqual(
-            [(item["member_id"], item["status"]) for item in ingested["failures"]],
-            [("alpha", "malformed"), ("beta", "malformed")],
+            {item["reason"] for item in ingested["ignored_ballots"]}, {"conflicting ballots; none counted"}
         )
+        self.assertEqual(len(ingested["ignored_ballots"]), 4)
+        settled = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(settled["status"], "split")
+        self.assertEqual(settled["tally"]["counts"]["agree"], 0)
+
+    def test_voting_for_your_own_revised_claim_keeps_the_answer(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        self._track(forum.start_round(topic_id, self.forums))
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        self._adapter("alpha", "merged", "ETag plus Redis", [{"on": "alpha-r2", "ballot": "agree"}])
+        self._adapter("beta", "merged", "ETag plus Redis", [{"on": "alpha-r1", "ballot": "agree"}])
+
+        self._track(forum.start_round(topic_id, self.forums))
+        forum.wait_round(topic_id, self.forums, 8)
+        ingested = forum.ingest_round(topic_id, self.forums)
+
+        self.assertEqual(ingested["failures"], [])
+        self.assertEqual({item["claim_id"] for item in ingested["ingested"]}, {"alpha-r2", "beta-r2"})
+        self.assertEqual(
+            [(item["member_id"], item["reason"]) for item in ingested["ignored_ballots"]],
+            [("alpha", "own claim from this round; peers vote on it next round")],
+        )
+        settled = forum.settle_topic(topic_id, self.forums, threshold="majority")
+        self.assertEqual(settled["status"], "split")
+        self.assertEqual(settled["tally"]["votes"]["beta"], "agree")
 
     def test_second_round_is_rejected_while_jobs_are_pending(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -486,7 +521,7 @@ class ForumTests(unittest.TestCase):
         self.assertEqual(code, 0, waited)
         code, ingested = self._cli("forum", "ingest", topic_id, "--forums-dir", str(self.forums))
         self.assertEqual(code, 0, ingested)
-        self.assertEqual({item["claim_id"] for item in ingested["ingested"]}, {"etag", "redis"})
+        self.assertEqual({item["claim_id"] for item in ingested["ingested"]}, {"alpha-r1", "beta-r1"})
         code, alpha_inbox = self._cli("forum", "inbox", topic_id, "--member", "alpha", "--forums-dir", str(self.forums))
         self.assertEqual(code, 0, alpha_inbox)
         senders = {message["sender"] for message in alpha_inbox["messages"]}
@@ -497,7 +532,7 @@ class ForumTests(unittest.TestCase):
             "settle",
             topic_id,
             "--claim-id",
-            "etag",
+            "alpha-r1",
             "--forums-dir",
             str(self.forums),
         )
@@ -524,7 +559,7 @@ class ForumTests(unittest.TestCase):
                     "env": {
                         "FAKE_CLAIM": "etag",
                         "FAKE_POSITION": "Use ETag",
-                        "FAKE_BALLOTS": json.dumps([{"on": "etag", "ballot": "agree"}]),
+                        "FAKE_BALLOTS": json.dumps([{"on": "alpha-r1", "ballot": "agree"}]),
                     },
                 }
             ),
@@ -537,7 +572,7 @@ class ForumTests(unittest.TestCase):
                     "env": {
                         "FAKE_CLAIM": "etag",
                         "FAKE_POSITION": "Use ETag",
-                        "FAKE_BALLOTS": json.dumps([{"on": "etag", "ballot": "agree"}]),
+                        "FAKE_BALLOTS": json.dumps([{"on": "alpha-r1", "ballot": "agree"}]),
                     },
                 }
             ),
@@ -567,7 +602,7 @@ class ForumTests(unittest.TestCase):
             adapter["env"].update(
                 FAKE_CLAIM=f"{member}-revision",
                 FAKE_POSITION=f"{member} still prefers ETag",
-                FAKE_BALLOTS=json.dumps([{"on": "etag", "ballot": "agree"}]),
+                FAKE_BALLOTS=json.dumps([{"on": "alpha-r1", "ballot": "agree"}]),
             )
             adapter_path.write_text(json.dumps(adapter), encoding="utf-8")
         second = forum.start_round(topic_id, self.forums)
@@ -578,7 +613,7 @@ class ForumTests(unittest.TestCase):
         agreed = forum.settle_topic(topic_id, self.forums)
 
         self.assertEqual(agreed["status"], "agreed")
-        self.assertEqual(agreed["claim_id"], "etag")
+        self.assertEqual(agreed["claim_id"], "alpha-r1")
         self.assertEqual(agreed["position"], "Use ETag")
 
     def test_second_round_tasks_contain_the_same_complete_candidate_set(self) -> None:
@@ -597,8 +632,9 @@ class ForumTests(unittest.TestCase):
             task = (self.forums / topic_id / "rounds" / "2" / member / "task.txt").read_text(encoding="utf-8")
             self.assertIn('"member_id": "alpha"', task)
             self.assertIn('"member_id": "beta"', task)
-            self.assertIn('"claim_id": "etag"', task)
-            self.assertIn('"claim_id": "redis"', task)
+            self.assertIn('"claim_id": "alpha-r1"', task)
+            self.assertIn('"claim_id": "beta-r1"', task)
+            self.assertIn(f"Relay records your answer as claim_id {member}-r2.", task)
 
     def test_failed_round_launch_resumes_known_jobs_without_repeating_work(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -735,45 +771,36 @@ class ForumTests(unittest.TestCase):
         split = forum.settle_topic(topic_id, self.forums)
         self.assertEqual(split["status"], "split")
         self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
-        agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
+        agreed = forum.settle_topic(topic_id, self.forums, claim_id="alpha-r1")
         self.assertEqual(agreed["status"], "agreed")
         self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "settled")
 
-    def test_collided_claim_ids_cannot_reach_unanimous_consensus(self) -> None:
-        left = self._adapter(
-            "alpha",
-            "etag",
-            "Use ETag",
-            [{"on": "etag", "ballot": "agree"}],
+    def test_member_supplied_claim_ids_are_replaced_by_relay_ids(self) -> None:
+        vote = [{"on": "etag", "ballot": "agree"}]
+        topic_id = self._open(
+            self._adapter("alpha", "etag", "Use ETag", vote),
+            self._adapter("beta", "etag", "Use Redis instead", vote),
         )
-        right = self._adapter(
-            "beta",
-            "etag",
-            "Use Redis instead",
-            [{"on": "etag", "ballot": "agree"}],
-        )
-        topic_id = self._open(left, right)
-        launched = forum.start_round(topic_id, self.forums)
-        self._track(launched)
+        self._track(forum.start_round(topic_id, self.forums))
         forum.wait_round(topic_id, self.forums, 8)
-        forum.ingest_round(topic_id, self.forums)
-        split = forum.settle_topic(topic_id, self.forums)
-        self.assertEqual(split["status"], "split")
-        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
-        with self.assertRaisesRegex(RelayError, "Ambiguous claim_id: etag"):
+        first = forum.ingest_round(topic_id, self.forums)
+        self.assertEqual({item["claim_id"] for item in first["ingested"]}, {"alpha-r1", "beta-r1"})
+        self.assertEqual(forum.settle_topic(topic_id, self.forums)["status"], "split")
+        with self.assertRaisesRegex(RelayError, "Unknown claim_id: etag"):
             forum.settle_topic(topic_id, self.forums, claim_id="etag")
-        self._adapter("alpha", "etag", "Use ETag")
-        self._adapter("beta", "etag", "Use ETag")
-        second = forum.start_round(topic_id, self.forums)
-        self._track(second)
+
+        agree = [{"on": "alpha-r1", "ballot": "agree"}]
+        self._adapter("alpha", "etag", "Use ETag", agree)
+        self._adapter("beta", "etag", "Use ETag", agree)
+        self._track(forum.start_round(topic_id, self.forums))
         forum.wait_round(topic_id, self.forums, 8)
         forum.ingest_round(topic_id, self.forums)
-        still_split = forum.settle_topic(topic_id, self.forums)
-        self.assertEqual(still_split["status"], "split")
-        agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
+        agreed = forum.settle_topic(topic_id, self.forums)
+
         self.assertEqual(agreed["status"], "agreed")
+        self.assertEqual(agreed["claim_id"], "alpha-r1")
         self.assertEqual(agreed["position"], "Use ETag")
-        self.assertTrue(agreed["chair_override"])
+        self.assertFalse(agreed["chair_override"])
 
     def test_rejected_settle_does_not_write_consensus_file(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -828,7 +855,7 @@ class ForumTests(unittest.TestCase):
         with patch.object(forum, "write_json", side_effect=slow_write):
             threads = [
                 threading.Thread(target=attempt, args=(None,)),
-                threading.Thread(target=attempt, args=("etag",)),
+                threading.Thread(target=attempt, args=("alpha-r1",)),
             ]
             for thread in threads:
                 thread.start()
@@ -863,7 +890,7 @@ class ForumTests(unittest.TestCase):
             patch.object(forum, "write_json", side_effect=OSError("disk unavailable")),
             self.assertRaisesRegex(OSError, "disk unavailable"),
         ):
-            forum.settle_topic(topic_id, self.forums, claim_id="etag")
+            forum.settle_topic(topic_id, self.forums, claim_id="alpha-r1")
 
         with forum.database(self.forums) as connection:
             row = connection.execute("SELECT payload FROM consensus WHERE topic_id=?", (topic_id,)).fetchone()
@@ -905,7 +932,7 @@ class ForumTests(unittest.TestCase):
 
         def settle() -> None:
             try:
-                forum.settle_topic(topic_id, self.forums, claim_id="etag")
+                forum.settle_topic(topic_id, self.forums, claim_id="alpha-r1")
             except BaseException as exc:
                 errors.append(exc)
             finally:
@@ -938,7 +965,7 @@ class ForumTests(unittest.TestCase):
         fenced = '```json\n{"claim_id":"etag","position":"Use ETag","evidence":[]}\n```'
         parsed = forum.parse_answer(fenced, "alpha", 1)
         assert parsed is not None
-        self.assertEqual(parsed["claim_id"], "etag")
+        self.assertEqual(parsed["claim_id"], "alpha-r1")
 
     def test_parse_answer_rejects_json_arrays(self) -> None:
         stolen = '[{"claim_id":"stolen","position":"Use ETag","evidence":[]}]'
@@ -950,7 +977,7 @@ class ForumTests(unittest.TestCase):
         bom = "\ufeff" + '{"claim_id":"etag","position":"Use ETag","evidence":[]}'
         parsed = forum.parse_answer(bom, "alpha", 1)
         assert parsed is not None
-        self.assertEqual(parsed["claim_id"], "etag")
+        self.assertEqual(parsed["claim_id"], "alpha-r1")
 
     def test_concatenated_json_answers_are_malformed_failures(self) -> None:
         worker = self.directory / "two_json.py"
@@ -977,9 +1004,16 @@ class ForumTests(unittest.TestCase):
         forum.wait_round(topic_id, self.forums, 8)
         ingested = forum.ingest_round(topic_id, self.forums)
         self.assertEqual({item["status"] for item in ingested["failures"]}, {forum.JOB_MALFORMED})
-        self.assertEqual(ingested["ingested"], [])
+        self.assertTrue(ingested["abandoned"])
         inbox = forum.peek_inbox(topic_id, "alpha", self.forums)
         self.assertFalse(any(message["kind"] == "claim" for message in inbox["messages"]))
+        status = forum.topic_status(topic_id, self.forums)
+        self.assertEqual((status["status"], status["round"], status["rounds"]), ("open", 0, []))
+        self.assertEqual(status["unread"], {"alpha": 1, "beta": 1})
+        retry = forum.start_round(topic_id, self.forums)
+        self._track(retry)
+        self.assertEqual(retry["round"], 1)
+        self.assertNotEqual({item["job_id"] for item in retry["jobs"]}, {item["job_id"] for item in launched["jobs"]})
 
     def test_deleted_jobs_dir_abandons_round_and_restores_mail(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -1035,9 +1069,10 @@ class ForumTests(unittest.TestCase):
         alpha_path.write_text('{"status":"ok","answer":"', encoding="utf-8")
         beta_path.write_text("[1, 2, 3]\n", encoding="utf-8")
         ingested = forum.ingest_round(topic_id, self.forums)
-        self.assertEqual(ingested["ingested"], [])
+        self.assertTrue(ingested["abandoned"])
         self.assertEqual({item["status"] for item in ingested["failures"]}, {forum.JOB_MALFORMED})
-        self.assertEqual(forum.topic_status(topic_id, self.forums)["status"], "open")
+        status = forum.topic_status(topic_id, self.forums)
+        self.assertEqual((status["status"], status["round"]), ("open", 0))
 
     def test_close_after_settle_updates_consensus_payload(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
@@ -1064,7 +1099,7 @@ class ForumTests(unittest.TestCase):
         self._track(forum.start_round(topic_id, self.forums))
         forum.wait_round(topic_id, self.forums, 8)
         forum.ingest_round(topic_id, self.forums)
-        agreed = forum.settle_topic(topic_id, self.forums, claim_id="etag")
+        agreed = forum.settle_topic(topic_id, self.forums, claim_id="alpha-r1")
         self.assertEqual(agreed["status"], "agreed")
 
         closed = forum.close_topic(topic_id, self.forums)

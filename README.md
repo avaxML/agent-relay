@@ -171,7 +171,7 @@ python3 scripts/relay.py forum ingest TOPIC_ID
 python3 scripts/relay.py forum settle TOPIC_ID
 ```
 
-`round` reserves every member's job ID before launch. Retry `forum round` if a launch stops midway; it resumes the reserved jobs. `ingest` broadcasts claims once and restores the exact input of a failed member. Round 1 collects proposals without counting ballots. Later rounds show every member the same prior candidate set and accept at most one affirmative ballot on an unambiguous `claim_id` in that set. `settle` uses those ballots or a chair `--claim-id` override. It commits consensus to SQLite before writing `consensus.json`; `forum export` repairs that file if publication was interrupted. Split leaves the topic open. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
+`round` reserves every member's job ID before launch. Retry `forum round` if a launch stops midway; it resumes the reserved jobs. `ingest` broadcasts claims once and restores the exact input of a failed member; a round in which every member fails is rewound and does not count. Relay assigns claim IDs as `MEMBER-rN`. Round 1 collects proposals without counting ballots. Later rounds show every member the same prior candidate set and count at most one affirmative ballot on a `claim_id` in that set; other ballots are reported, not fatal. `settle` uses those ballots or a chair `--claim-id` override. It commits consensus to SQLite before writing `consensus.json`; `forum export` repairs that file if publication was interrupted. Split leaves the topic open. Agreement is advisory; Relay never applies a patch because members agreed. See [forums](references/forums.md).
 
 ## Restricted execution environments
 

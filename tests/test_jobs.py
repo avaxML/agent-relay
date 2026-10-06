@@ -13,6 +13,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 RELAY = ROOT / "scripts" / "relay.py"
@@ -378,6 +379,66 @@ class JobCliTests(unittest.TestCase):
         )
         self.assertEqual(code, 1, payload)
         self.assertIn("File exists", payload["error"])
+
+    def test_submitted_probe_copies_isolation_into_the_job_runtime(self) -> None:
+        for arguments in (
+            ["init", "-q"],
+            ["-c", "user.name=Test", "-c", "user.email=test@example.com", "add", "."],
+            ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "initial"],
+        ):
+            subprocess.run(["git", "-C", str(self.project), *arguments], check=True, capture_output=True)
+        probe = self.directory / "probe_worker.py"
+        probe.write_text(
+            "import pathlib\npathlib.Path('probe.txt').write_text('probe\\n')\nprint('probe complete')\n",
+            encoding="utf-8",
+        )
+        adapter = self.directory / "tools-adapter.json"
+        adapter.write_text(
+            json.dumps(
+                {
+                    "name": "fake-tools",
+                    "executable": sys.executable,
+                    "default_model": "fake-model",
+                    "args": [str(probe)],
+                    "input": "stdin",
+                    "output": "text",
+                    "env": {},
+                    "models_args": [],
+                    "probe_args": [],
+                    "tools": {"args": [str(probe)], "env": {}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.directory / "clones")}):
+            code, payload = self._cli(
+                "submit",
+                "--provider",
+                "fake-tools",
+                "--adapter-file",
+                str(adapter),
+                "--task-file",
+                str(self.task),
+                "--root",
+                str(self.project),
+                "--files",
+                "source.txt",
+                "--jobs-dir",
+                str(self.jobs),
+                "--kind",
+                "probe",
+                "--timeout",
+                "10",
+            )
+            self.assertEqual(code, 0, payload)
+            job_id = payload["job_id"]
+            self.active.append(job_id)
+            code, state = self._cli("wait", job_id, "--jobs-dir", str(self.jobs), "--timeout", "10")
+        self.assertEqual(code, 0, state)
+        self.assertEqual(state["status"], "completed")
+        code, fetched = self._cli("result", job_id, "--jobs-dir", str(self.jobs))
+        self.assertEqual(code, 0, fetched)
+        self.assertEqual(fetched["result"]["status"], "ok")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,13 @@ from providers import RelayError
 from task_runner import prepare_task, run_prepared, write_json
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
-OUTCOMES = {"ok": "completed", "error": "failed", "cancelled": "cancelled"}
+OUTCOMES = {
+    "ok": "completed",
+    "error": "failed",
+    "cancelled": "cancelled",
+    "violation": "failed",
+    "check_failed": "failed",
+}
 STARTUP_GRACE = 15
 
 
@@ -110,7 +116,7 @@ def submit(args: argparse.Namespace) -> dict[str, Any]:
         write_json(directory / "task.json", task)
         runtime = directory / "runtime"
         runtime.mkdir(mode=0o700)
-        for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py"):
+        for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py", "isolation.py"):
             shutil.copy2(Path(__file__).resolve().parent / name, runtime / name)
         with (directory / "supervisor.log").open("wb") as log:
             subprocess.Popen(
@@ -127,6 +133,19 @@ def submit(args: argparse.Namespace) -> dict[str, Any]:
         write_json(directory / "state.json", state)
         return state
     return status(directory.name, root)
+
+
+def find_by_output(output: Path, root: Path) -> str | None:
+    """Return the job that owns an artifact directory, so a crashed dispatch can recover its job ID."""
+    target = output.expanduser().resolve()
+    for path in root.glob("*/state.json"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(state, dict) and Path(str(state.get("output_dir"))).resolve() == target:
+            return str(state.get("job_id"))
+    return None
 
 
 def cancel(job_id: str, root: Path) -> dict[str, Any]:

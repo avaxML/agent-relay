@@ -44,6 +44,7 @@ class PackagingTests(unittest.TestCase):
             "bulk-read",
             "chaos-monkey",
             "delegate",
+            "executor",
             "propose-patch",
             "relay-doctor",
             "second-opinion",

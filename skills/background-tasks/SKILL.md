@@ -5,7 +5,7 @@ description: Submit, monitor, collect, and cooperatively cancel long-running or 
 
 Before launching a provider in a restricted host, read [sandbox execution](../../references/sandbox-execution.md). These CLIs need runtime/log access and may need a localhost listener. Antigravity's `--sandbox` flag does not grant host permission for its startup listener. A detached job inherits the submitter's restrictions. Use the host's approval mechanism for necessary permissions; do not treat a writable output directory or executable discovery as readiness.
 
-Use this skill when delegated work should continue while the orchestrator does other work, when several independent workers can run concurrently, or when a worker may outlast the current Codex turn. Prefer this path for Cursor `xhigh` and OpenCode `max`, which can take several minutes.
+Use this skill when delegated work should continue while the orchestrator does other work, when several independent workers can run concurrently, or when a worker may outlast the current Codex turn. Prefer this path for Cursor `xhigh` and OpenCode `max`, which can take several minutes, and for tool-enabled `probe` and `execute` tasks. Do not escalate to those slow levels unless the user asks.
 
 Resolve the plugin root as the directory two levels above the directory containing this `SKILL.md`. Resolve the jobs directory from `--jobs-dir`, then `AGENT_RELAY_JOBS_DIR`, then `~/.local/state/agent-relay/jobs`. Use absolute paths for task files, repository roots, output paths, adapter files, and jobs directories. Do not use shell background `&`; `submit` detaches the runner and returns promptly.
 
@@ -31,6 +31,6 @@ Independent jobs have distinct directories and artifacts and may run concurrentl
 
 The worker inherits the invoking environment and CLI credentials. Job snapshots, logs, terminal results, and provider session history can contain sensitive source material. Local job files do not provide hard OS isolation.
 
-The bundled Cursor adapter uses the stable Relay-owned workspace that the user explicitly trusted during setup. It never passes `--trust`. Do not point Cursor at the source project workspace or add approval flags when submitting a background job.
+For tool-free kinds, the bundled Cursor adapter uses the stable Relay-owned workspace that the user explicitly trusted during setup and never passes `--trust`. Do not point Cursor at the source project workspace or add approval flags when submitting a background job. `probe` and `execute` jobs use the adapter's verified tools mode in a throwaway clone; they accept `--ref`, `--owns`, `--check`, `--setup`, and `--check-timeout`. A `violation` or `check_failed` result makes the job `failed`, and `result` still returns its `result.json`. For several such jobs, use [executor](../executor/SKILL.md).
 
 For ordinary one-shot delegation, use [delegate](../delegate/SKILL.md). For adapter flags and provider configuration, read [adding-adapters.md](../../references/adding-adapters.md).

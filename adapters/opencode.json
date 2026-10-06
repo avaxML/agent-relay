@@ -26,6 +26,22 @@
     "run",
     "--help"
   ],
+  "tools": {
+    "args": [
+      "run",
+      "--standalone",
+      "--model",
+      "{model}",
+      "--format",
+      "json",
+      "--file",
+      "{request_file}",
+      "Read the attached JSON task. Follow its instructions, using tools only inside the current directory, and report every command you ran."
+    ],
+    "env": {
+      "OPENCODE_CONFIG_CONTENT": "{\"permission\":{\"*\":\"deny\",\"read\":\"allow\",\"list\":\"allow\",\"glob\":\"allow\",\"grep\":\"allow\",\"edit\":\"allow\",\"bash\":\"allow\",\"external_directory\":\"deny\",\"webfetch\":\"deny\",\"websearch\":\"deny\",\"task\":\"deny\"}}"
+    }
+  },
   "effort": {
     "models": [
       "opencode-go/deepseek-v4.1-flash"

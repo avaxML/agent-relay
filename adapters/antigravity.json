@@ -27,6 +27,28 @@
   "probe_args": [
     "--help"
   ],
+  "tools": {
+    "args": [
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--model",
+      "{model}",
+      "--mode",
+      "accept-edits",
+      "--sandbox",
+      "--add-dir",
+      "{clone}",
+      "--dangerously-skip-permissions",
+      "--print-timeout",
+      "{timeout}s",
+      "--log-file",
+      "{workdir}/agy.log",
+      "--print="
+    ],
+    "env": {}
+  },
   "effort": {
     "models": [
       "gemini-3.8-flash-low",

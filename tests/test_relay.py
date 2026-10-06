@@ -355,7 +355,7 @@ class RunIntegrationTests(RelayTestCase):
                 "--sandbox",
                 "enabled",
                 "--model",
-                "cursor-grok-4.6-high",
+                "grok-4.7-high",
                 "--output-format",
                 "stream-json",
             ],

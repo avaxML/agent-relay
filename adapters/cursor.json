@@ -1,7 +1,7 @@
 {
   "name": "cursor",
   "executable": "cursor-agent",
-  "default_model": "cursor-grok-4.6-high",
+  "default_model": "grok-4.7-high",
   "args": [
     "-p",
     "--workspace",
@@ -26,23 +26,23 @@
   ],
   "effort": {
     "models": [
-      "cursor-grok-4.6-low",
-      "cursor-grok-4.6-medium",
-      "cursor-grok-4.6-high",
-      "cursor-grok-4.6-xhigh"
+      "grok-4.7-low",
+      "grok-4.7-medium",
+      "grok-4.7-high",
+      "grok-4.7-xhigh"
     ],
     "levels": {
       "low": {
-        "model": "cursor-grok-4.6-low"
+        "model": "grok-4.7-low"
       },
       "medium": {
-        "model": "cursor-grok-4.6-medium"
+        "model": "grok-4.7-medium"
       },
       "high": {
-        "model": "cursor-grok-4.6-high"
+        "model": "grok-4.7-high"
       },
       "xhigh": {
-        "model": "cursor-grok-4.6-xhigh",
+        "model": "grok-4.7-xhigh",
         "timeout": 600
       }
     }

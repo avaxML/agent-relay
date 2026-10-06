@@ -46,8 +46,8 @@ class EffortTests(unittest.TestCase):
         for effort in ("low", "medium", "high", "xhigh"):
             with self.subTest(effort=effort):
                 self.assertEqual(
-                    resolve_effort(adapter, "cursor-grok-4.6-high", effort),
-                    (f"cursor-grok-4.6-{effort}", []),
+                    resolve_effort(adapter, "grok-4.7-high", effort),
+                    (f"grok-4.7-{effort}", []),
                 )
 
     def test_unsupported_models_levels_and_legacy_adapters_fail(self) -> None:
@@ -82,19 +82,28 @@ class EffortTests(unittest.TestCase):
         cursor = load_adapter("cursor")
         opencode = load_adapter("opencode")
         deepseek = "opencode-go/deepseek-v4.1-flash"
-        self.assertEqual(resolve_timeout(cursor, "xhigh", "cursor-grok-4.6-xhigh", None), 600)
+        self.assertEqual(resolve_timeout(cursor, "xhigh", "grok-4.7-xhigh", None), 600)
         self.assertEqual(resolve_timeout(opencode, "max", f"{deepseek}#max", None), 600)
-        self.assertEqual(resolve_timeout(cursor, "high", "cursor-grok-4.6-high", None), DEFAULT_TIMEOUT)
-        self.assertEqual(resolve_timeout(cursor, None, "cursor-grok-4.6-high", None), DEFAULT_TIMEOUT)
+        self.assertEqual(resolve_timeout(cursor, "high", "grok-4.7-high", None), DEFAULT_TIMEOUT)
+        self.assertEqual(resolve_timeout(cursor, None, "grok-4.7-high", None), DEFAULT_TIMEOUT)
         self.assertEqual(resolve_timeout(opencode, None, deepseek, None), DEFAULT_TIMEOUT)
         self.assertEqual(resolve_timeout(opencode, "max", f"{deepseek}#max", 90), 90)
 
     def test_directly_selected_slow_variant_implies_its_timeout(self) -> None:
-        self.assertEqual(resolve_timeout(load_adapter("cursor"), None, "cursor-grok-4.6-xhigh", None), 600)
+        self.assertEqual(resolve_timeout(load_adapter("cursor"), None, "grok-4.7-xhigh", None), 600)
         self.assertEqual(
             resolve_timeout(load_adapter("opencode"), None, "opencode-go/deepseek-v4.1-flash#max", None), 600
         )
         self.assertEqual(resolve_timeout({"name": "legacy"}, None, "model", None), DEFAULT_TIMEOUT)
+
+    def test_cursor_rejects_previous_generation_and_keeps_composer_without_effort(self) -> None:
+        cursor = load_adapter("cursor")
+        for model in ("cursor-grok-4.6-high", "composer-2.5"):
+            with self.subTest(model=model), self.assertRaises(RelayError):
+                resolve_effort(cursor, model, "high")
+        self.assertEqual(resolve_effort(cursor, "composer-2.5", None), ("composer-2.5", []))
+        self.assertEqual(resolve_timeout(cursor, None, "composer-2.5", None), DEFAULT_TIMEOUT)
+        self.assertEqual(load_adapter("cursor")["default_model"], "grok-4.7-high")
 
     def test_custom_effort_reaches_cli_and_result_records_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

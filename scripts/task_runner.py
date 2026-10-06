@@ -444,6 +444,8 @@ def run_prepared(
             tools_args, tools_env = resolve_invocation(adapter, True)
             env, removed = tool_environment(os.environ, keep=adapter["tools"].get("pass_env", []))
             result["env_removed"] = removed
+            # Some CLIs resolve their project from PWD rather than the process cwd.
+            env["PWD"] = str(clone.work)
             provider_env = {**env, **tools_env}
             setup_results: list[dict[str, Any]] = []
             result["setup_results"] = setup_results

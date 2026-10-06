@@ -33,6 +33,9 @@ mode = os.environ.get("FAKE_MODE", "probe")
 if os.environ.get("GIT_DIR"):
     print("GIT_DIR leaked into the worker environment", file=sys.stderr)
     raise SystemExit(3)
+if os.path.realpath(os.environ.get("PWD", ".")) != os.path.realpath(os.getcwd()):
+    print("PWD does not name the clone; a PWD-resolving CLI would work in the caller's directory", file=sys.stderr)
+    raise SystemExit(6)
 if os.environ.get("FAKE_TOOLS") != "1":
     print("tools environment missing", file=sys.stderr)
     raise SystemExit(4)
@@ -300,6 +303,13 @@ class ToolsTests(unittest.TestCase):
         for kind, options in (("probe", {}), ("execute", {"owns": ["app.py"]})):
             with self.subTest(kind=kind), self.assertRaisesRegex(RelayError, "has no verified tools mode"):
                 self.run_kind(kind, "probe", **options)
+
+    def test_tool_processes_see_the_clone_as_pwd(self) -> None:
+        check = "python3 -c 'import os; assert os.path.realpath(os.environ[\"PWD\"]) == os.path.realpath(os.getcwd())'"
+        with mock.patch.dict(os.environ, {"PWD": str(ROOT)}):
+            result = self.run_kind("probe", "probe", checks=[check])
+        self.assertEqual(result["status"], "ok", result.get("error"))
+        self.assertEqual(result["checks"][0]["exit_code"], 0)
 
     def test_provider_environment_excludes_git_variables_and_keeps_tools_env(self) -> None:
         with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent"}):

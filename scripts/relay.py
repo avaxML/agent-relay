@@ -109,6 +109,16 @@ def main() -> int:
             )
             sub.add_argument("--max-input-bytes", type=positive_int, default=400000)
             sub.add_argument("--max-answer-chars", type=positive_int, default=12000)
+            sub.add_argument("--ref", default="HEAD")
+            sub.add_argument("--owns", action="append")
+            sub.add_argument("--check", action="append", dest="checks")
+            sub.add_argument("--setup", action="append")
+            sub.add_argument(
+                "--check-timeout",
+                type=positive_int,
+                default=180,
+                help="Seconds for each Relay setup/check command; separate from --timeout.",
+            )
         if command == "submit":
             sub.add_argument("--jobs-dir", type=Path)
     adapter = commands.add_parser("adapter")

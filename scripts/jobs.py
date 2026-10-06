@@ -22,7 +22,13 @@ from providers import RelayError
 from task_runner import prepare_task, run_prepared, write_json
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
-OUTCOMES = {"ok": "completed", "error": "failed", "cancelled": "cancelled"}
+OUTCOMES = {
+    "ok": "completed",
+    "error": "failed",
+    "cancelled": "cancelled",
+    "violation": "failed",
+    "check_failed": "failed",
+}
 STARTUP_GRACE = 15
 
 
@@ -110,7 +116,7 @@ def submit(args: argparse.Namespace) -> dict[str, Any]:
         write_json(directory / "task.json", task)
         runtime = directory / "runtime"
         runtime.mkdir(mode=0o700)
-        for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py"):
+        for name in ("jobs.py", "task_runner.py", "execution.py", "providers.py", "isolation.py"):
             shutil.copy2(Path(__file__).resolve().parent / name, runtime / name)
         with (directory / "supervisor.log").open("wb") as log:
             subprocess.Popen(

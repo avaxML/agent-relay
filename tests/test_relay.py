@@ -123,9 +123,14 @@ class BuildRequestTests(RelayTestCase):
             with self.subTest(kind=kind):
                 instructions = json.loads(build_request(self.root, [], self.task, kind, 10000)[0])["instructions"]
                 self.assertEqual(instructions, KINDS[kind].instructions)
-                self.assertFalse(KINDS[kind].tools)
-                self.assertTrue(instructions.startswith("You are a bounded worker."))
-                self.assertIn("Do not use tools", instructions)
+                self.assertTrue(instructions.startswith("You are a bounded worker"))
+                if kind in ("probe", "execute"):
+                    self.assertTrue(KINDS[kind].tools)
+                    self.assertIn("Stay inside the clone", instructions)
+                    self.assertIn("Do not commit, push", instructions)
+                else:
+                    self.assertFalse(KINDS[kind].tools)
+                    self.assertIn("Do not use tools", instructions)
 
 
 class ProviderTests(unittest.TestCase):

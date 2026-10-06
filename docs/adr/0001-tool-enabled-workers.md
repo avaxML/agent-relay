@@ -20,20 +20,20 @@ Every Relay provider used to run with tools denied, in a temporary directory, on
 
 Relay pins `--ref` to a commit SHA when the task is prepared. Before any provider runs, it does the following.
 
-- **Snapshot.** It fetches that commit into a private bare repository (`clones/<id>/repo.git`) and points its `HEAD` at the fetched branch. This is the only time Relay runs git against the user's repository: `rev-parse` to pin the ref, and the fetch source. No provider has run at that point.
+- **Snapshot.** It fetches that commit into a private bare repository (`clones/<id>/repo.git`) and points its `HEAD` at the fetched branch. These are the only git commands Relay runs against the user's repository: `rev-parse` to pin the ref, and the fetch source (`upload-pack`). Neither runs hooks or fsmonitor. Within one task, both run before that task's provider. `dispatch` pins one SHA for the whole dispatch before its first submit. Later tasks in that dispatch still fetch the pinned SHA from the user's repository after other tasks' providers ran, but only in their own clones.
 - **Work tree.** It clones the provider's work tree (`clones/<id>/work`) from the private repository with `--no-local --no-hardlinks`, removes `origin`, and checks out the SHA detached. Without hardlinks, a provider cannot corrupt the user's or Relay's object store. Without `origin`, a plain `git push` has nowhere to go.
-- **Index.** It builds Relay's own index (`clones/<id>/relay.index`) from the SHA.
+- **Index and fingerprint.** It builds Relay's own index (`clones/<id>/relay.index`) from the SHA. It also writes `repo.git/info/attributes` (`* -filter -ident -working-tree-encoding`) and records a fingerprint of everything in `repo.git` except `objects/`. These files sit beside the work tree, where a provider's shell can reach them. Before capture, Relay therefore refuses to run any git if the fingerprint changed, and rebuilds its index from the pinned SHA. A provider can thus neither plant config or excludes there nor hide an edit with `assume-unchanged`.
 
 After the provider exits, Relay never uses the work tree's `.git`.
 
 - **Hardened git.** Status, `add`, and diff run with `--git-dir=repo.git --work-tree=work`, Relay's index, and these settings:
-  - `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.excludesFile=/dev/null -c core.autocrlf=false`;
-  - `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`;
+  - `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null -c core.autocrlf=false -c protocol.file.allow=always` (the last is needed to fetch from a local path);
+  - `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0` and `LC_ALL=C`;
   - `--no-ext-diff --no-textconv --no-renames`;
   - no inherited `GIT_*` variables.
 
   Hooks, `core.fsmonitor`, filter drivers, external diff, or a `.git` file or symlink the provider plants in the clone therefore never run inside Relay.
-- **`.git` metadata check.** Changes to the work tree's `.git` are detected in pure Python, by hashing its files before and after the run and reading symlinks without following them. Every path except `index`, `objects/`, `logs/`, `FETCH_HEAD` and `ORIG_HEAD` is watched, including `config`, `hooks/`, `info/`, `HEAD` and `refs/`. A `.git` that is no longer a directory also counts. Any such change is a violation for both kinds; a provider commit is caught because it moves `HEAD` or a ref.
+- **`.git` metadata check.** Changes to the work tree's `.git` are detected in pure Python, by hashing its files before and after the run and reading symlinks without following them. Every path except `index`, `objects/`, `logs/`, `FETCH_HEAD` and `ORIG_HEAD` is watched, including `config`, `hooks/`, `info/`, `HEAD` and `refs/`. The excluded paths are git's own caches, which read-only commands such as `git status` rewrite. Content changes still surface through Relay's capture, and a commit moves `HEAD` or a ref. A `.git` that is no longer a directory also counts. Any such change is a violation for both kinds; a provider commit is caught because it moves `HEAD` or a ref.
 - **Bounds.** Capture is bounded and does not follow symlinks.
   - Status entries are capped at 10,000.
   - The `lstat` sizes of changed and untracked regular files are capped at 8 MB.
@@ -67,7 +67,17 @@ Each mode was settled by a live synthetic check on this machine (agy 1.3.0, open
 
 Relay never edits `~/.cursor/cli-config.json`, `~/.gemini/antigravity-cli/settings.json`, or OpenCode's configuration.
 
-The environment for tool-kind processes drops `GIT_*`, `SSH_AUTH_SOCK`, and names matching `TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|ACCESS_KEY|PRIVATE_KEY`. An adapter's `tools.pass_env` can exempt named variables. `result.json` records the removed names (never values) as `env_removed`. All three providers authenticated from their own credential stores with this filter in place.
+The environment for tool-kind processes drops `GIT_*`, `SSH_AUTH_SOCK`, and names matching `TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|ACCESS_KEY|PRIVATE_KEY`. An adapter's `tools.pass_env` can exempt secret-pattern names only. Validation rejects `GIT_*` and `SSH_AUTH_SOCK` in `pass_env` and in `tools.env`. `result.json` records the removed names (never values) as `env_removed`. All three providers authenticated from their own credential stores with this filter in place.
+
+## Module layering
+
+- `relay.py` (CLI edge) imports `task_runner`, `jobs`, `providers` and `dispatch`.
+- `dispatch` imports `isolation` (globs, ref pinning, clone removal), `task_runner` (`write_json` and `check_tool_options`) and `providers`. It never imports `jobs`; submit, doctor, status and result are injected.
+- `jobs` imports `task_runner` and `providers`.
+- `task_runner` imports `execution`, `providers` and `isolation`.
+- `isolation` imports `execution` and `providers`.
+- `execution` imports `providers`.
+- `providers` imports only the standard library.
 
 ## What Relay cannot stop
 
@@ -77,7 +87,7 @@ Tool modes are not an OS sandbox. A provider runs as the user, so Relay cannot p
 - shell writes outside the clone where the provider's own sandbox allows them;
 - daemons that escape the process group.
 
-Relay's checks run code that the provider may have changed. That is inherent in rerunning `execute` checks; the checks still run in the clone with the filtered environment.
+A provider that overwrites object files in Relay's private repository could still corrupt the comparison base (objects are not fingerprinted). Relay's checks run code that the provider may have changed. That is inherent in rerunning `execute` checks; the checks still run in the clone with the filtered environment.
 
 ## Rejected alternatives
 

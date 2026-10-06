@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from execution import execute
-from providers import RelayError, decode_response, load_adapter
+from providers import BLANKET_FLAGS, RelayError, decode_response, load_adapter, resolve_invocation, validate_adapter
 from task_runner import KINDS, build_request, provider_workspace, run
 
 
@@ -448,6 +448,74 @@ class RunIntegrationTests(RelayTestCase):
                 run(args)
         finally:
             os.environ["PATH"] = old_path
+
+
+class AdapterToolsTests(unittest.TestCase):
+    def adapter(self, **changes: object) -> dict[str, object]:
+        adapter: dict[str, object] = {
+            "name": "fake",
+            "executable": "fake-cli",
+            "default_model": "m",
+            "args": [],
+            "input": "stdin",
+            "output": "text",
+            "env": {},
+            "models_args": [],
+            "probe_args": [],
+        }
+        adapter.update(changes)
+        return adapter
+
+    def test_valid_tools_block_resolves_tools_and_base_invocations(self) -> None:
+        tools = {"args": ["-p", "--workspace", "{clone}", "--trust"], "env": {"X": "1"}, "pass_env": ["MY_KEY"]}
+        adapter = validate_adapter(self.adapter(args=["-p"], env={"BASE": "1"}, tools=tools), "fake")
+        self.assertEqual(resolve_invocation(adapter, True), (["-p", "--workspace", "{clone}", "--trust"], {"X": "1"}))
+        self.assertEqual(resolve_invocation(adapter, False), (["-p"], {"BASE": "1"}))
+
+    def test_invalid_tools_blocks_are_rejected(self) -> None:
+        cases = [
+            {"args": ["-p"], "unknown": True},
+            {"env": {"X": "1"}},
+            {"args": ["-p"], "env": {"X": 1}},
+            {"args": ["-p"], "pass_env": ["1BAD"]},
+            {"args": ["-p", "{bogus}"]},
+        ]
+        for tools in cases:
+            with self.subTest(tools=tools), self.assertRaises(RelayError):
+                validate_adapter(self.adapter(tools=tools), "fake")
+
+    def test_clone_placeholder_is_invalid_in_base_args(self) -> None:
+        with self.assertRaises(RelayError):
+            validate_adapter(self.adapter(args=["--workspace", "{clone}"]), "fake")
+
+    def test_blanket_flags_are_allowed_only_in_tools_args(self) -> None:
+        for flag in sorted(BLANKET_FLAGS):
+            for value in (flag, f"{flag}=1"):
+                placements = {
+                    "args": {"args": [value]},
+                    "models_args": {"models_args": [value]},
+                    "probe_args": {"probe_args": [value]},
+                    "effort": {"effort": {"models": ["m"], "levels": {"high": {"args": [value]}}}},
+                }
+                for field, changes in placements.items():
+                    with (
+                        self.subTest(flag=value, field=field),
+                        self.assertRaisesRegex(RelayError, "auto-approval flag"),
+                    ):
+                        validate_adapter(self.adapter(**changes), "fake")
+                with self.subTest(flag=value, field="tools.args"):
+                    validate_adapter(self.adapter(tools={"args": [value]}), "fake")
+
+    def test_resolve_invocation_without_tools_mode_fails(self) -> None:
+        adapter = validate_adapter(self.adapter(), "fake")
+        with self.assertRaises(RelayError) as raised:
+            resolve_invocation(adapter, True)
+        self.assertEqual(str(raised.exception), "provider fake has no verified tools mode")
+
+    def test_bundled_adapters_still_load(self) -> None:
+        for name in ("antigravity", "cursor", "opencode"):
+            with self.subTest(name=name):
+                self.assertEqual(load_adapter(name)["name"], name)
 
 
 if __name__ == "__main__":

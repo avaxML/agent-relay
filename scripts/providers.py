@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Iterator
@@ -14,6 +15,12 @@ from string import Formatter
 from typing import Any
 
 DEFAULT_TIMEOUT = 180
+PLACEHOLDERS = frozenset({"model", "request_file", "timeout", "workdir", "provider_workspace"})
+TOOLS_PLACEHOLDERS = PLACEHOLDERS | {"clone"}
+BLANKET_FLAGS = frozenset(
+    {"--force", "--yolo", "--trust", "--auto", "--auto-review", "--dangerously-skip-permissions", "--approve-mcps"}
+)
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class RelayError(Exception):
@@ -62,8 +69,8 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         "models_args",
         "probe_args",
     }
-    if not isinstance(adapter, dict) or not required <= set(adapter) or set(adapter) - required - {"effort"}:
-        raise RelayError(f"Adapter requires {', '.join(sorted(required))}; only effort is optional.")
+    if not isinstance(adapter, dict) or not required <= set(adapter) or set(adapter) - required - {"effort", "tools"}:
+        raise RelayError(f"Adapter requires {', '.join(sorted(required))}; only effort and tools are optional.")
     if adapter["name"] != name:
         raise RelayError("Adapter name does not match --provider.")
     for field in ("name", "executable", "default_model"):
@@ -77,14 +84,8 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         value = adapter[field]
         if not isinstance(value, list) or not all(isinstance(arg, str) for arg in value):
             raise RelayError(f"Adapter {field} must be a string array.")
-        for arg in value:
-            for _, key, spec, conversion in Formatter().parse(arg):
-                if key is not None and (
-                    key not in {"model", "request_file", "timeout", "workdir", "provider_workspace"}
-                    or spec
-                    or conversion
-                ):
-                    raise RelayError(f"Unsupported argument placeholder: {key}")
+        _check_placeholders(value, PLACEHOLDERS)
+        _reject_blanket_flags(value, field)
     if not isinstance(adapter["env"], dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in adapter["env"].items()
     ):
@@ -93,7 +94,52 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         raise RelayError("File transport requires {request_file} in args.")
     if "effort" in adapter:
         validate_effort(adapter["effort"])
+    if "tools" in adapter:
+        validate_tools(adapter["tools"], adapter["input"])
     return adapter
+
+
+def _check_placeholders(values: list[str], allowed: frozenset[str]) -> None:
+    for arg in values:
+        for _, key, spec, conversion in Formatter().parse(arg):
+            if key is not None and (key not in allowed or spec or conversion):
+                raise RelayError(f"Unsupported argument placeholder: {key}")
+
+
+def _reject_blanket_flags(values: list[str], field: str) -> None:
+    for arg in values:
+        name = arg.split("=", 1)[0]
+        if name in BLANKET_FLAGS:
+            raise RelayError(
+                f"Adapter {field} must not contain auto-approval flag {name}; declare it only in tools.args."
+            )
+
+
+def validate_tools(config: Any, input_kind: str) -> None:
+    if not isinstance(config, dict) or "args" not in config or set(config) - {"args", "env", "pass_env"}:
+        raise RelayError("Adapter tools requires args; only env and pass_env are optional.")
+    args = config["args"]
+    if not isinstance(args, list) or not args or not all(isinstance(arg, str) for arg in args):
+        raise RelayError("Adapter tools.args must be a nonempty string array.")
+    _check_placeholders(args, TOOLS_PLACEHOLDERS)
+    env = config.get("env", {})
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        raise RelayError("Adapter tools.env must map strings to strings.")
+    pass_env = config.get("pass_env", [])
+    if not isinstance(pass_env, list) or not all(
+        isinstance(name, str) and ENV_NAME.fullmatch(name) for name in pass_env
+    ):
+        raise RelayError("Adapter tools.pass_env must list environment variable names.")
+    if input_kind == "file" and not any("{request_file}" in arg for arg in args):
+        raise RelayError("Adapter tools.args require {request_file} for file transport.")
+
+
+def resolve_invocation(adapter: dict[str, Any], tools: bool) -> tuple[list[str], dict[str, str]]:
+    if not tools:
+        return adapter["args"], adapter["env"]
+    if "tools" not in adapter:
+        raise RelayError(f"provider {adapter['name']} has no verified tools mode")
+    return adapter["tools"]["args"], adapter["tools"].get("env", {})
 
 
 def _read_adapter_data(path: Path, expected_name: str | None = None) -> tuple[dict[str, Any], bytes]:
@@ -286,6 +332,7 @@ def validate_effort(config: Any) -> None:
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise RelayError("Effort args must be a string array.")
+        _reject_blanket_flags(args, f"effort.levels.{level}.args")
         model = settings.get("model", "{model}")
         if not isinstance(model, str) or not model:
             raise RelayError("Effort model must be a nonempty string.")

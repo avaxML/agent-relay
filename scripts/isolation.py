@@ -234,6 +234,7 @@ def create_clone(root: Path, sha: str, logs: Path, timeout: float) -> Clone:
             timeout,
             git_dir=repo_git,
         )
+        run_git(["symbolic-ref", "HEAD", "refs/heads/relay-base"], logs, timeout, git_dir=repo_git)
         run_git(
             ["clone", "--quiet", "--no-local", "--no-hardlinks", "--no-checkout", str(repo_git), str(work)],
             logs,

@@ -90,6 +90,18 @@ class IsolationTestCase(unittest.TestCase):
         remotes = self._git(["remote"], cwd=clone.work)
         self.assertNotIn("origin", remotes.split())
 
+    def test_unchanged_clone_reports_no_changes(self) -> None:
+        (self.source_dir / "second.py").write_text("x = 1\n", encoding="utf-8")
+        self._git(["add", "second.py"], cwd=self.source_dir)
+        self._git(
+            ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "second"],
+            cwd=self.source_dir,
+        )
+        sha = self._git(["rev-parse", "HEAD"], cwd=self.source_dir).strip()
+        clone = create_clone(self.source_dir, sha, self.logs_dir, timeout=10.0)
+        result = capture(clone, snapshot_metadata(clone.work), self.logs_dir, timeout=10.0)
+        self.assertEqual((result.tracked_changes, result.untracked_files, result.diff), ([], [], b""))
+
     def test_hooks_never_run_and_metadata_recorded(self) -> None:
         clone = create_clone(self.source_dir, self.commit1, self.logs_dir, timeout=10.0)
         before = snapshot_metadata(clone.work)

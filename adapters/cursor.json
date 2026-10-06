@@ -24,6 +24,21 @@
   "probe_args": [
     "--help"
   ],
+  "tools": {
+    "args": [
+      "-p",
+      "--workspace",
+      "{clone}",
+      "--trust",
+      "--sandbox",
+      "enabled",
+      "--model",
+      "{model}",
+      "--output-format",
+      "stream-json"
+    ],
+    "env": {}
+  },
   "effort": {
     "models": [
       "grok-4.7-low",

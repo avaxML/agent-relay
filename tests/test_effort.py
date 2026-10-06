@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from providers import RelayError, load_adapter, resolve_effort, validate_effort
+from providers import DEFAULT_TIMEOUT, RelayError, load_adapter, resolve_effort, resolve_timeout, validate_effort
 from task_runner import run
 
 
@@ -70,9 +70,22 @@ class EffortTests(unittest.TestCase):
             {"args": []},
             {"model": "{unknown}"},
             {"args": "--effort high"},
+            {"timeout": 600},
+            {"model": "{model}#max", "timeout": 0},
+            {"model": "{model}#max", "timeout": "600"},
+            {"model": "{model}#max", "timeout": True},
         ):
             with self.subTest(settings=settings), self.assertRaises(RelayError):
                 validate_effort({"models": ["test"], "levels": {"high": settings}})
+
+    def test_slow_bundled_levels_declare_longer_timeouts(self) -> None:
+        cursor = load_adapter("cursor")
+        opencode = load_adapter("opencode")
+        self.assertEqual(resolve_timeout(cursor, "xhigh", None), 600)
+        self.assertEqual(resolve_timeout(opencode, "max", None), 600)
+        self.assertEqual(resolve_timeout(cursor, "high", None), DEFAULT_TIMEOUT)
+        self.assertEqual(resolve_timeout(cursor, None, None), DEFAULT_TIMEOUT)
+        self.assertEqual(resolve_timeout(opencode, "max", 90), 90)
 
     def test_custom_effort_reaches_cli_and_result_records_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -86,7 +99,7 @@ class EffortTests(unittest.TestCase):
                         "name": "fake",
                         "executable": sys.executable,
                         "default_model": "base",
-                        "args": [str(script), "--model", "{model}"],
+                        "args": [str(script), "--model", "{model}", "--timeout", "{timeout}"],
                         "input": "stdin",
                         "output": "text",
                         "env": {},
@@ -98,6 +111,7 @@ class EffortTests(unittest.TestCase):
                                 "high": {
                                     "model": "{model}-thinking",
                                     "args": ["--budget", "8192"],
+                                    "timeout": 42,
                                 }
                             },
                         },
@@ -117,18 +131,22 @@ class EffortTests(unittest.TestCase):
                 kind="read",
                 max_input_bytes=10000,
                 output=root / "result",
-                timeout=5,
+                timeout=None,
                 max_answer_chars=1000,
             )
             result = run(args)
             self.assertEqual(result["status"], "ok")
             self.assertEqual(
                 json.loads(result["answer"]),
-                ["--model", "base-thinking", "--budget", "8192"],
+                ["--model", "base-thinking", "--timeout", "42", "--budget", "8192"],
             )
+            self.assertEqual(result["timeout"], 42)
             self.assertEqual(result["requested_model"], "base")
             self.assertEqual(result["model"], "base-thinking")
             self.assertEqual(result["effort"], "high")
+            args.timeout = 7
+            args.output = root / "explicit"
+            self.assertEqual(json.loads(run(args)["answer"])[3], "7")
             args.effort = "unsupported"
             args.output = root / "must-not-exist"
             with self.assertRaises(RelayError):

@@ -9,7 +9,7 @@ Read [adding-adapters.md](../../references/adding-adapters.md) completely before
 
 Create one JSON object with all required fields: `name`, `executable`, `default_model`, `args`, `input`, `output`, `env`, `models_args`, and `probe_args`. Use only the documented placeholders (`{model}`, `{request_file}`, `{timeout}`, `{workdir}`, `{provider_workspace}`). Use `{provider_workspace}` only when a CLI requires a stable directory that the user approves through its normal trust flow. The external definition selects one named adapter and adds no runner code.
 
-Add the optional `effort` mapping only for verified model IDs and levels. See the reference for argument and model-variant mappings. Existing adapters without it still work when `--effort` is omitted.
+Add the optional `effort` mapping only for verified model IDs and levels. See the reference for argument and model-variant mappings. When a level measurably needs longer than the 180-second default, give it a `timeout` in seconds instead of asking callers to remember `--timeout`. Existing adapters without it still work when `--effort` is omitted.
 
 Run `adapter validate ABSOLUTE_JSON`, then install it with `adapter install ABSOLUTE_JSON`. If the name already has different registered content, inspect the difference before using `--replace`. Run `adapter validate NAME --probe`, `models --provider NAME`, and a small read task before recommending the adapter. Use `--registry-dir PATH` on each command when the caller requests a nondefault registry. Use `--adapter-file ABSOLUTE_JSON` only when the definition must remain specific to one invocation.
 

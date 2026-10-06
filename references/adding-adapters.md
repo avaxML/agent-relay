@@ -42,6 +42,8 @@ Existing adapters need no change. To support `--effort`, add a verified mapping 
 
 `models` is an exact allowlist, not a wildcard. Each level must contain `args`, `model`, or both. Arguments are appended to the invocation; a model setting replaces the `{model}` value used by the base arguments. These settings may use only `{model}`, for example `"model": "{model}#high"`. Omitted effort leaves arguments and model unchanged. The runner rejects unsupported levels or models before launching the CLI. Use `doctor` to inspect these declarations, and verify each mapping against the CLI and model rather than assuming that every provider supports the same levels. Antigravity's built-in mapping changes the model variant and supplies a matching effort flag.
 
+A level may also declare `"timeout"`, a positive integer of seconds, when it routinely needs longer than the 180-second default. It applies only when the caller omits `--timeout`, and the resolved value fills the `{timeout}` placeholder and is recorded as `timeout` in `result.json`. A timeout alone is not a valid level; the level must still change the model or supply arguments. The bundled Cursor `xhigh` and OpenCode `max` levels declare 600 seconds.
+
 ## Invocation
 
 Resolve the plugin root as the directory two levels above the directory containing a skill's `SKILL.md`. Validate and install the adapter before a real task:
@@ -76,7 +78,7 @@ The runner executes in an isolated temporary working directory, packages explici
 
 - OpenCode defaults to `opencode-go/deepseek-v4.1-flash`; its tools are denied by relay configuration.
 - Antigravity defaults to `gemini-3.8-flash-low`, plan mode, and sandbox mode.
-- Cursor defaults to `cursor-grok-4.6-high`, ask mode, enabled sandboxing, stdin input, and stream-JSON output. The bundled adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`; its probe is `--help` and its model listing command is `models`. Low, medium, high, and xhigh effort select the exact matching Grok 4.6 model ID without extra arguments.
+- Cursor defaults to `cursor-grok-4.6-high`, ask mode, enabled sandboxing, stdin input, and stream-JSON output. The bundled adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`; its probe is `--help` and its model listing command is `models`. Low, medium, high, and xhigh effort select the exact matching Grok 4.6 model ID without extra arguments; xhigh defaults to a 600-second timeout.
 
 Cursor uses `{provider_workspace}` to select a stable, Relay-owned empty directory. Before the first run, open `cursor-agent` interactively in that directory and approve Cursor's normal workspace-trust prompt. Agent Relay never passes `--trust`, a source project workspace, `--force`, `--yolo`, `--auto-review`, or `--approve-mcps`. Set `AGENT_RELAY_PROVIDER_WORKSPACES_DIR` to move the provider workspace root. Otherwise Relay uses `$XDG_STATE_HOME/agent-relay/providers` or `~/.local/state/agent-relay/providers`. The provider still inherits host permissions because this is not an OS sandbox.
 

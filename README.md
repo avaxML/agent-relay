@@ -66,7 +66,7 @@ python3 scripts/relay.py run \
   --kind read
 ```
 
-Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout 180`, `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
+Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout SECONDS` (default 180, or the effort level's declared timeout), `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
 
 ## Adapter registry
 
@@ -92,11 +92,11 @@ The orchestrator can choose `--effort low`, `medium`, or `high` for each task. O
 
 | Adapter and supported models | Levels | CLI mapping |
 | --- | --- | --- |
-| OpenCode, `opencode-go/deepseek-v4.1-flash` | `low`, `medium`, `high`, `max` | Appends `#LEVEL` to the model ID |
+| OpenCode, `opencode-go/deepseek-v4.1-flash` | `low`, `medium`, `high`, `max` | Appends `#LEVEL` to the model ID; `max` defaults to a 600-second timeout |
 | Antigravity, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL` and passes `--effort LEVEL` |
-| Cursor, Grok 4.6 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `cursor-grok-4.6-LEVEL`; no additional effort argument |
+| Cursor, Grok 4.6 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `cursor-grok-4.6-LEVEL`; no additional effort argument; `xhigh` defaults to a 600-second timeout |
 
-Explicit effort overrides the Antigravity or Cursor variant within the same model family. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
+Explicit effort overrides the Antigravity or Cursor variant within the same model family. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. Cursor `xhigh` and OpenCode `max` can take several minutes, so their levels declare a 600-second default timeout; an explicit `--timeout` still wins. Prefer `submit` for these levels so a long worker does not hold the orchestrator's turn. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
 
 OpenCode's variant mechanism and provider-specific effort behavior are documented in [its model guide](https://opencode.ai/docs/models/) and [provider transforms](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts). The local Antigravity CLI help documents its effort flag.
 

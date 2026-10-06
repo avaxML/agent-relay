@@ -13,6 +13,8 @@ from pathlib import Path
 from string import Formatter
 from typing import Any
 
+DEFAULT_TIMEOUT = 180
+
 
 class RelayError(Exception):
     """A delegation cannot produce a usable result."""
@@ -276,8 +278,11 @@ def validate_effort(config: Any) -> None:
     for level, settings in levels.items():
         if not level or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in level):
             raise RelayError("Effort names use lowercase letters, digits and hyphens.")
-        if not isinstance(settings, dict) or not settings or set(settings) - {"args", "model"}:
-            raise RelayError("Effort settings require args or model, with no other fields.")
+        if not isinstance(settings, dict) or not settings or set(settings) - {"args", "model", "timeout"}:
+            raise RelayError("Effort settings require args or model, plus an optional timeout.")
+        timeout = settings.get("timeout", 1)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            raise RelayError("Effort timeout must be a positive integer number of seconds.")
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise RelayError("Effort args must be a string array.")
@@ -307,6 +312,15 @@ def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> t
     return settings.get("model", "{model}").format(model=model), [
         arg.format(model=model) for arg in settings.get("args", [])
     ]
+
+
+def resolve_timeout(adapter: dict[str, Any], effort: str | None, timeout: int | None) -> int:
+    """An explicit timeout wins; otherwise slower effort levels may declare a longer default."""
+    if timeout is not None:
+        return timeout
+    if effort is None:
+        return DEFAULT_TIMEOUT
+    return int(adapter["effort"]["levels"][effort].get("timeout", DEFAULT_TIMEOUT))
 
 
 def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -> RelayError:

@@ -42,7 +42,8 @@
         "model": "cursor-grok-4.6-high"
       },
       "xhigh": {
-        "model": "cursor-grok-4.6-xhigh"
+        "model": "cursor-grok-4.6-xhigh",
+        "timeout": 600
       }
     }
   }

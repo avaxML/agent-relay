@@ -129,4 +129,14 @@ All runs used a throwaway fixture repository (tracked `app.py` returning 1, and 
 | all three | defaults (antigravity `gemini-3.8-flash-low`, opencode `deepseek-v4.1-flash`, cursor `grok-4.7-high`) | `dispatch` of six probe tasks with `--providers antigravity opencode cursor --max-per-provider 2`, then `collect` and `cleanup` | assigned and submitted 2/2/2; all six `ok` with each Relay check exit 0; no fallbacks; `collect` exit 0; `cleanup` removed nothing (probe clones were already gone) |
 | opencode | first run, before the `PWD` fix | probe | Relay `check_failed`. OpenCode wrote `probe.txt` in the caller's directory because it resolved its project from `PWD`; fixed by setting `PWD` to the clone |
 
-A probe that the task explicitly asked to modify `app.py` was also refused by all three providers. The violation path therefore has no live outcome, because providers comply with the probe bound. It is proven by the fake-CLI tests and their mutation checks.
+Three further live attempts to reach the probe violation path did not produce one.
+- **A task asking for the edit.** All three providers refused to modify the tracked `app.py`.
+- **A tracked `gen.py` that rewrites `app.py`.** OpenCode and Cursor read the script first and declined to run it in the clone root. Antigravity timed out at 180 seconds.
+- **A tracked `bench.py` whose side effect rewrites the tracked `baseline.txt`:**
+  - Cursor ran it, then restored `baseline.txt` before exiting.
+  - OpenCode ran a copy from an untracked scratch directory.
+  - Antigravity's terminal sandbox denied the write inside the clone (`PermissionError: Operation not permitted`).
+
+All three runs were `ok` with no changes. That is correct, because Relay judges the clone's final state: a write restored before the provider exits is not a violation. The violation path therefore has no live outcome. It is proven by the fake-CLI tests and their mutation checks.
+
+Antigravity's denied write inside the clone means its shell sandbox may block `execute` tasks whose commands write files. Its execute run still produced its owned edit.

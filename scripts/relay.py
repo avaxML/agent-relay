@@ -9,9 +9,11 @@ import os
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
+import dispatch
 import jobs
 from execution import execute
 from providers import (
@@ -56,6 +58,7 @@ def inspect_provider(
         "installed": bool(executable),
         "authentication": "not checked",
         "effort": adapter.get("effort"),
+        "tools": "tools" in adapter,
     }
     if executable and (probe or models):
         with tempfile.TemporaryDirectory(prefix="agent-relay-doctor-") as temp:
@@ -70,6 +73,21 @@ def inspect_provider(
                 stderr=(directory / "stderr.log").read_text(errors="replace")[:2000],
             )
     return result
+
+
+def provider_health(name: str, registry_dir: Path | None) -> dict[str, Any]:
+    try:
+        report = inspect_provider(name, None, registry_dir, probe=True)
+        adapter = load_adapter(name, None, registry_dir)
+    except (RelayError, OSError, ValueError) as exc:
+        return {"ok": False, "tools": False, "reason": str(exc)}
+    if not report["installed"]:
+        reason = "executable not found"
+    elif report.get("exit_code") != 0:
+        reason = f"probe exited with code {report.get('exit_code')}"
+    else:
+        reason = "ok"
+    return {"ok": reason == "ok", "tools": "tools" in adapter, "reason": reason}
 
 
 def adapter_validation_target(value: str, registry_dir: Path | None) -> tuple[str, Path | None]:
@@ -144,6 +162,24 @@ def main() -> int:
             sub.add_argument(
                 "--timeout", type=nonnegative_int, default=30, help="Wait deadline; does not cancel the job."
             )
+    fanout = commands.add_parser("dispatch")
+    fanout.add_argument("--manifest", type=Path, required=True)
+    fanout.add_argument("--root", type=Path, required=True)
+    fanout.add_argument("--providers", nargs="+", required=True)
+    fanout.add_argument("--ref", default="HEAD")
+    fanout.add_argument("--max-per-provider", type=positive_int, default=2)
+    fanout.add_argument("--registry-dir", type=Path)
+    fanout.add_argument("--jobs-dir", type=Path)
+    fanout.add_argument("--dispatch-dir", type=Path)
+    fanout.add_argument("--timeout", type=positive_int)
+    fanout.add_argument("--check-timeout", type=positive_int, default=180)
+    fanout.add_argument("--max-input-bytes", type=positive_int, default=400000)
+    fanout.add_argument("--max-answer-chars", type=positive_int, default=12000)
+    gather = commands.add_parser("collect")
+    gather.add_argument("--dispatch", type=Path, required=True)
+    gather.add_argument("--timeout", type=nonnegative_int, default=600)
+    sweep = commands.add_parser("cleanup")
+    sweep.add_argument("--dispatch", type=Path, required=True)
     args = parser.parse_args()
     result: dict[str, Any]
     try:
@@ -170,6 +206,47 @@ def main() -> int:
         elif args.command == "submit":
             result = jobs.submit(args)
             code = 1 if result["status"] in {"failed", "cancelled", "interrupted"} else 0
+        elif args.command == "dispatch":
+            settings = {
+                "ref": args.ref,
+                "registry_dir": args.registry_dir,
+                "jobs_dir": args.jobs_dir,
+                "timeout": args.timeout,
+                "check_timeout": args.check_timeout,
+                "max_input_bytes": args.max_input_bytes,
+                "max_answer_chars": args.max_answer_chars,
+            }
+            ledger_path = dispatch.create(
+                args.manifest,
+                args.root,
+                args.providers,
+                settings,
+                {name: kind.tools for name, kind in KINDS.items()},
+                lambda name: provider_health(name, args.registry_dir),
+                jobs.submit,
+                args.max_per_provider,
+                args.dispatch_dir / uuid.uuid4().hex if args.dispatch_dir else None,
+            )
+            result = json.loads(ledger_path.read_text(encoding="utf-8"))
+            code = 0
+        elif args.command in ("collect", "cleanup"):
+            ledger = json.loads(args.dispatch.read_text(encoding="utf-8"))
+            jobs_dir = ledger["settings"].get("jobs_dir")
+            root = jobs.job_root(Path(jobs_dir) if jobs_dir else None)
+            if args.command == "cleanup":
+                result = dispatch.cleanup(args.dispatch, lambda job_id: jobs.result(job_id, root))
+                code = 0
+            else:
+                result = dispatch.collect(
+                    args.dispatch,
+                    jobs.submit,
+                    lambda job_id: jobs.status(job_id, root),
+                    lambda job_id: jobs.result(job_id, root),
+                    args.timeout,
+                )
+                succeeded = all(task["state"] == "submitted" and task["status"] == "ok" for task in result["tasks"])
+                succeeded = succeeded and not result["needs_native_fallback"]
+                code = (0 if succeeded else 1) if result["complete"] else 2
         elif args.command in ("status", "wait", "result", "cancel"):
             root = jobs.job_root(args.jobs_dir)
             if args.command == "wait":

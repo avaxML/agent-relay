@@ -44,7 +44,7 @@ python3 <plugin-root>/scripts/relay.py dispatch --manifest /abs/tasks/manifest.j
   --providers antigravity opencode cursor --max-per-provider 2
 ```
 
-Assignment is equal. Each task without an explicit `provider` goes to the eligible provider with the fewest assigned tasks; ties follow the `--providers` order. The per-provider cap holds work back instead of skewing it. A task that no provider can take is recorded under `needs_native_fallback` with its task file and reason; Relay never drops it and never runs it elsewhere. Save the printed ledger path.
+Assignment is equal. Each task without an explicit `provider` goes to the eligible provider with the fewest assigned tasks; ties follow the `--providers` order. The per-provider cap holds work back instead of skewing it. A task that no provider can take is recorded under `needs_native_fallback` with its task file and reason; Relay never drops it and never runs it elsewhere. Save the printed ledger path. Dispatch snapshots every task file into the dispatch directory, so editing or deleting the originals later does not change held-back tasks, and gives each task a fixed output directory, so a task is never submitted twice. If a run crashed mid-submit, `collect` recovers the job from that directory or resubmits a task that never launched; an outcome it cannot establish stays `submitting` and keeps `collect` from reporting completion.
 
 Slow levels (Cursor `xhigh`, OpenCode `max`) can run for several minutes; do not escalate to them unless the user asks. Pass `--effort` or `--model` per task in the manifest when needed.
 

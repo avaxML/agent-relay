@@ -245,16 +245,70 @@ class AdvanceTests(DispatchTestCase):
         self.assertEqual(len(fakes.submitted), 6)
         self.assertEqual(self.submitted(path), [2, 2, 2])
 
-    def test_task_left_submitting_is_never_resubmitted(self) -> None:
-        fakes = Fakes()
-        path = self.create([self.task(f"t{n}") for n in range(2)], fakes, max_per_provider=1)
+    def strand(self, path: Path, output_exists: bool) -> Path:
         ledger = self.ledger(path)
-        ledger["tasks"][0].update(state="submitting", job_id=None)
+        task = ledger["tasks"][0]
+        output = path.parent / "outputs" / task["id"]
+        task.update(state="submitting", job_id=None, output_dir=str(output))
+        ledger["counts"][task["provider"]]["submitted"] -= 1
         path.write_text(json.dumps(ledger), encoding="utf-8")
+        if output_exists:
+            output.mkdir(parents=True)
+        return output
+
+    def test_stranded_submission_with_a_launched_job_is_recovered_not_resubmitted(self) -> None:
+        fakes = Fakes()
+        path = self.create([self.task("t0")], fakes)
+        output = self.strand(path, output_exists=True)
         before = len(fakes.submitted)
-        dispatch.advance(path, fakes.submit, fakes.status)
+        dispatch.advance(
+            path, fakes.submit, fakes.status, locate=lambda found: "job-found" if found == output else None
+        )
+        task = self.ledger(path)["tasks"][0]
         self.assertEqual(len(fakes.submitted), before)
-        self.assertEqual(self.ledger(path)["tasks"][0]["state"], "submitting")
+        self.assertEqual((task["state"], task["job_id"]), ("submitted", "job-found"))
+        self.assertEqual(self.submitted(path), [1, 0, 0])
+
+    def test_stranded_submission_that_never_launched_is_submitted_once(self) -> None:
+        fakes = Fakes()
+        path = self.create([self.task("t0")], fakes)
+        self.strand(path, output_exists=False)
+        before = len(fakes.submitted)
+        dispatch.advance(path, fakes.submit, fakes.status, locate=lambda found: None)
+        dispatch.advance(path, fakes.submit, fakes.status, locate=lambda found: None)
+        self.assertEqual(len(fakes.submitted), before + 1)
+        self.assertEqual(self.ledger(path)["tasks"][0]["state"], "submitted")
+
+    def test_unresolved_submission_is_never_resubmitted_or_reported_complete(self) -> None:
+        fakes = Fakes()
+        path = self.create([self.task("t0")], fakes)
+        self.strand(path, output_exists=True)
+        before = len(fakes.submitted)
+        clock = iter(range(100))
+        aggregate = dispatch.collect(
+            path, fakes.submit, fakes.status, fakes.result, timeout=3, sleep=lambda s: None, clock=lambda: next(clock)
+        )
+        self.assertEqual(len(fakes.submitted), before)
+        self.assertFalse(aggregate["complete"])
+        self.assertEqual(aggregate["tasks"][0]["state"], "submitting")
+
+    def test_each_task_gets_a_fixed_output_directory(self) -> None:
+        fakes = Fakes()
+        path = self.create([self.task("t0")], fakes)
+        self.assertEqual(fakes.submitted[0].output, path.parent / "outputs" / "t0")
+
+    def test_held_back_tasks_use_the_task_text_snapshotted_at_dispatch(self) -> None:
+        fakes = Fakes()
+        tasks = [self.task(f"t{n}", provider="cursor") for n in range(2)]
+        path = self.create(tasks, fakes, max_per_provider=1)
+        (self.plan / "t1.md").write_text("Edited after dispatch", encoding="utf-8")
+        (self.plan / "t0.md").unlink()
+        fakes.statuses["job1"] = "completed"
+        dispatch.advance(path, fakes.submit, fakes.status)
+        held = fakes.submitted[1]
+        self.assertEqual(held.task_file.read_text(encoding="utf-8"), "Task t1")
+        self.assertTrue(held.task_file.is_relative_to(path.parent))
+        self.assertEqual(self.ledger(path)["tasks"][1]["source_task_file"], str((self.plan / "t1.md").resolve()))
 
     def test_submit_failure_is_recorded_and_not_retried(self) -> None:
         fakes = Fakes()
@@ -418,6 +472,21 @@ class CollectTests(DispatchTestCase):
         outcome = dispatch.cleanup(path, result, removed.append)
         self.assertEqual(removed, [Path("/clones/two")])
         self.assertEqual(outcome["errors"], [{"id": "first", "error": "result.json is missing"}])
+
+
+class FindByOutputTests(unittest.TestCase):
+    def test_find_by_output_returns_the_owning_job(self) -> None:
+        import jobs
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for job_id, output in (("a" * 32, root / "out-a"), ("b" * 32, root / "out-b")):
+                (root / job_id).mkdir()
+                (root / job_id / "state.json").write_text(
+                    json.dumps({"job_id": job_id, "output_dir": str(output)}), encoding="utf-8"
+                )
+            self.assertEqual(jobs.find_by_output(root / "out-b", root), "b" * 32)
+            self.assertIsNone(jobs.find_by_output(root / "out-c", root))
 
 
 class DispatchRootTests(unittest.TestCase):

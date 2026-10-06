@@ -30,6 +30,7 @@ TASK_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 Submit = Callable[[argparse.Namespace], Mapping[str, Any]]
 Lookup = Callable[[str], Mapping[str, Any]]
+Locate = Callable[[Path], str | None]
 
 
 def dispatch_root() -> Path:
@@ -182,6 +183,7 @@ def create(
     max_per_provider: int = 2,
     directory: Path | None = None,
     pin_ref: Callable[[Path, str], str] = _pin_ref,
+    locate: Locate | None = None,
 ) -> Path:
     if not order or len(set(order)) != len(order):
         raise RelayError("Providers must be a nonempty list without duplicates.")
@@ -193,12 +195,20 @@ def create(
     reasons = {item["id"]: item["reason"] for item in fallbacks}
     target = directory if directory is not None else dispatch_root() / uuid.uuid4().hex
     target.mkdir(mode=0o700, parents=True)
+    snapshots = target / "tasks"
+    snapshots.mkdir(mode=0o700)
     records = []
     for task in tasks:
         fallback = task["id"] in reasons
+        source = Path(task["task_file"])
+        snapshot = snapshots / f"{task['id']}{source.suffix}"
+        snapshot.write_bytes(source.read_bytes())
+        snapshot.chmod(0o600)
         records.append(
             {
                 **task,
+                "task_file": str(snapshot),
+                "source_task_file": task["task_file"],
                 "provider": assignments.get(task["id"], task["provider"]),
                 "state": "needs_native_fallback" if fallback else "pending",
                 "job_id": None,
@@ -228,7 +238,7 @@ def create(
     }
     path = target / "ledger.json"
     write_json(path, ledger)
-    advance(path, submit, _never_consulted)
+    advance(path, submit, _never_consulted, locate)
     return path
 
 
@@ -247,7 +257,7 @@ def task_arguments(task: Mapping[str, Any], ledger: Mapping[str, Any]) -> argpar
         task_file=Path(task["task_file"]),
         root=Path(ledger["root"]),
         files=task["files"],
-        output=None,
+        output=Path(task["output_dir"]),
         kind=task["kind"],
         timeout=settings.get("timeout"),
         max_input_bytes=settings.get("max_input_bytes", 400000),
@@ -276,9 +286,27 @@ def _read(ledger_path: Path) -> dict[str, Any]:
     return ledger
 
 
-def advance(ledger_path: Path, submit: Submit, status: Lookup) -> dict[str, Any]:
+def _reconcile(ledger: dict[str, Any], locate: Locate | None) -> None:
+    """Resolve tasks a crashed run left between submit and the ledger write, without ever submitting twice."""
+    for task in ledger["tasks"]:
+        if task["state"] != "submitting":
+            continue
+        output = Path(task["output_dir"])
+        job_id = locate(output) if locate is not None else None
+        if job_id is not None:
+            task.update(state="submitted", job_id=job_id, reason=None)
+            ledger["counts"][task["provider"]]["submitted"] += 1
+        elif not output.exists():
+            task.update(state="pending", reason=None)
+        else:
+            task["reason"] = f"Submission outcome unknown; inspect {output} before resubmitting by hand."
+
+
+def advance(ledger_path: Path, submit: Submit, status: Lookup, locate: Locate | None = None) -> dict[str, Any]:
     with _locked(ledger_path):
         ledger = _read(ledger_path)
+        _reconcile(ledger, locate)
+        write_json(ledger_path, ledger)
         for name in ledger["providers"]:
             mine = [task for task in ledger["tasks"] if task["provider"] == name]
             active = sum(
@@ -289,14 +317,15 @@ def advance(ledger_path: Path, submit: Submit, status: Lookup) -> dict[str, Any]
                     break
                 if task["state"] != "pending":
                     continue
-                task["state"] = "submitting"
+                # A fixed output directory makes a repeated submit fail instead of running the task twice.
+                task.update(state="submitting", output_dir=str(ledger_path.parent / "outputs" / task["id"]))
                 write_json(ledger_path, ledger)
                 try:
                     job = submit(task_arguments(task, ledger))
                 except (RelayError, OSError, ValueError) as exc:
                     task.update(state="submit_failed", reason=str(exc))
                 else:
-                    task.update(job_id=job.get("job_id"), output_dir=job.get("output_dir"))
+                    task.update(job_id=job.get("job_id"), output_dir=job.get("output_dir") or task["output_dir"])
                     if job.get("status") in SUBMIT_FAILED:
                         task.update(state="submit_failed", reason=str(job.get("error") or job.get("status")))
                     else:
@@ -309,7 +338,8 @@ def advance(ledger_path: Path, submit: Submit, status: Lookup) -> dict[str, Any]
 
 def _done(ledger: Mapping[str, Any], status: Lookup) -> bool:
     return all(
-        task["state"] != "pending" and (task["state"] != "submitted" or status(task["job_id"])["status"] in TERMINAL)
+        task["state"] not in {"pending", "submitting"}
+        and (task["state"] != "submitted" or status(task["job_id"])["status"] in TERMINAL)
         for task in ledger["tasks"]
     )
 
@@ -344,10 +374,11 @@ def collect(
     poll: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    locate: Locate | None = None,
 ) -> dict[str, Any]:
     deadline = clock() + timeout
     while True:
-        ledger = advance(ledger_path, submit, status)
+        ledger = advance(ledger_path, submit, status, locate)
         complete = _done(ledger, status)
         remaining = deadline - clock()
         if complete or remaining <= 0:

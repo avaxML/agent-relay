@@ -47,6 +47,8 @@ After the provider exits, Relay never uses the work tree's `.git`.
   3. Capture.
   4. Relay's `--check` commands.
 
+  After the checks, Relay captures the clone again, so violations and `changes.diff` describe the clone the lead will inspect, including anything a check changed (`check_side_effects`). Tool-kind `--files` must be files in the pinned commit.
+
   Setup and checks go through `execution.execute` with `shlex.split` arguments, no shell, a 1 MB log cap, and their own `--check-timeout` (default 180 seconds). The provider timeout does not include clone setup, capture, or checks.
 - **Clone lifetime.** `probe` clones are removed after the run. `execute` clones survive an `ok`, `violation`, or `check_failed` result until `relay.py cleanup`. Cancellation, timeout, and errors remove the clone and keep the logs.
 - **Environment.** Tool-kind setup, provider, and check processes see `PWD` set to the clone. A live run showed OpenCode resolving its project from an inherited `PWD` and writing into the caller's directory; Relay's own check in the clone caught it as `check_failed`.

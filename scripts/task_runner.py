@@ -12,15 +12,17 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from execution import execute
 from isolation import (
+    Capture,
     Clone,
     capture,
     create_clone,
     find_violations,
+    missing_from_commit,
     remove_clone,
     resolve_ref,
     snapshot_metadata,
@@ -183,6 +185,19 @@ def build_request(
     return request, records
 
 
+def _tool_path(given: str) -> str:
+    relative = PurePosixPath(given)
+    if not given or relative.is_absolute() or ".." in relative.parts or "\\" in given:
+        raise RelayError("--files must be relative paths inside --root.")
+    if (
+        any(p in {".git", ".ssh"} for p in relative.parts)
+        or relative.name == ".env"
+        or relative.name.startswith(".env.")
+    ):
+        raise RelayError(f"Credential or repository metadata path is excluded: {given}")
+    return relative.as_posix()
+
+
 def build_tool_request(
     root: Path,
     files: list[str],
@@ -200,15 +215,8 @@ def build_tool_request(
     question = task.read_text(encoding="utf-8")
     if not question.strip():
         raise RelayError("Task must not be empty.")
-    records, paths, seen = [], [], set()
-    for given in files:
-        path, normalized = _source_path(root, given)
-        if path in seen:
-            continue
-        seen.add(path)
-        relative = normalized.as_posix()
-        records.append({"path": relative})
-        paths.append(relative)
+    paths = list(dict.fromkeys(_tool_path(given) for given in files))
+    records = [{"path": path} for path in paths]
     payload = {
         "instructions": KINDS[kind].instructions,
         "task": question,
@@ -220,6 +228,10 @@ def build_tool_request(
     if len(request.encode()) > max_bytes:
         raise RelayError("Encoded bundle exceeds input limit; reduce the selected files.")
     return request, records
+
+
+def _captured_paths(captured: Capture) -> list[str]:
+    return [*captured.tracked_changes, *captured.untracked_files, *captured.metadata_changes]
 
 
 def run_check(
@@ -393,11 +405,14 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     resolve_invocation(adapter, True)
     owns = check_tool_options(args.kind, owns, checks, setup)
     root = args.root.resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix="agent-relay-ref-") as temporary:
-        sha = resolve_ref(root, ref, Path(temporary), check_timeout)
     request, records = build_tool_request(
         root, args.files, args.task_file, args.kind, args.max_input_bytes, owns, checks
     )
+    with tempfile.TemporaryDirectory(prefix="agent-relay-ref-") as temporary:
+        sha = resolve_ref(root, ref, Path(temporary), check_timeout)
+        missing = missing_from_commit(root, sha, [record["path"] for record in records], Path(temporary), check_timeout)
+    if missing:
+        raise RelayError(f"--files entry is not a file in the pinned commit {sha[:12]}: {', '.join(missing)}")
     return {
         "adapter": adapter,
         "request": request,
@@ -485,10 +500,7 @@ def run_prepared(
                 cancel_file,
                 heartbeat,
             )
-            captured = capture(clone, before, logs, options["check_timeout"])
-            diff_path = output / "changes.diff"
-            diff_path.write_bytes(captured.diff)
-            violations = find_violations(captured, options["owns"] if result["kind"] == "execute" else None)
+            provider_capture = capture(clone, before, logs, options["check_timeout"])
             check_results = [
                 run_check(
                     command,
@@ -503,6 +515,12 @@ def run_prepared(
             ]
             if cancel_file is not None and cancel_file.exists():
                 raise RelayCancelled("Cancellation requested before result publication.")
+            # Checks run code the provider may have edited; judge the clone as the lead will find it.
+            captured = capture(clone, before, logs, options["check_timeout"]) if check_results else provider_capture
+            check_side_effects = sorted(set(_captured_paths(captured)) ^ set(_captured_paths(provider_capture)))
+            diff_path = output / "changes.diff"
+            diff_path.write_bytes(captured.diff)
+            violations = find_violations(captured, options["owns"] if result["kind"] == "execute" else None)
             passed = sum(record["exit_code"] == 0 for record in check_results)
             if result["kind"] == "execute":
                 files_changed = [*captured.tracked_changes, *captured.untracked_files]
@@ -524,6 +542,7 @@ def run_prepared(
                 untracked_files=captured.untracked_files,
                 violations=violations,
                 checks=check_results,
+                check_side_effects=check_side_effects,
                 provider_claims=answer[: task["max_answer_chars"]],
                 provider_claims_truncated=len(answer) > task["max_answer_chars"],
                 answer_path=str(answer_path),

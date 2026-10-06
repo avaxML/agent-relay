@@ -242,6 +242,17 @@ def resolve_ref(root: Path, ref: str, logs: Path, timeout: float) -> str:
     return sha
 
 
+def missing_from_commit(root: Path, sha: str, paths: Sequence[str], logs: Path, timeout: float) -> list[str]:
+    """Return the given repository paths that are not files in the pinned commit (runs before any provider)."""
+    if not paths:
+        return []
+    listing = run_git(
+        ["ls-tree", "-z", "--full-name", "--format=%(objecttype) %(path)", sha, "--", *paths], logs, timeout, cwd=root
+    )
+    blobs = {entry[5:] for entry in listing.decode("utf-8", errors="replace").split("\0") if entry.startswith("blob ")}
+    return [path for path in paths if path not in blobs]
+
+
 def create_clone(root: Path, sha: str, logs: Path, timeout: float) -> Clone:
     directory = clones_root() / uuid4().hex
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)

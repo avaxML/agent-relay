@@ -226,6 +226,7 @@ def main() -> int:
                 jobs.submit,
                 args.max_per_provider,
                 args.dispatch_dir / uuid.uuid4().hex if args.dispatch_dir else None,
+                locate=lambda output: jobs.find_by_output(output, jobs.job_root(args.jobs_dir)),
             )
             result = json.loads(ledger_path.read_text(encoding="utf-8"))
             code = 0
@@ -243,6 +244,7 @@ def main() -> int:
                     lambda job_id: jobs.status(job_id, root),
                     lambda job_id: jobs.result(job_id, root),
                     args.timeout,
+                    locate=lambda output: jobs.find_by_output(output, root),
                 )
                 succeeded = all(task["state"] == "submitted" and task["status"] == "ok" for task in result["tasks"])
                 succeeded = succeeded and not result["needs_native_fallback"]

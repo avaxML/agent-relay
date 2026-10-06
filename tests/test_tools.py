@@ -290,6 +290,29 @@ class ToolsTests(unittest.TestCase):
         self.assertIsNone(result["clone"])
         self.assertEqual(list(self.clones.iterdir()), [])
 
+    def test_changes_made_by_relay_checks_are_captured(self) -> None:
+        check = 'python3 -c \'open("stray.txt", "w").write("x")\''
+        result = self.run_kind("execute", "edit", owns=["app.py"], checks=[check])
+        self.assertEqual(result["checks"][0]["exit_code"], 0)
+        self.assertEqual(result["status"], "violation")
+        self.assertEqual(result["violations"], ["stray.txt"])
+        self.assertEqual(result["check_side_effects"], ["stray.txt"])
+        self.assertIn("stray.txt", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(Path(result["clone"]).parent)
+
+    def test_tool_files_are_checked_against_the_pinned_commit(self) -> None:
+        self.app.unlink()
+        (self.repository / "fresh.py").write_text("x = 1\n", encoding="utf-8")
+        result = self.run_kind("probe", "probe", files=["app.py"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["files"], ["app.py"])
+        with self.assertRaisesRegex(RelayError, "not a file in the pinned commit"):
+            self.run_kind("probe", "probe", files=["fresh.py"])
+        for given in ("../x", "/etc/passwd", ".git/config", ".env"):
+            with self.subTest(given=given), self.assertRaises(RelayError):
+                self.run_kind("probe", "probe", files=[given])
+
     def test_setup_runs_inside_the_clone_before_the_provider(self) -> None:
         setup = ['python3 -c \'open("setup.txt","w").write("x")\'']
         result = self.run_kind("probe", "probe-setup", setup=setup)

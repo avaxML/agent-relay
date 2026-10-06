@@ -116,6 +116,7 @@ All runs used a throwaway fixture repository (tracked `app.py` returning 1, and 
 | antigravity (1.3.0) | `gemini-3.8-flash-high`, `--effort high` | probe / probe-edit / execute as above | `ok` / refused (no changes) / `ok` with a diff only in `app.py` |
 | cursor | `grok-4.7-xhigh`, `--effort xhigh` | `run --kind read` | `ok`; `result.json` `model` `grok-4.7-xhigh`, `timeout` 600 |
 | cursor | `composer-2.5`, no effort | `run --kind read --model composer-2.5` | `ok`; `timeout` 180 |
+| all three | defaults (antigravity `gemini-3.8-flash-low`, opencode `deepseek-v4.1-flash`, cursor `grok-4.7-high`) | `dispatch` of six probe tasks with `--providers antigravity opencode cursor --max-per-provider 2`, then `collect` and `cleanup` | assigned and submitted 2/2/2; all six `ok` with each Relay check exit 0; no fallbacks; `collect` exit 0; `cleanup` removed nothing (probe clones were already gone) |
 | opencode | first run, before the `PWD` fix | probe | Relay `check_failed`. OpenCode wrote `probe.txt` in the caller's directory because it resolved its project from `PWD`; fixed by setting `PWD` to the clone |
 
 A probe that the task explicitly asked to modify `app.py` was also refused by all three providers. The violation path therefore has no live outcome, because providers comply with the probe bound. It is proven by the fake-CLI tests and their mutation checks.

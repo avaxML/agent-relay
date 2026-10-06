@@ -336,6 +336,23 @@ def write_json(path: Path, value: Any) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def check_tool_options(kind: str, owns: list[str], checks: list[str], setup: list[str]) -> list[str]:
+    if not KINDS[kind].tools:
+        if owns or checks or setup:
+            raise RelayError("--owns, --check, and --setup apply only to probe and execute.")
+        return owns
+    if kind == "execute":
+        if not owns:
+            raise RelayError("execute requires at least one --owns glob.")
+        owns = validate_globs(owns)
+    elif owns:
+        raise RelayError("probe must not declare --owns; it may only create untracked files.")
+    for command in (*checks, *setup):
+        if not shlex.split(command):
+            raise RelayError("Check and setup commands must not be empty.")
+    return owns
+
+
 def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     kind = KINDS[args.kind]
     adapter = load_adapter(args.provider, args.adapter_file, getattr(args, "registry_dir", None))
@@ -352,8 +369,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     setup = list(getattr(args, "setup", None) or [])
     check_timeout = getattr(args, "check_timeout", 180)
     if not kind.tools:
-        if owns or checks or setup:
-            raise RelayError("--owns, --check, and --setup apply only to probe and execute.")
+        check_tool_options(args.kind, owns, checks, setup)
         request, sources = build_request(args.root, args.files, args.task_file, args.kind, args.max_input_bytes)
         return {
             "adapter": adapter,
@@ -375,15 +391,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
             },
         }
     resolve_invocation(adapter, True)
-    if args.kind == "execute":
-        if not owns:
-            raise RelayError("execute requires at least one --owns glob.")
-        owns = validate_globs(owns)
-    elif owns:
-        raise RelayError("probe must not declare --owns; it may only create untracked files.")
-    for command in (*checks, *setup):
-        if not shlex.split(command):
-            raise RelayError("Check and setup commands must not be empty.")
+    owns = check_tool_options(args.kind, owns, checks, setup)
     root = args.root.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="agent-relay-ref-") as temporary:
         sha = resolve_ref(root, ref, Path(temporary), check_timeout)

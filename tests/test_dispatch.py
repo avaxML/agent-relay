@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,10 @@ from providers import RelayError
 KINDS = {"read": False, "review": False, "probe": True, "execute": True}
 ORDER = ["antigravity", "opencode", "cursor"]
 HEALTHY = {"ok": True, "tools": True, "reason": "ok"}
+
+
+def pinned_ref(root: Path, ref: str) -> str:
+    return "a" * 40
 
 
 class Fakes:
@@ -73,7 +77,13 @@ class DispatchTestCase(unittest.TestCase):
         path.write_text(json.dumps({"tasks": tasks} if document is None else document), encoding="utf-8")
         return path
 
-    def create(self, tasks: list[dict[str, Any]], fakes: Fakes, max_per_provider: int = 2) -> Path:
+    def create(
+        self,
+        tasks: list[dict[str, Any]],
+        fakes: Fakes,
+        max_per_provider: int = 2,
+        pin_ref: Callable[[Path, str], str] = pinned_ref,
+    ) -> Path:
         self.runs += 1
         return dispatch.create(
             self.manifest(tasks),
@@ -85,6 +95,7 @@ class DispatchTestCase(unittest.TestCase):
             fakes.submit,
             max_per_provider=max_per_provider,
             directory=self.directory / "dispatches" / str(self.runs),
+            pin_ref=pin_ref,
         )
 
     def ledger(self, path: Path) -> dict[str, Any]:
@@ -114,7 +125,7 @@ class AssignmentTests(DispatchTestCase):
         self.assertEqual(first.root, self.project.resolve())
         self.assertEqual(first.jobs_dir, self.directory / "jobs")
         self.assertEqual(first.files, ["src/app.py"])
-        self.assertEqual((first.ref, first.check_timeout, first.max_input_bytes), ("HEAD", 180, 400000))
+        self.assertEqual((first.ref, first.check_timeout, first.max_input_bytes), ("a" * 40, 180, 400000))
 
     def test_explicit_provider_is_respected_and_counted(self) -> None:
         fakes = Fakes()
@@ -203,6 +214,19 @@ class ManifestTests(DispatchTestCase):
         self.assert_rejected([], {"tasks": [self.task("a")], "extra": 1})
         self.assert_rejected([], {"tasks": []})
 
+    def test_tool_option_errors_reuse_task_runner_messages(self) -> None:
+        no_tools = "--owns, --check, and --setup apply only to probe and execute."
+        cases = [
+            (self.task("a", kind="read", checks=["true"]), no_tools),
+            (self.task("a", owns=["src/**"]), "probe must not declare --owns; it may only create untracked files."),
+            (self.task("a", kind="execute"), "execute requires at least one --owns glob."),
+        ]
+        for task, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaises(RelayError) as caught:
+                    dispatch.load_manifest(self.manifest([task]), KINDS)
+                self.assertIn(f"Task {task['id']}: {message}", str(caught.exception))
+
 
 class AdvanceTests(DispatchTestCase):
     def test_concurrency_cap_holds_back_tasks_until_jobs_finish(self) -> None:
@@ -242,7 +266,15 @@ class AdvanceTests(DispatchTestCase):
 
         manifest = self.manifest([self.task("t")])
         path = dispatch.create(
-            manifest, self.project, ORDER, {}, KINDS, fakes.doctor, failing, directory=self.directory / "d"
+            manifest,
+            self.project,
+            ORDER,
+            {},
+            KINDS,
+            fakes.doctor,
+            failing,
+            directory=self.directory / "d",
+            pin_ref=pinned_ref,
         )
         task = self.ledger(path)["tasks"][0]
         self.assertEqual((task["state"], task["reason"]), ("submit_failed", "boom"))
@@ -258,6 +290,54 @@ class AdvanceTests(DispatchTestCase):
         self.assertEqual(ledger["schema_version"], 1)
         self.assertEqual(ledger["providers"], ORDER)
         self.assertEqual(ledger["settings"]["jobs_dir"], str(self.directory / "jobs"))
+
+
+class PinRefTests(DispatchTestCase):
+    def test_create_pins_ref_once_and_every_task_gets_the_sha(self) -> None:
+        fakes = Fakes()
+        calls: list[str] = []
+
+        def pin(root: Path, ref: str) -> str:
+            calls.append(ref)
+            return "a" * 40
+
+        path = self.create([self.task(f"t{n}") for n in range(4)], fakes, max_per_provider=1, pin_ref=pin)
+        ledger = self.ledger(path)
+        self.assertEqual(ledger["settings"]["ref"], "a" * 40)
+        self.assertEqual(ledger["settings"]["requested_ref"], "HEAD")
+        self.assertEqual([args.ref for args in fakes.submitted], ["a" * 40] * 3)
+        fakes.statuses["job1"] = "completed"
+        dispatch.advance(path, fakes.submit, fakes.status)
+        self.assertEqual([args.ref for args in fakes.submitted], ["a" * 40] * 4)
+        self.assertEqual(calls, ["HEAD"])
+
+    def test_default_pin_ref_resolves_a_real_repository_head(self) -> None:
+        repository = self.directory / "repository"
+        repository.mkdir()
+        subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        fakes = Fakes()
+        path = dispatch.create(
+            self.manifest([self.task("a")]),
+            repository,
+            ORDER,
+            {"ref": "HEAD", "jobs_dir": self.directory / "jobs", "timeout": None},
+            KINDS,
+            fakes.doctor,
+            fakes.submit,
+            directory=self.directory / "d",
+        )
+        ledger = self.ledger(path)
+        self.assertEqual((ledger["settings"]["requested_ref"], ledger["settings"]["ref"]), ("HEAD", head))
+        self.assertEqual([args.ref for args in fakes.submitted], [head])
 
 
 class CollectTests(DispatchTestCase):
@@ -324,6 +404,21 @@ class CollectTests(DispatchTestCase):
         self.assertEqual(outcome["dispatch_id"], self.ledger(path)["dispatch_id"])
         self.assertTrue(path.is_file())
 
+    def test_cleanup_reports_lookup_errors_and_keeps_cleaning(self) -> None:
+        fakes = Fakes()
+        path = self.create([self.task("first"), self.task("second")], fakes, max_per_provider=1)
+        fakes.results["job2"] = {"status": "ok", "clone": "/clones/two/work"}
+
+        def result(job_id: str) -> Mapping[str, Any]:
+            if job_id == "job1":
+                raise RelayError("result.json is missing")
+            return fakes.result(job_id)
+
+        removed: list[Path] = []
+        outcome = dispatch.cleanup(path, result, removed.append)
+        self.assertEqual(removed, [Path("/clones/two")])
+        self.assertEqual(outcome["errors"], [{"id": "first", "error": "result.json is missing"}])
+
 
 class DispatchRootTests(unittest.TestCase):
     def test_dispatch_root_honors_environment_and_rejects_symlink(self) -> None:
@@ -359,6 +454,13 @@ class DispatchCliTests(DispatchTestCase):
     def test_dispatch_collect_cleanup_with_unavailable_provider(self) -> None:
         registry = self.directory / "registry"
         registry.mkdir()
+        subprocess.run(["git", "init"], cwd=self.project, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"],
+            cwd=self.project,
+            check=True,
+            capture_output=True,
+        )
         adapter = {
             "name": "ghost-relay-test",
             "executable": "agent-relay-definitely-missing-cli",

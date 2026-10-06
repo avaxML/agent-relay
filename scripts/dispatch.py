@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -16,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import isolation
-from isolation import globs_overlap, validate_globs
+import task_runner
+from isolation import globs_overlap
 from providers import RelayError
 from task_runner import write_json
 
@@ -84,14 +86,10 @@ def _normalize(raw: Any, directory: Path, kinds: Mapping[str, bool]) -> dict[str
         if value is not None and not isinstance(value, str):
             raise RelayError(f"Task {task_id}: {key} must be a string.")
         task[key] = value
-    if not kinds[kind] and (task["owns"] or task["checks"] or task["setup"]):
-        raise RelayError(f"Task {task_id}: kind {kind} takes no owns, checks, or setup.")
-    if kind == "execute":
-        if not task["owns"]:
-            raise RelayError(f"Task {task_id}: kind execute requires owns.")
-        task["owns"] = validate_globs(task["owns"])
-    elif task["owns"]:
-        raise RelayError(f"Task {task_id}: only kind execute declares owns.")
+    try:
+        task["owns"] = task_runner.check_tool_options(kind, task["owns"], task["checks"], task["setup"])
+    except RelayError as exc:
+        raise RelayError(f"Task {task_id}: {exc}") from exc
     return task
 
 
@@ -168,6 +166,11 @@ def _never_consulted(job_id: str) -> Mapping[str, Any]:
     raise RelayError(f"A fresh dispatch has no submitted job to inspect: {job_id}")
 
 
+def _pin_ref(root: Path, ref: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="agent-relay-ref-") as temporary:
+        return isolation.resolve_ref(root, ref, Path(temporary), 60)
+
+
 def create(
     manifest: Path,
     root: Path,
@@ -178,6 +181,7 @@ def create(
     submit: Submit,
     max_per_provider: int = 2,
     directory: Path | None = None,
+    pin_ref: Callable[[Path, str], str] = _pin_ref,
 ) -> Path:
     if not order or len(set(order)) != len(order):
         raise RelayError("Providers must be a nonempty list without duplicates.")
@@ -203,6 +207,11 @@ def create(
             }
         )
     counts = {name: {"assigned": list(assignments.values()).count(name), "submitted": 0} for name in order}
+    raw_ref = settings.get("ref", "HEAD")
+    requested_ref = raw_ref if isinstance(raw_ref, str) else str(raw_ref)
+    stored_settings = _json_safe(settings)
+    stored_settings["requested_ref"] = requested_ref
+    stored_settings["ref"] = pin_ref(root, requested_ref)
     ledger = {
         "schema_version": 1,
         "dispatch_id": target.name,
@@ -211,7 +220,7 @@ def create(
         "root": str(root.resolve()),
         "providers": list(order),
         "max_per_provider": max_per_provider,
-        "settings": _json_safe(settings),
+        "settings": stored_settings,
         "doctor": health,
         "tasks": records,
         "needs_native_fallback": fallbacks,
@@ -371,14 +380,18 @@ def cleanup(
 ) -> dict[str, Any]:
     ledger = _read(ledger_path)
     removed: list[str] = []
+    errors: list[dict[str, str]] = []
     for task in ledger["tasks"]:
         if task["state"] != "submitted":
             continue
-        clone = (result(task["job_id"]).get("result") or {}).get("clone")
-        if clone is None:
-            continue
-        directory = Path(clone).parent
-        if str(directory) not in removed:
-            remove_clone(directory)
-            removed.append(str(directory))
-    return {"dispatch_id": ledger["dispatch_id"], "removed": removed}
+        try:
+            clone = (result(task["job_id"]).get("result") or {}).get("clone")
+            if clone is None:
+                continue
+            directory = Path(clone).parent
+            if str(directory) not in removed:
+                remove_clone(directory)
+                removed.append(str(directory))
+        except (RelayError, OSError, ValueError) as exc:
+            errors.append({"id": str(task["id"]), "error": str(exc)})
+    return {"dispatch_id": ledger["dispatch_id"], "removed": removed, "errors": errors}

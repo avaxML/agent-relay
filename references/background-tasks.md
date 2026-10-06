@@ -12,7 +12,7 @@ python3 scripts/relay.py result JOB_ID [--jobs-dir DIR]
 python3 scripts/relay.py cancel JOB_ID [--jobs-dir DIR]
 ```
 
-Submit accepts `--provider`, `--model`, `--effort`, `--task-file`, `--root`, `--files`, `--kind`, `--timeout`, `--max-input-bytes`, `--max-answer-chars`, and `--adapter-file`, matching `run`. `--timeout` is the worker timeout. `--output` defaults to `job_dir/artifacts`; a supplied directory must not already exist. `--jobs-dir` defaults to `AGENT_RELAY_JOBS_DIR` or `~/.local/state/agent-relay/jobs`.
+Submit accepts `--provider`, `--model`, `--effort`, `--task-file`, `--root`, `--files`, `--kind`, `--timeout`, `--max-input-bytes`, `--max-answer-chars`, and `--adapter-file`, matching `run`. `--timeout` is the worker timeout; when omitted, it is the effort level's declared timeout or 180 seconds. `--output` defaults to `job_dir/artifacts`; a supplied directory must not already exist. `--jobs-dir` defaults to `AGENT_RELAY_JOBS_DIR` or `~/.local/state/agent-relay/jobs`.
 
 Submit returns promptly with JSON containing `job_id`, `status`, `jobs_dir`, `job_dir`, and `output_dir`. The initial status is `queued` or `running`, depending on how quickly the detached runner starts. Jobs transition through `queued`, `running`, `cancelling`, `completed`, `failed`, `cancelled`, or `interrupted`. The existing worker result status `ok` is represented by the job status `completed`; the saved result JSON remains available under the artifact directory.
 

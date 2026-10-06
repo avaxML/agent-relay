@@ -21,6 +21,7 @@ from providers import (
     decode_response,
     load_adapter,
     resolve_effort,
+    resolve_timeout,
 )
 
 KINDS = {
@@ -139,12 +140,13 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     adapter["executable"] = str(Path(executable).resolve())
     requested_model = args.model or adapter["default_model"]
     model, effort_args = resolve_effort(adapter, requested_model, args.effort)
+    timeout = resolve_timeout(adapter, args.effort, model, args.timeout)
     request, sources = build_request(args.root, args.files, args.task_file, args.kind, args.max_input_bytes)
     return {
         "adapter": adapter,
         "request": request,
         "effort_args": effort_args,
-        "timeout": args.timeout,
+        "timeout": timeout,
         "max_answer_chars": args.max_answer_chars,
         "result": {
             "schema_version": 1,
@@ -153,6 +155,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
             "model": model,
             "requested_model": requested_model,
             "effort": args.effort,
+            "timeout": timeout,
             "kind": args.kind,
             "sources": sources,
             "input_bytes": len(request.encode()),

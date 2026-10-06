@@ -102,7 +102,11 @@ def main() -> int:
                 "--output", type=Path, required=command == "run", help="New artifact directory; never overwritten."
             )
             sub.add_argument("--kind", choices=KINDS, default="read")
-            sub.add_argument("--timeout", type=positive_int, default=180)
+            sub.add_argument(
+                "--timeout",
+                type=positive_int,
+                help="Worker seconds; defaults to the effort level's declared timeout, else 180.",
+            )
             sub.add_argument("--max-input-bytes", type=positive_int, default=400000)
             sub.add_argument("--max-answer-chars", type=positive_int, default=12000)
         if command == "submit":

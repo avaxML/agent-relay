@@ -41,7 +41,8 @@
         "model": "{model}#high"
       },
       "max": {
-        "model": "{model}#max"
+        "model": "{model}#max",
+        "timeout": 600
       }
     }
   }

@@ -314,13 +314,23 @@ def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> t
     ]
 
 
-def resolve_timeout(adapter: dict[str, Any], effort: str | None, timeout: int | None) -> int:
-    """An explicit timeout wins; otherwise slower effort levels may declare a longer default."""
+def resolve_timeout(adapter: dict[str, Any], effort: str | None, model: str, timeout: int | None) -> int:
+    """An explicit timeout wins; otherwise slower effort levels may declare a longer default.
+
+    Without --effort, a model ID that a level selects (such as an xhigh variant) implies that level.
+    """
     if timeout is not None:
         return timeout
-    if effort is None:
+    config = adapter.get("effort")
+    if not config:
         return DEFAULT_TIMEOUT
-    return int(adapter["effort"]["levels"][effort].get("timeout", DEFAULT_TIMEOUT))
+    if effort is not None:
+        return int(config["levels"][effort].get("timeout", DEFAULT_TIMEOUT))
+    for settings in config["levels"].values():
+        variant = settings.get("model", "{model}")
+        if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
+            return int(settings.get("timeout", DEFAULT_TIMEOUT))
+    return DEFAULT_TIMEOUT
 
 
 def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -> RelayError:

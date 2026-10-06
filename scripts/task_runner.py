@@ -140,7 +140,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     adapter["executable"] = str(Path(executable).resolve())
     requested_model = args.model or adapter["default_model"]
     model, effort_args = resolve_effort(adapter, requested_model, args.effort)
-    timeout = resolve_timeout(adapter, args.effort, args.timeout)
+    timeout = resolve_timeout(adapter, args.effort, model, args.timeout)
     request, sources = build_request(args.root, args.files, args.task_file, args.kind, args.max_input_bytes)
     return {
         "adapter": adapter,

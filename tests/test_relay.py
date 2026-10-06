@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from execution import execute
 from providers import RelayError, decode_response, load_adapter
-from task_runner import build_request, provider_workspace, run
+from task_runner import KINDS, build_request, provider_workspace, run
 
 
 class RelayTestCase(unittest.TestCase):
@@ -117,6 +117,15 @@ class BuildRequestTests(RelayTestCase):
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, instructions)
+
+    def test_kind_table_owns_worker_instructions(self) -> None:
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                instructions = json.loads(build_request(self.root, [], self.task, kind, 10000)[0])["instructions"]
+                self.assertEqual(instructions, KINDS[kind].instructions)
+                self.assertFalse(KINDS[kind].tools)
+                self.assertTrue(instructions.startswith("You are a bounded worker."))
+                self.assertIn("Do not use tools", instructions)
 
 
 class ProviderTests(unittest.TestCase):

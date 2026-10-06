@@ -5,7 +5,7 @@
 
 ![Agent Relay routes a bounded coding task to multiple coding-agent CLIs and collects their artifacts.](assets/agent-relay-flow.png)
 
-Agent Relay lets a lead coding agent delegate bounded inspection and review work to locally installed coding-agent CLIs. It is designed for I/O-heavy work: the relay packages explicit files, sends them through a provider adapter, and returns a bounded, inspectable result without applying patches.
+Agent Relay lets a lead coding agent delegate bounded inspection, review, experiments, and small implementations to locally installed coding-agent CLIs. The tool-free kinds package explicit files, send them through a provider adapter, and return a bounded, inspectable result. The tool-enabled kinds (`probe` and `execute`) let a provider run commands in a throwaway clone while Relay captures what changed and reruns the checks itself. Relay never applies results to your checkout.
 
 The bundled adapters are:
 
@@ -13,9 +13,9 @@ The bundled adapters are:
 | --- | --- | --- |
 | `opencode` | `opencode-go/deepseek-v4.1-flash` | code and log triage |
 | `antigravity` | `gemini-3.8-flash-low` | broad extraction and corpus reading |
-| `cursor` | `cursor-grok-4.6-high` | independent review through Cursor Agent |
+| `cursor` | `grok-4.7-high` | independent review through Cursor Agent |
 
-Use the bundled skills for common workflows: `delegate`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
+Use the bundled skills for common workflows: `delegate`, `executor`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
 
 ## Requirements
 
@@ -68,6 +68,33 @@ python3 scripts/relay.py run \
 
 Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout SECONDS` (default 180, or the effort level's declared timeout), `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
 
+## Tool-enabled kinds and the executor
+
+`--kind probe` runs experiments and may create only untracked files. `--kind execute --owns GLOB` implements a bounded task and may change only owned paths. Both run the adapter's verified tools mode in a throwaway clone of `--root` at `--ref` (default `HEAD`), under `$AGENT_RELAY_CLONES_DIR` or `~/.local/state/agent-relay/clones`, never in your checkout.
+
+```sh
+python3 scripts/relay.py run --provider opencode --kind execute \
+  --task-file /abs/path/task.txt --root /abs/path/repository --files src/limits.py \
+  --owns 'src/limits.py' --owns 'tests/test_limits.py' \
+  --check 'python3 -m pytest -q tests/test_limits.py' --output /abs/path/fresh-output
+```
+
+`--setup CMD` runs before the provider and `--check CMD` after it. Both are repeatable, both run without a shell, and both use `--check-timeout` (default 180 seconds), which is separate from the provider timeout. The result uses `schema_version: 2` and records:
+- Relay's own `checks` next to the provider's `provider_claims`;
+- `violations`, `files_changed` and `untracked_files`;
+- `diff_path` (`changes.diff`), and `clone` for `execute`, kept until cleanup;
+- `env_removed`;
+- `status`: `ok`, `violation`, `check_failed`, `error`, or `cancelled`.
+
+A tracked change in a probe, a change outside `--owns`, or any `.git` change is a violation. Empty provider output is an error. Apply an `execute` result yourself with `git apply --check` and `git apply` after reading the diff.
+
+To spread several tasks across providers as subagents, use the `executor` skill:
+- `relay.py dispatch --manifest FILE --root REPO --providers antigravity opencode cursor` assigns tasks equally and submits them as background jobs.
+- `relay.py collect --dispatch LEDGER` waits with a bound and aggregates the results.
+- `relay.py cleanup --dispatch LEDGER` removes kept clones.
+
+Tasks that no provider can take are listed as `needs_native_fallback`. See [ADR 0001](docs/adr/0001-tool-enabled-workers.md) for the isolation design and what it cannot prevent.
+
 ## Adapter registry
 
 Install a validated adapter once to use it by provider name:
@@ -94,9 +121,9 @@ The orchestrator can choose `--effort low`, `medium`, or `high` for each task. O
 | --- | --- | --- |
 | OpenCode, `opencode-go/deepseek-v4.1-flash` | `low`, `medium`, `high`, `max` | Appends `#LEVEL` to the model ID; `max` defaults to a 600-second timeout |
 | Antigravity, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL` and passes `--effort LEVEL` |
-| Cursor, Grok 4.6 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `cursor-grok-4.6-LEVEL`; no additional effort argument; `xhigh` defaults to a 600-second timeout |
+| Cursor, Grok 4.7 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `grok-4.7-LEVEL`; no additional effort argument; `xhigh` defaults to a 600-second timeout, also for `--model grok-4.7-xhigh` without `--effort` |
 
-Explicit effort overrides the Antigravity or Cursor variant within the same model family. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. Cursor `xhigh` and OpenCode `max` can take several minutes, so their levels declare a 600-second default timeout; an explicit `--timeout` still wins. Prefer `submit` for these levels so a long worker does not hold the orchestrator's turn. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
+Explicit effort overrides the Antigravity or Cursor variant within the same model family. Cursor's `composer-2.5` is reachable with `--model composer-2.5` and no `--effort`; it has no effort mapping because every level selects a fixed Grok ID. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. Cursor `xhigh` and OpenCode `max` can take several minutes, so their levels declare a 600-second default timeout; an explicit `--timeout` still wins. Prefer `submit` for these levels so a long worker does not hold the orchestrator's turn. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
 
 OpenCode's variant mechanism and provider-specific effort behavior are documented in [its model guide](https://opencode.ai/docs/models/) and [provider transforms](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts). The local Antigravity CLI help documents its effort flag.
 
@@ -104,13 +131,13 @@ OpenCode's variant mechanism and provider-specific effort behavior are documente
 
 The file bundle is data, not instructions. Keep delegated questions narrow, require source paths and line references, and verify important claims against the original files. The input manifest includes hashes, byte and line counts; the bundled source payload uses numbered lines. Results include source metadata, logs, and explicit truncation metadata so the lead agent can audit what was sent and returned. Delegated prompts prohibit nested delegation, but this is an instruction rather than a hard security control.
 
-The provider process runs from a temporary working directory. This is an execution convenience, not a hard security boundary. The process inherits the host environment and may access host files or the network subject to the CLI's permissions. Relay never applies returned patches, and it does not enforce hooks or OS-level sandboxing. The small excluded-path list is not a secret scanner: select only files authorized for the chosen provider. Treat local output artifacts and the provider's own session history as potentially sensitive and manage retention accordingly.
+For tool-free kinds the provider process runs from a temporary working directory. This is an execution convenience, not a hard security boundary. The process inherits the host environment and may access host files or the network subject to the CLI's permissions. Relay never applies returned patches or tool-kind diffs, and it does not provide OS-level sandboxing; tool kinds run in a clone and Relay disables hooks in its own git calls there. The small excluded-path list is not a secret scanner: select only files authorized for the chosen provider. Treat local output artifacts and the provider's own session history as potentially sensitive and manage retention accordingly.
 
-The bundled Cursor adapter targets locally verified `cursor-agent` version `2026.09.10-fd3934a`. It uses stdin, ask mode, Cursor's enabled sandbox, and stream JSON. Cursor runs against a stable Relay-owned workspace at `$AGENT_RELAY_PROVIDER_WORKSPACES_DIR/cursor`, `$XDG_STATE_HOME/agent-relay/providers/cursor`, or `~/.local/state/agent-relay/providers/cursor`. Before the first run, open `cursor-agent` interactively in that empty directory and approve Cursor's normal workspace-trust prompt. Relay never passes `--trust`, `--force`, `--yolo`, `--auto-review`, `--approve-mcps`, or the source project workspace. The provider still inherits host permissions, so this is not an OS security boundary.
+The bundled Cursor adapter targets locally verified `cursor-agent` version `2026.10.01-e373342`. Its tool-free invocation uses stdin, ask mode, Cursor's enabled sandbox, and stream JSON. Cursor runs against a stable Relay-owned workspace at `$AGENT_RELAY_PROVIDER_WORKSPACES_DIR/cursor`, `$XDG_STATE_HOME/agent-relay/providers/cursor`, or `~/.local/state/agent-relay/providers/cursor`. Before the first run, open `cursor-agent` interactively in that empty directory and approve Cursor's normal workspace-trust prompt. That invocation never passes `--trust`, `--force`, `--yolo`, `--auto-review`, `--approve-mcps`, or the source project workspace. Cursor's tools mode, used only by `probe` and `execute`, passes `--trust` for a fresh Relay clone and never `--force` or `--yolo`. The provider still inherits host permissions, so this is not an OS security boundary.
 
 Timeouts stop the worker process group. The runner checks combined stdout/stderr size against a 4 MB threshold every 50 ms; this is a stop threshold, not a filesystem quota. It refuses to parse oversized logs. No automatic retries, provider fallback, or shared conversation reuse occur.
 
-The design is informed by [Spotify's Shunt work](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt), but this plugin contains its own implementation and no copied source. OpenCode and Antigravity passed a live synthetic file-reading check on September 13, 2026. Cursor passed its help probe, model listing, and a live synthetic file-reading check through Agent Relay on September 15, 2026. Do not infer support for other coding-agent CLIs without the same checks.
+The design is informed by [Spotify's Shunt work](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt), but this plugin contains its own implementation and no copied source. OpenCode and Antigravity passed a live synthetic file-reading check on September 13, 2026. Cursor passed its help probe, model listing, and a live synthetic file-reading check through Agent Relay on September 15, 2026. On October 6, 2026, all three providers also passed live tool-mode checks on a synthetic fixture: a `probe` returned `ok` with only an untracked file and a passing Relay check, and an `execute --owns app.py` returned `ok` with a diff only in `app.py`. Cursor `--effort xhigh` (`grok-4.7-xhigh`, 600-second timeout) and `--model composer-2.5` passed read checks. Do not infer support for other coding-agent CLIs without the same checks.
 
 ## Verification
 

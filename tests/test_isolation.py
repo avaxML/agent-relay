@@ -179,6 +179,41 @@ class IsolationTestCase(unittest.TestCase):
         self.assertEqual(find_violations(result, ["app.py"]), ["new.txt"])
         self.assertEqual(find_violations(result, ["*"]), [])
 
+    def test_planted_filter_in_private_repo_is_refused_and_never_runs(self) -> None:
+        clone = create_clone(self.source_dir, self.commit1, self.logs_dir, timeout=10.0)
+        before = snapshot_metadata(clone.work)
+        marker = self.temp_path / "filter-marker"
+        script = self.temp_path / "pwn-filter.sh"
+        script.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        with (clone.git_dir / "config").open("a", encoding="utf-8") as handle:
+            handle.write(f'\n[filter "pwn"]\n\tclean = {script.as_posix()}\n')
+        (clone.work / ".gitattributes").write_text("* filter=pwn\n", encoding="utf-8")
+        (clone.work / "app.py").write_text("print('pwned')\n", encoding="utf-8")
+        with self.assertRaisesRegex(RelayError, "private repository changed"):
+            capture(clone, before, self.logs_dir, timeout=10.0)
+        self.assertFalse(marker.exists())
+
+    def test_assume_unchanged_in_relay_index_cannot_hide_a_tracked_edit(self) -> None:
+        clone = create_clone(self.source_dir, self.commit1, self.logs_dir, timeout=10.0)
+        before = snapshot_metadata(clone.work)
+        (clone.work / "app.py").write_text("print('edited')\n", encoding="utf-8")
+        subprocess.run(
+            [
+                "git",
+                f"--git-dir={clone.git_dir}",
+                f"--work-tree={clone.work}",
+                "update-index",
+                "--assume-unchanged",
+                "app.py",
+            ],
+            cwd=clone.work,
+            env={**os.environ, "GIT_INDEX_FILE": str(clone.index)},
+            check=True,
+        )
+        result = capture(clone, before, self.logs_dir, timeout=10.0)
+        self.assertEqual(result.tracked_changes, ["app.py"])
+
     def test_deletion_outside_owns_and_rename_into_owns(self) -> None:
         clone = create_clone(self.source_dir, self.commit1, self.logs_dir, timeout=10.0)
         before = snapshot_metadata(clone.work)
@@ -238,6 +273,10 @@ class IsolationTestCase(unittest.TestCase):
             {"PATH": "/usr/bin:/bin", "HOME": "/home/user", "GITHUB_TOKEN": "secret-token"},
         )
         self.assertEqual(removed_keep, ["GIT_DIR", "MY_API_KEY", "SSH_AUTH_SOCK"])
+
+        filtered_git, removed_git = tool_environment(base, keep=["GIT_DIR", "SSH_AUTH_SOCK", "GITHUB_TOKEN"])
+        self.assertEqual(filtered_git, {"PATH": "/usr/bin:/bin", "HOME": "/home/user", "GITHUB_TOKEN": "secret-token"})
+        self.assertEqual(removed_git, ["GIT_DIR", "MY_API_KEY", "SSH_AUTH_SOCK"])
 
     def test_validate_globs_table(self) -> None:
         for invalid in ["/abs", "../x", "a/../b", ".git/config", "a//b", "", "back\\slash", "trailing/"]:

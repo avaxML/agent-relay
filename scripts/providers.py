@@ -130,6 +130,9 @@ def validate_tools(config: Any, input_kind: str) -> None:
         isinstance(name, str) and ENV_NAME.fullmatch(name) for name in pass_env
     ):
         raise RelayError("Adapter tools.pass_env must list environment variable names.")
+    for name in (*pass_env, *env):
+        if name.startswith("GIT_") or name == "SSH_AUTH_SOCK":
+            raise RelayError(f"Adapter tools must not pass or set {name}.")
     if input_kind == "file" and not any("{request_file}" in arg for arg in args):
         raise RelayError("Adapter tools.args require {request_file} for file transport.")
 

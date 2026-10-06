@@ -522,6 +522,16 @@ class AdapterToolsTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(load_adapter(name)["name"], name)
 
+    def test_tools_reject_git_and_ssh_auth_sock(self) -> None:
+        cases = [
+            {"args": ["-p"], "pass_env": ["GIT_DIR"]},
+            {"args": ["-p"], "pass_env": ["SSH_AUTH_SOCK"]},
+            {"args": ["-p"], "env": {"GIT_WORK_TREE": "/x"}},
+        ]
+        for tools in cases:
+            with self.subTest(tools=tools), self.assertRaises(RelayError):
+                validate_adapter(self.adapter(tools=tools), "fake")
+
 
 if __name__ == "__main__":
     unittest.main()

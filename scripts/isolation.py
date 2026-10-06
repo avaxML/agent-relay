@@ -30,6 +30,8 @@ GIT_CONFIG = [
     "core.autocrlf=false",
     "-c",
     "protocol.file.allow=always",
+    "-c",
+    "core.attributesFile=/dev/null",
 ]
 
 METADATA_IGNORED = {"index", "objects", "logs", "FETCH_HEAD", "ORIG_HEAD"}
@@ -40,9 +42,11 @@ def tool_environment(base: Mapping[str, str], keep: Collection[str] = ()) -> tup
     env: dict[str, str] = {}
     removed: list[str] = []
     for key, value in base.items():
-        if key in keep_set:
+        if key.startswith("GIT_") or key == "SSH_AUTH_SOCK":
+            removed.append(key)
+        elif key in keep_set:
             env[key] = value
-        elif key.startswith("GIT_") or key == "SSH_AUTH_SOCK" or SECRET_NAME.search(key) is not None:
+        elif SECRET_NAME.search(key) is not None:
             removed.append(key)
         else:
             env[key] = value
@@ -201,6 +205,28 @@ class Clone:
     git_dir: Path
     index: Path
     sha: str
+    fingerprint: tuple[tuple[str, str], ...]
+
+
+def _private_fingerprint(git_dir: Path) -> tuple[tuple[str, str], ...]:
+    records: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(git_dir, followlinks=False):
+        current = Path(dirpath)
+        if current == git_dir:
+            dirnames[:] = [name for name in dirnames if name != "objects"]
+        linked = [name for name in dirnames if (current / name).is_symlink()]
+        for name in linked:
+            dirnames.remove(name)
+            path = current / name
+            records[path.relative_to(git_dir).as_posix()] = f"symlink:{os.readlink(path)}"
+        for name in filenames:
+            path = current / name
+            rel = path.relative_to(git_dir).as_posix()
+            if path.is_symlink():
+                records[rel] = f"symlink:{os.readlink(path)}"
+            elif path.is_file():
+                records[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return tuple(sorted(records.items()))
 
 
 def resolve_ref(root: Path, ref: str, logs: Path, timeout: float) -> str:
@@ -244,7 +270,17 @@ def create_clone(root: Path, sha: str, logs: Path, timeout: float) -> Clone:
         run_git(["remote", "remove", "origin"], logs, timeout, git_dir=work_git, work_tree=work)
         run_git(["checkout", "--quiet", "--detach", sha], logs, timeout, git_dir=work_git, work_tree=work)
         run_git(["read-tree", sha], logs, timeout, git_dir=repo_git, work_tree=work, index=index)
-        return Clone(directory=directory, work=work, git_dir=repo_git, index=index, sha=sha)
+        info = repo_git / "info"
+        info.mkdir(mode=0o700, exist_ok=True)
+        (info / "attributes").write_text("* -filter -ident -working-tree-encoding\n", encoding="utf-8")
+        return Clone(
+            directory=directory,
+            work=work,
+            git_dir=repo_git,
+            index=index,
+            sha=sha,
+            fingerprint=_private_fingerprint(repo_git),
+        )
     except Exception:
         shutil.rmtree(directory, ignore_errors=True)
         raise
@@ -315,6 +351,17 @@ def capture(
     max_bytes: int = 8_000_000,
     max_entries: int = 10_000,
 ) -> Capture:
+    if _private_fingerprint(clone.git_dir) != clone.fingerprint:
+        raise RelayError("Relay's private repository changed during the run; capture refused.")
+    clone.index.unlink(missing_ok=True)
+    run_git(
+        ["read-tree", clone.sha],
+        logs=logs,
+        timeout=timeout,
+        git_dir=clone.git_dir,
+        work_tree=clone.work,
+        index=clone.index,
+    )
     after_meta = snapshot_metadata(clone.work)
     all_keys = set(before) | set(after_meta)
     metadata_changes = sorted(k for k in all_keys if before.get(k) != after_meta.get(k))

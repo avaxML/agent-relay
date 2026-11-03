@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from execution import execute
+from execution import OutputBudget, execute
 from isolation import (
     Capture,
     Clone,
@@ -32,7 +32,9 @@ from isolation import (
 from providers import (
     RelayCancelled,
     RelayError,
+    RelayStopped,
     decode_exit_failure,
+    decode_partial,
     decode_response,
     load_adapter,
     resolve_effort,
@@ -55,10 +57,25 @@ TOOLS = (
 )
 
 
+# Tool kinds run long agent loops whose streams echo every tool result, so they get larger log budgets.
+READ_LOG_BYTES, READ_EVENT_BYTES = 4_000_000, 32_000
+TOOL_LOG_BYTES, TOOL_EVENT_BYTES = 16_000_000, 64_000
+# Output past this multiple of the persisted cap is a runaway, not verbosity.
+HARD_CEILING_FACTOR = 16
+
+
 @dataclass(frozen=True)
 class Kind:
     instructions: str
     tools: bool = False
+
+    @property
+    def max_log_bytes(self) -> int:
+        return TOOL_LOG_BYTES if self.tools else READ_LOG_BYTES
+
+    @property
+    def max_event_bytes(self) -> int:
+        return TOOL_EVENT_BYTES if self.tools else READ_EVENT_BYTES
 
 
 KINDS: dict[str, Kind] = {
@@ -102,6 +119,30 @@ KINDS: dict[str, Kind] = {
         tools=True,
     ),
 }
+
+
+def resolve_log_budget(
+    adapter: dict[str, Any], kind: str, max_log_bytes: int | None, max_event_bytes: int | None
+) -> dict[str, Any]:
+    """An explicit flag wins, then the adapter's limits, then the kind's default."""
+    limits = adapter.get("limits", {})
+    defaults = {"max_log_bytes": KINDS[kind].max_log_bytes, "max_event_bytes": KINDS[kind].max_event_bytes}
+    given = {"max_log_bytes": max_log_bytes, "max_event_bytes": max_event_bytes}
+    budget: dict[str, Any] = {"sources": {}}
+    for name, default in defaults.items():
+        if given[name] is not None:
+            budget[name], budget["sources"][name] = given[name], "cli"
+        elif name in limits:
+            budget[name], budget["sources"][name] = limits[name], "adapter"
+        else:
+            budget[name], budget["sources"][name] = default, "kind"
+    if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
+        raise RelayError(
+            "--max-event-bytes must be at least 1024 and at most a quarter of --max-log-bytes "
+            f"(got {budget['max_event_bytes']} and {budget['max_log_bytes']})."
+        )
+    budget["hard_ceiling_bytes"] = budget["max_log_bytes"] * HARD_CEILING_FACTOR
+    return budget
 
 
 def provider_workspace(name: str) -> Path:
@@ -318,16 +359,24 @@ def invoke_provider(
         **extra,
     }
     argv = [adapter["executable"]] + [arg.format_map(values) for arg in args] + task["effort_args"]
-    code = execute(
-        argv,
-        cwd,
-        env,
-        stdin_file,
-        output,
-        task["timeout"],
-        cancel_file=cancel_file,
-        heartbeat=heartbeat,
+    limits = task["log_budget"]
+    budget = OutputBudget(
+        adapter["output"], limits["max_log_bytes"], limits["max_event_bytes"], limits["hard_ceiling_bytes"]
     )
+    try:
+        code = execute(
+            argv,
+            cwd,
+            env,
+            stdin_file,
+            output,
+            task["timeout"],
+            cancel_file=cancel_file,
+            heartbeat=heartbeat,
+            budget=budget,
+        )
+    finally:
+        result["log_stats"] = budget.stats()
     result["exit_code"] = code
     if code:
         raise decode_exit_failure(adapter, code, output / "stderr.log")
@@ -375,6 +424,9 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     requested_model = args.model or adapter["default_model"]
     model, effort_args = resolve_effort(adapter, requested_model, args.effort)
     timeout = resolve_timeout(adapter, args.effort, model, args.timeout)
+    log_budget = resolve_log_budget(
+        adapter, args.kind, getattr(args, "max_log_bytes", None), getattr(args, "max_event_bytes", None)
+    )
     ref = getattr(args, "ref", "HEAD")
     owns = list(getattr(args, "owns", None) or [])
     checks = list(getattr(args, "checks", None) or [])
@@ -388,6 +440,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
             "request": request,
             "effort_args": effort_args,
             "timeout": timeout,
+            "log_budget": log_budget,
             "max_answer_chars": args.max_answer_chars,
             "result": {
                 "schema_version": 1,
@@ -400,6 +453,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
                 "kind": args.kind,
                 "sources": sources,
                 "input_bytes": len(request.encode()),
+                "log_budget": log_budget,
             },
         }
     resolve_invocation(adapter, True)
@@ -418,6 +472,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
         "request": request,
         "effort_args": effort_args,
         "timeout": timeout,
+        "log_budget": log_budget,
         "max_answer_chars": args.max_answer_chars,
         "tools": {
             "root": str(root),
@@ -444,8 +499,72 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
             "declared_checks": checks,
             "setup": setup,
             "input_bytes": len(request.encode()),
+            "log_budget": log_budget,
         },
     }
+
+
+def _record_capture(result: dict[str, Any], output: Path, captured: Capture, owns: list[str] | None) -> Path:
+    diff_path = output / "changes.diff"
+    diff_path.write_bytes(captured.diff)
+    if result["kind"] == "execute":
+        files_changed = [*captured.tracked_changes, *captured.untracked_files]
+    else:
+        files_changed = list(captured.tracked_changes)
+    result.update(
+        diff_path=str(diff_path),
+        files_changed=files_changed,
+        tracked_changes=captured.tracked_changes,
+        untracked_files=captured.untracked_files,
+        violations=find_violations(captured, owns),
+    )
+    return diff_path
+
+
+def salvage(
+    task: dict[str, Any],
+    result: dict[str, Any],
+    output: Path,
+    clone: Clone | None,
+    before: dict[str, str] | None,
+    answer: str | None,
+) -> None:
+    """Keep a stopped worker's edits and words before Relay discards its clone."""
+    try:
+        if clone is not None and before is not None:
+            options = task["tools"]
+            try:
+                captured = capture(clone, before, output / "relay", options["check_timeout"])
+            except (RelayError, OSError) as exc:
+                result["capture_error"] = str(exc)
+            else:
+                _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+        limit = task["max_answer_chars"]
+        if answer is not None:
+            answer_path = output / "answer.txt"
+            answer_path.write_text(answer + "\n", encoding="utf-8")
+            result.update(
+                provider_claims=answer[:limit],
+                provider_claims_truncated=len(answer) > limit,
+                answer_path=str(answer_path),
+            )
+            return
+        stdout = output / "stdout.log"
+        partial = (
+            decode_partial(stdout.read_text(encoding="utf-8", errors="replace"), task["adapter"]["output"])
+            if stdout.is_file()
+            else None
+        )
+        if partial:
+            partial_path = output / "partial-answer.txt"
+            partial_path.write_text(partial + "\n", encoding="utf-8")
+            result.update(
+                partial_answer=partial[:limit],
+                partial_answer_truncated=len(partial) > limit,
+                partial_answer_path=str(partial_path),
+            )
+    except (RelayError, OSError, ValueError) as exc:
+        result["salvage_error"] = str(exc)
 
 
 def run_prepared(
@@ -455,6 +574,8 @@ def run_prepared(
     result = {**task["result"], "output_dir": str(output)}
     started = time.monotonic()
     clone: Clone | None = None
+    before: dict[str, str] | None = None
+    answer: str | None = None
     try:
         if "tools" in task:
             options = task["tools"]
@@ -518,14 +639,10 @@ def run_prepared(
             # Checks run code the provider may have edited; judge the clone as the lead will find it.
             captured = capture(clone, before, logs, options["check_timeout"]) if check_results else provider_capture
             check_side_effects = sorted(set(_captured_paths(captured)) ^ set(_captured_paths(provider_capture)))
-            diff_path = output / "changes.diff"
-            diff_path.write_bytes(captured.diff)
-            violations = find_violations(captured, options["owns"] if result["kind"] == "execute" else None)
+            _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+            violations = result["violations"]
+            files_changed = result["files_changed"]
             passed = sum(record["exit_code"] == 0 for record in check_results)
-            if result["kind"] == "execute":
-                files_changed = [*captured.tracked_changes, *captured.untracked_files]
-            else:
-                files_changed = list(captured.tracked_changes)
             if violations:
                 status = "violation"
             elif any(record["exit_code"] != 0 for record in check_results):
@@ -536,11 +653,6 @@ def run_prepared(
             answer_path.write_text(answer + "\n", encoding="utf-8")
             result.update(
                 status=status,
-                diff_path=str(diff_path),
-                files_changed=files_changed,
-                tracked_changes=captured.tracked_changes,
-                untracked_files=captured.untracked_files,
-                violations=violations,
                 checks=check_results,
                 check_side_effects=check_side_effects,
                 provider_claims=answer[: task["max_answer_chars"]],
@@ -579,12 +691,18 @@ def run_prepared(
                     answer_path=str(answer_path),
                     metadata=metadata,
                 )
-    except RelayCancelled as exc:
-        result.update(status="cancelled", error=str(exc))
+    except RelayStopped as exc:
+        # User cancellation keeps its job-level meaning; timeouts and runaways are a distinct terminal status.
+        status = "cancelled" if isinstance(exc, RelayCancelled) else "stopped"
+        result.update(status=status, stop_reason=exc.reason, error=str(exc))
+        salvage(task, result, output, clone, before, answer)
     except (RelayError, OSError, ValueError) as exc:
         result.update(status="error", error=str(exc))
     except KeyboardInterrupt:
-        result.update(status="cancelled", error="Delegation interrupted; worker process group stopped.")
+        result.update(
+            status="cancelled", stop_reason="cancelled", error="Delegation interrupted; worker process group stopped."
+        )
+        salvage(task, result, output, clone, before, answer)
     finally:
         if clone is not None and not (
             result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}

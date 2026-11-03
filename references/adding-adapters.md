@@ -6,7 +6,7 @@ Adapter files are trusted execution configuration because they select an executa
 
 ## Adapter shape
 
-Required fields, with optional `effort` and `tools` blocks:
+Required fields, with optional `effort`, `tools`, and `limits` blocks:
 
 ```json
 {
@@ -58,6 +58,64 @@ The `probe` and `execute` kinds need a tools mode. Without one, a provider rejec
 
 `tools.args` and `tools.env` replace the base `args` and `env` for tool kinds; they never extend them, so base restrictions such as plan mode or deny-all permissions do not leak into tools mode and tools flags never reach the tool-free kinds. `tools.args` may use the base placeholders plus `{clone}`, the provider's work tree. File transport still requires `{request_file}`. `pass_env` lists environment variables to keep even though they match Relay's secret filter (names containing `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `PRIVATE_KEY`; `GIT_*` and `SSH_AUTH_SOCK` are always removed). Every tools mode must keep the same contract: run only in the given clone, report through the adapter's existing output decoder, and fail (nonzero exit or empty output) rather than succeed silently when a tool call is denied.
 
+## Log budget, truncation, and stops
+
+Relay streams a provider's stdout and stderr through a bounded writer instead of letting the CLI write the log files directly. A verbose provider is never stopped for being verbose. Cursor's `stream-json` output, for example, repeats every tool result in full, and a long `execute` run can exceed 4 MB of output.
+
+- **Per-event truncation.** A JSONL event larger than `max_event_bytes` is re-serialized with its longest string values clipped. Its keys, `type`, and `subtype` are kept, and a `relay_truncated_bytes` field records how much was removed. In practice this clips Cursor's `tool_call`/`completed` results first, because they are the large events. Lines that are not JSON pass through unchanged.
+- **Protected events.** Relay never truncates or drops the events a decoder depends on:
+  - `cursor-jsonl` and `agy-jsonl`: the terminal `result` event;
+  - `opencode-jsonl`: every `text` event, and every event that has a `type` of `error` or an `error` key.
+
+  Each decoder therefore still finds the final answer, and still reports a provider failure.
+- **Persisted cap.** stderr gets an eighth of `max_log_bytes` and stdout the rest, so the two log files together stay under `max_log_bytes`. Once stdout reaches three quarters of its share, unprotected events are dropped; the last quarter is reserved for protected events. A `text` stream (and stderr) keeps its first half and its last lines, with a `[agent-relay dropped N lines, B bytes]` marker between them, so a final answer printed last survives. A text line longer than `max_event_bytes` is cut on a UTF-8 boundary.
+- **Runaway ceiling.** Relay stops the worker only when the raw output passes `hard_ceiling_bytes`, which is 16 × `max_log_bytes`. This is a genuine runaway rather than verbosity.
+
+| Budget | `read`, `review`, `patch`, `chaos` | `probe`, `execute` |
+| --- | --- | --- |
+| `max_log_bytes` | 4,000,000 | 16,000,000 |
+| `max_event_bytes` | 32,000 | 64,000 |
+| `hard_ceiling_bytes` | 64,000,000 | 256,000,000 |
+
+An adapter may override the defaults for every kind:
+
+```json
+"limits": {"max_log_bytes": 32000000, "max_event_bytes": 128000}
+```
+
+Both keys are optional and must be positive integers. `--max-log-bytes` and `--max-event-bytes` on `run`, `submit`, and `dispatch` take precedence over the adapter, which takes precedence over the kind's default. `max_event_bytes` must be at least 1024 and at most a quarter of `max_log_bytes`. Every `result.json` records:
+
+- `log_budget`: the effective values, plus `sources`, which says whether each value came from `cli`, `adapter`, or `kind`;
+- `log_stats`: for stdout and stderr, the bytes received and written, and the number of events and bytes truncated or dropped.
+
+Relay's own setup and check commands and its git calls do not use the budget. Their output is either complete or refused: checks keep a 1 MB limit and git an 8 MB one, and passing that limit stops the command.
+
+**Stops never lose work.** Relay records a stop as one of three results:
+
+- Provider timeout: `status: "stopped"`, `stop_reason: "timeout"`.
+- Runaway output: `status: "stopped"`, `stop_reason: "runaway_output"`.
+- Cancellation, whether by `cancel` or by a signal to the runner: `status: "cancelled"`, `stop_reason: "cancelled"`. This happens even when the cancellation arrives during Relay checks.
+
+Before it discards the clone of a stopped tool run, Relay captures it with the same rules as a successful run. It writes `changes.diff` and records `diff_path`, `files_changed`, `tracked_changes`, `untracked_files`, and `violations`. If that capture fails, Relay records `capture_error`.
+
+Relay also decodes whatever answer the log holds:
+
+- Cursor: the `assistant` messages;
+- OpenCode: the `text` events;
+- Antigravity: the `result` event;
+- `text`: the raw output.
+
+It writes that answer to `partial-answer.txt` and records `partial_answer` and `partial_answer_path`. If the provider had already finished, as with a cancellation during checks, Relay writes its full answer to `answer.txt` and records it as `provider_claims`.
+
+Relay removes the clone of a stopped run. To recover the work, read the stopped result's `changes.diff` and apply it yourself:
+
+```sh
+git apply --check /abs/path/output/changes.diff
+git apply /abs/path/output/changes.diff
+```
+
+Then rerun the checks yourself. A stopped job's job status is `failed`, and `relay.py result JOB_ID` still returns its `result.json`.
+
 ## Kinds
 
 | Kind | Tools | Runs in | Result |
@@ -66,7 +124,7 @@ The `probe` and `execute` kinds need a tools mode. Without one, a provider rejec
 | `probe` | adapter `tools` | a throwaway clone at `--ref` | `schema_version: 2`; any tracked or `.git` change is a `violation` |
 | `execute` | adapter `tools` | a throwaway clone at `--ref`; requires `--owns GLOB` | `schema_version: 2`; any change outside `--owns` or under `.git` is a `violation`; the clone is kept until `cleanup` |
 
-Tool kinds accept `--ref` (default `HEAD`), repeatable `--setup CMD` and `--check CMD`, and `--check-timeout SECONDS` (default 180, separate from the provider `--timeout`). Setup runs before the provider and checks after it, through Relay's runner with `shlex` splitting and no shell. Their request lists `--files` as starting points instead of bundling contents; each must be a file in the pinned commit, not merely in the current checkout. Relay captures the clone again after its checks, so a change a check makes is judged and appears in `changes.diff` (`check_side_effects` lists the paths it added or removed). Results add `ref`, `sha`, `clone` (execute), `diff_path` (`changes.diff`), `files_changed`, `tracked_changes`, `untracked_files`, `violations`, `checks` (Relay's own runs: command, exit code, duration, output tail), `provider_claims` (the provider's answer, unverified), `env_removed`, and `status` (`ok`, `violation`, `check_failed`, `error`, or `cancelled`). See [ADR 0001](../docs/adr/0001-tool-enabled-workers.md).
+Tool kinds accept `--ref` (default `HEAD`), repeatable `--setup CMD` and `--check CMD`, and `--check-timeout SECONDS` (default 180, separate from the provider `--timeout`). Setup runs before the provider and checks after it, through Relay's runner with `shlex` splitting and no shell. Their request lists `--files` as starting points instead of bundling contents; each must be a file in the pinned commit, not merely in the current checkout. Relay captures the clone again after its checks, so a change a check makes is judged and appears in `changes.diff` (`check_side_effects` lists the paths it added or removed). Results add `ref`, `sha`, `clone` (execute), `diff_path` (`changes.diff`), `files_changed`, `tracked_changes`, `untracked_files`, `violations`, `checks` (Relay's own runs: command, exit code, duration, output tail), `provider_claims` (the provider's answer, unverified), `env_removed`, `log_budget`, `log_stats`, and `status` (`ok`, `violation`, `check_failed`, `error`, `stopped`, or `cancelled`; a stop also records `stop_reason`). See [ADR 0001](../docs/adr/0001-tool-enabled-workers.md).
 
 ## Invocation
 

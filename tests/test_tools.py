@@ -71,6 +71,19 @@ elif mode == "sleep":
 elif mode == "cancel":
     pathlib.Path(os.environ["FAKE_CANCEL"]).write_text("cancel", encoding="utf-8")
     time.sleep(30)
+elif mode == "edit-sleep":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    print("edited app.py, still working", flush=True)
+    time.sleep(30)
+elif mode == "edit-cancel":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    print("edited app.py", flush=True)
+    pathlib.Path(os.environ["FAKE_CANCEL"]).write_text("cancel", encoding="utf-8")
+    time.sleep(30)
+elif mode == "edit-flood":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    while True:
+        sys.stdout.write("noise " * 10000 + "\\n")
 else:
     raise SystemExit(f"unknown FAKE_MODE {mode}")
 """
@@ -250,11 +263,62 @@ class ToolsTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(list(self.clones.iterdir()), [])
 
-    def test_provider_timeout_is_an_error_and_keeps_logs(self) -> None:
+    def test_provider_timeout_is_a_stop_and_keeps_logs(self) -> None:
         result = self.run_kind("probe", "sleep", timeout=1)
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["stop_reason"], "timeout")
         self.assertEqual(list(self.clones.iterdir()), [])
         self.assertTrue((Path(result["output_dir"]) / "stderr.log").is_file())
+
+    def assert_edit_salvaged(self, result: dict[str, Any]) -> None:
+        diff_path = Path(result["diff_path"])
+        self.assertEqual(diff_path, Path(result["output_dir"]) / "changes.diff")
+        self.assertIn("+    return 2", diff_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["files_changed"], ["app.py"])
+        self.assertEqual(result["violations"], [])
+        self.assertIsNone(result["clone"])
+        self.assertEqual(list(self.clones.iterdir()), [])
+        recorded = json.loads((Path(result["output_dir"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(recorded["stop_reason"], result["stop_reason"])
+        self.assertEqual(self._status(), "")
+
+    def test_timeout_keeps_the_workers_diff_and_partial_answer(self) -> None:
+        result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assert_edit_salvaged(result)
+        self.assertIn("still working", result["partial_answer"])
+        self.assertIn("still working", Path(result["partial_answer_path"]).read_text(encoding="utf-8"))
+
+    def test_cancellation_keeps_the_workers_diff(self) -> None:
+        cancel_file = self.directory / "cancel.request"
+        args = self.make_args("execute", owns=["app.py"])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        environment = {
+            "FAKE_MODE": "edit-cancel",
+            "FAKE_CANCEL": str(cancel_file),
+            "AGENT_RELAY_CLONES_DIR": str(self.clones),
+        }
+        with mock.patch.dict(os.environ, environment):
+            result = run_prepared(task, output, cancel_file)
+        self.assertEqual((result["status"], result["stop_reason"]), ("cancelled", "cancelled"))
+        self.assert_edit_salvaged(result)
+
+    def test_runaway_output_keeps_the_workers_diff(self) -> None:
+        result = self.run_kind("execute", "edit-flood", owns=["app.py"], max_log_bytes=200_000, max_event_bytes=10_000)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "runaway_output"))
+        self.assert_edit_salvaged(result)
+        self.assertLessEqual((Path(result["output_dir"]) / "stdout.log").stat().st_size, 200_000)
+        self.assertEqual(result["log_budget"]["max_log_bytes"], 200_000)
+        self.assertGreater(result["log_stats"]["stdout"]["dropped_bytes"], 0)
+
+    def test_tool_results_record_the_effective_log_budget(self) -> None:
+        result = self.run_kind("execute", "edit", owns=["app.py"])
+        self.assertEqual(result["log_budget"]["sources"], {"max_log_bytes": "kind", "max_event_bytes": "kind"})
+        self.assertGreater(result["log_budget"]["hard_ceiling_bytes"], result["log_budget"]["max_log_bytes"])
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(Path(result["clone"]).parent)
 
     def test_cancellation_removes_the_clone(self) -> None:
         cancel_file = self.directory / "cancel.request"
@@ -287,6 +351,9 @@ class ToolsTests(unittest.TestCase):
             result = run_prepared(task, output, cancel_file)
         self.assertEqual(result["status"], "cancelled")
         self.assertLess(result["duration_seconds"], 15)
+        self.assertEqual(result["stop_reason"], "cancelled")
+        self.assertIn("app.py", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertIn("edited app.py", result["provider_claims"])
         self.assertIsNone(result["clone"])
         self.assertEqual(list(self.clones.iterdir()), [])
 

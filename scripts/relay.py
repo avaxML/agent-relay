@@ -42,6 +42,20 @@ def nonnegative_int(value: str) -> int:
     return number
 
 
+def add_log_budget_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-log-bytes",
+        type=positive_int,
+        help="Persisted provider log budget; defaults to the adapter's limits, else 4 MB (16 MB for probe/execute).",
+    )
+    parser.add_argument(
+        "--max-event-bytes",
+        type=positive_int,
+        help="Size above which one provider event is truncated; defaults to the adapter's limits, else 32 KB "
+        "(64 KB for probe/execute).",
+    )
+
+
 def inspect_provider(
     name: str,
     custom: Path | None,
@@ -137,6 +151,7 @@ def main() -> int:
                 default=180,
                 help="Seconds for each Relay setup/check command; separate from --timeout.",
             )
+            add_log_budget_arguments(sub)
         if command == "submit":
             sub.add_argument("--jobs-dir", type=Path)
     adapter = commands.add_parser("adapter")
@@ -175,6 +190,7 @@ def main() -> int:
     fanout.add_argument("--check-timeout", type=positive_int, default=180)
     fanout.add_argument("--max-input-bytes", type=positive_int, default=400000)
     fanout.add_argument("--max-answer-chars", type=positive_int, default=12000)
+    add_log_budget_arguments(fanout)
     gather = commands.add_parser("collect")
     gather.add_argument("--dispatch", type=Path, required=True)
     gather.add_argument("--timeout", type=nonnegative_int, default=600)
@@ -215,6 +231,8 @@ def main() -> int:
                 "check_timeout": args.check_timeout,
                 "max_input_bytes": args.max_input_bytes,
                 "max_answer_chars": args.max_answer_chars,
+                "max_log_bytes": args.max_log_bytes,
+                "max_event_bytes": args.max_event_bytes,
             }
             ledger_path = dispatch.create(
                 args.manifest,

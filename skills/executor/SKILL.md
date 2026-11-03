@@ -46,6 +46,8 @@ python3 <plugin-root>/scripts/relay.py dispatch --manifest /abs/tasks/manifest.j
 
 Assignment is equal. Each task without an explicit `provider` goes to the eligible provider with the fewest assigned tasks; ties follow the `--providers` order. The per-provider cap holds work back instead of skewing it. A task that no provider can take is recorded under `needs_native_fallback` with its task file and reason; Relay never drops it and never runs it elsewhere. Save the printed ledger path. Dispatch snapshots every task file into the dispatch directory, so editing or deleting the originals later does not change held-back tasks, and gives each task a fixed output directory, so a task is never submitted twice. If a run crashed mid-submit, `collect` recovers the job from that directory or resubmits a task that never launched; an outcome it cannot establish stays `submitting` and keeps `collect` from reporting completion.
 
+`dispatch` also accepts `--max-log-bytes` and `--max-event-bytes`. Verbose provider output is truncated and counted rather than stopped, so these flags are rarely needed.
+
 Slow levels (Cursor `xhigh`, OpenCode `max`) can run for several minutes; do not escalate to them unless the user asks. Pass `--effort` or `--model` per task in the manifest when needed.
 
 ## 4. Collect
@@ -60,7 +62,7 @@ python3 <plugin-root>/scripts/relay.py collect --dispatch /abs/path/ledger.json 
 
 For every task:
 
-1. Read `result.json`: `status`, `violations`, `checks`, `provider_claims`, `env_removed`. Treat `provider_claims` as unverified.
+1. Read `result.json`: `status`, `stop_reason`, `violations`, `checks`, `provider_claims`, `env_removed`, `log_stats`. Treat `provider_claims` and `partial_answer` as unverified. A `stopped` or `cancelled` task still has a `changes.diff` holding the worker's edits up to the stop, but its checks never ran. Treat it as unfinished work to recover: read the diff, apply it, finish or re-dispatch the rest, and run the checks yourself.
 2. Read the whole `changes.diff`. Confirm it touches only owned paths and does what the task asked.
 3. Confirm Relay's checks ran and passed. `check_failed` or `violation` is never acceptable as is.
 4. Apply in the real checkout with `git apply --check changes.diff`, then `git apply changes.diff`, then rerun the checks there yourself.

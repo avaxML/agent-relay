@@ -9,7 +9,7 @@ import re
 import stat
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from string import Formatter
 from typing import Any
@@ -20,6 +20,7 @@ TOOLS_PLACEHOLDERS = PLACEHOLDERS | {"clone"}
 BLANKET_FLAGS = frozenset(
     {"--force", "--yolo", "--trust", "--auto", "--auto-review", "--dangerously-skip-permissions", "--approve-mcps"}
 )
+LIMIT_FIELDS = frozenset({"max_log_bytes", "max_event_bytes"})
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -27,8 +28,19 @@ class RelayError(Exception):
     """A delegation cannot produce a usable result."""
 
 
-class RelayCancelled(RelayError):
+class RelayStopped(RelayError):
+    """Relay stopped a running provider; the worker's partial work may still be salvaged."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class RelayCancelled(RelayStopped):
     """The owner requested that the worker stop."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, "cancelled")
 
 
 def bundled_adapter_directory() -> Path:
@@ -69,8 +81,9 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         "models_args",
         "probe_args",
     }
-    if not isinstance(adapter, dict) or not required <= set(adapter) or set(adapter) - required - {"effort", "tools"}:
-        raise RelayError(f"Adapter requires {', '.join(sorted(required))}; only effort and tools are optional.")
+    optional = {"effort", "tools", "limits"}
+    if not isinstance(adapter, dict) or not required <= set(adapter) or set(adapter) - required - optional:
+        raise RelayError(f"Adapter requires {', '.join(sorted(required))}; only effort, tools and limits are optional.")
     if adapter["name"] != name:
         raise RelayError("Adapter name does not match --provider.")
     for field in ("name", "executable", "default_model"):
@@ -96,7 +109,17 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         validate_effort(adapter["effort"])
     if "tools" in adapter:
         validate_tools(adapter["tools"], adapter["input"])
+    if "limits" in adapter:
+        validate_limits(adapter["limits"])
     return adapter
+
+
+def validate_limits(config: Any) -> None:
+    if not isinstance(config, dict) or set(config) - LIMIT_FIELDS:
+        raise RelayError("Adapter limits may set only max_log_bytes and max_event_bytes.")
+    for field, value in config.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RelayError(f"Adapter limits.{field} must be a positive integer number of bytes.")
 
 
 def _check_placeholders(values: list[str], allowed: frozenset[str]) -> None:
@@ -449,3 +472,46 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if not isinstance(answer, str) or not answer.strip():
         raise RelayError("Worker returned no answer.")
     return answer.strip(), metadata
+
+
+def _decodable_events(raw: str) -> list[dict[str, Any]]:
+    events = []
+    for line in raw.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def decode_partial(raw: str, output: str) -> str | None:
+    """Best-effort answer from a stopped worker's log; malformed or missing events are skipped."""
+    with suppress(RelayError):
+        return decode_response(raw, output)[0]
+    if output == "text":
+        return raw.strip() or None
+    events = _decodable_events(raw)
+    parts: list[Any] = []
+    if output == "cursor-jsonl":
+        for event in events:
+            message = event.get("message")
+            if (
+                event.get("type") == "assistant"
+                and isinstance(message, dict)
+                and isinstance(message.get("content"), list)
+            ):
+                parts += [item.get("text") for item in message["content"] if isinstance(item, dict)]
+    elif output == "agy-jsonl":
+        for event in events:
+            result = event.get("result")
+            if event.get("event") == "result" and isinstance(result, dict):
+                parts.append(result.get("response"))
+    else:
+        for event in events:
+            part = event.get("part")
+            if event.get("type") == "text" and isinstance(part, dict):
+                parts.append(part.get("text"))
+    answer = "\n".join(part for part in parts if isinstance(part, str)).strip()
+    return answer or None

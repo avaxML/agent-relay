@@ -325,11 +325,6 @@ class BoundedLogTests(unittest.TestCase):
         with self.assertRaisesRegex(RelayError, "malformed JSON"):
             decode_response(self.path.read_text(encoding="utf-8"), "cursor-jsonl")
 
-    def test_a_whitespace_only_text_overflow_is_not_a_lost_answer(self) -> None:
-        log = self.write("text", [b" " * 30_000 + b"\n", b"answer\n"], 20_000, 1_024)
-        self.assertEqual(log.stats["truncated_answer_events"], 0)
-        self.assertEqual(log.stats["truncated_events"], 1)
-
     def test_clipping_finds_a_fit_when_short_strings_dominate(self) -> None:
         event = {"type": "result", "result": "R" * 30_000, **{f"m{index}": "v" for index in range(559)}}
         line = json.dumps(event).encode()
@@ -338,21 +333,45 @@ class BoundedLogTests(unittest.TestCase):
         self.assertLessEqual(len(shrunk), 6_143)
         self.assertEqual(json.loads(shrunk)["m0"], "v")
 
-    def test_unicode_whitespace_overflow_is_not_a_lost_answer(self) -> None:
-        log = self.write("text", [b"done\n", "\u00a0".encode() * 30_000 + b"\n"], 20_000, 1_024)
-        self.assertEqual(log.stats["truncated_answer_events"], 0)
-
     def test_the_tail_uses_head_space_the_head_left_unused(self) -> None:
         chunks = [b"a" * 1_000 + b"\n", b"b" * 87_000 + b"\n", b"c" * 60_000 + b"\n"]
         log = self.write("text", chunks, 175_000, 8_000)
         self.assertEqual(log.stats["dropped_answer_events"], 0)
         self.assertEqual(len(self.path.read_bytes()), 148_003)
 
-    def test_trimming_only_whitespace_lines_is_not_a_lost_answer(self) -> None:
-        chunks = [b"h" * 10_000 + b"\n", *([b" " * 3_000 + b"\n"] * 20), b"answer\n"]
+    def test_any_text_loss_counts_even_whitespace(self) -> None:
+        # Oracle's witness: dropping only whitespace still detached the first paragraph from the decoded tail.
+        chunks = [b"first answer paragraph\n", *([b" " * 3_000 + b"\n"] * 20), b"second answer paragraph\n"]
         log = self.write("text", chunks, 20_000, 1_024)
-        self.assertGreater(log.stats["dropped_events"], 0)
-        self.assertEqual(log.stats["dropped_answer_events"], 0)
+        self.assertGreater(log.stats["dropped_answer_events"], 0)
+
+    def test_a_text_line_that_fits_the_log_is_never_cut(self) -> None:
+        log = self.write("text", [b"x" * 12_000 + b"\n"], 20_000, 1_024)
+        self.assertEqual(log.stats["truncated_answer_events"], 0)
+        self.assertEqual(len(self.path.read_bytes()), 12_001)
+
+    def test_a_text_run_without_loss_decodes_the_whole_log(self) -> None:
+        log = self.write("text", [b"head\n", b"y" * 15_000 + b"\n", b"end\n"], 20_000, 1_024)
+        self.assertEqual(log.stats["dropped_events"] + log.stats["truncated_answer_events"], 0)
+        answer = decode_response(provider_stdout(self.path.parent, {"stdout": log.stats}), "text")[0]
+        self.assertTrue(answer.startswith("head") and answer.endswith("end"))
+
+    def test_invalid_utf8_is_never_blank(self) -> None:
+        log = BoundedLog(self.path, "cursor-jsonl", 200_000, 4_000)
+        log.feed(b" " * 300_000)
+        log.feed(b"\xff\n")
+        log.feed(cursor_stream(0)[-1])
+        log.close()
+        self.assertEqual(log.stats["dropped_answer_events"], 1)
+
+    def test_writer_and_decoder_agree_on_event_framing(self) -> None:
+        event = {"type": "tool_call", "out": "a\u2028b" + "x" * 20_000}
+        raw = json.dumps(event, ensure_ascii=False).encode() + b"\n"
+        self.write("cursor-jsonl", [raw, cursor_stream(0)[-1]], 1_000_000, 4_000)
+        self.assertEqual(decode_response(self.path.read_text(encoding="utf-8"), "cursor-jsonl")[0], "final answer")
+        self.assertEqual(
+            decode_response(b"".join([raw, cursor_stream(0)[-1]]).decode(), "cursor-jsonl")[0], "final answer"
+        )
 
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)

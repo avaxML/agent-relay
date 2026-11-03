@@ -51,8 +51,11 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _blank(data: bytes | bytearray) -> bool:
-    """Whitespace only, by the decoders' Unicode rules (a non-breaking space counts); split characters are ignored."""
-    return not bytes(data).decode("utf-8", "ignore").strip()
+    """Whitespace only, by the decoders' Unicode rules. Bytes that are not valid UTF-8 are never blank."""
+    try:
+        return not bytes(data).decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return False
 
 
 def _utf8_prefix(data: bytes, limit: int) -> bytes:
@@ -164,8 +167,8 @@ class BoundedLog:
         if self.protected is None:
             self.head_limit = max_bytes // 2
             self.tail_limit = max_bytes - self.head_limit - 128
-            # A text answer can be one long line, so cut a line only when it could not fit in the tail at all.
-            self.line_limit = self.tail_limit
+            # A text answer can be one long line, so a line is cut only when it could not fit in the whole log.
+            self.line_limit = max_bytes - 128
         else:
             self.reserve = max_bytes // 4
             self.line_limit = max_bytes
@@ -300,28 +303,30 @@ class BoundedLog:
                 # The decoder would have rejected this line; dropping it must not turn a protocol error into success.
                 self.stats["dropped_malformed_events"] += 1
 
+    # Text has no framing, so Relay cannot tell which lines were the answer: any byte cut or dropped from a text
+    # stdout, whitespace included, counts as answer loss, and invoke_provider fails the run.
     def _text_line(self, line: bytes, overflowed: bool) -> None:
         if overflowed or len(line) > self.line_limit:
-            body = line.removesuffix(b"\n")
-            kept = _utf8_prefix(body, self.line_limit - 1)
-            # The end of the line is lost, and a text answer often ends there (unless it was only whitespace).
-            if not (overflowed and self.overflow_blank):
-                self.stats["truncated_answer_events"] += 1
-            self.stats["truncated_events"] += 1
-            self.stats["truncated_bytes"] += len(body) - len(kept)
-            kept += b"\n"
-            line = kept
+            line = self._cut(line, self.line_limit)
         if not self.tail and self.written + len(line) <= self.head_limit:
             self._write(line)
             return
         if not self.tail:
             # The tail gets everything the head left unused, not only its fixed half.
             self.tail_limit = self.max_bytes - self.written - 128
+        if len(line) > self.tail_limit:
+            line = self._cut(line, self.tail_limit)
         self.tail += line
-        # Without framing, text cannot show which lines were its answer, so any line dropped from stdout makes
-        # the answer unprovable; invoke_provider fails the run and keeps the tail as the partial answer.
         if len(self.tail) > 2 * self.tail_limit:
             self._trim_tail()
+
+    def _cut(self, line: bytes, limit: int) -> bytes:
+        body = line.removesuffix(b"\n")
+        kept = _utf8_prefix(body, limit - 1)
+        self.stats["truncated_answer_events"] += 1
+        self.stats["truncated_events"] += 1
+        self.stats["truncated_bytes"] += len(body) - len(kept)
+        return kept + b"\n"
 
     def _trim_tail(self) -> None:
         """Drop whole lines from the front until the tail fits; every line fits on its own."""
@@ -333,8 +338,7 @@ class BoundedLog:
         cut = self.tail.find(b"\n", excess - 1) + 1
         lines = self.tail.count(b"\n", 0, cut)
         self.stats["dropped_events"] += lines
-        if not _blank(self.tail[:cut]):
-            self.stats["dropped_answer_events"] += lines
+        self.stats["dropped_answer_events"] += lines
         self.stats["dropped_bytes"] += cut
         del self.tail[:cut]
 

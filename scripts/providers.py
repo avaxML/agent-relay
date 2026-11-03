@@ -429,7 +429,7 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             raise RelayError("Worker returned no text.")
         return raw.strip(), {}
     events = []
-    for line in raw.splitlines():
+    for line in raw.split("\n"):  # LF only, exactly as the bounded writer frames events
         if not line.strip():
             continue
         try:
@@ -514,7 +514,7 @@ def event_classifier(output: str) -> Callable[[dict[str, Any]], int] | None:
 
 def _decodable_events(raw: str) -> list[dict[str, Any]]:
     events = []
-    for line in raw.splitlines():
+    for line in raw.split("\n"):
         try:
             event = json.loads(line)
         except (ValueError, RecursionError):

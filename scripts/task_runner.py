@@ -138,15 +138,15 @@ def resolve_log_budget(
             budget[name], budget["sources"][name] = limits[name], "adapter"
         else:
             budget[name], budget["sources"][name] = default, "kind"
+
+    def origin(name: str) -> str:
+        source = budget["sources"][name]
+        flag = "--" + name.replace("_", "-")
+        return {"cli": flag, "adapter": f"adapter limits.{name}", "kind": f"the {kind} default"}[source]
+
     if budget["max_log_bytes"] > MAX_LOG_BYTES:
-        raise RelayError(f"max_log_bytes must be at most {MAX_LOG_BYTES} (1 TiB).")
+        raise RelayError(f"max_log_bytes from {origin('max_log_bytes')} must be at most {MAX_LOG_BYTES} (1 TiB).")
     if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
-
-        def origin(name: str) -> str:
-            source = budget["sources"][name]
-            flag = "--" + name.replace("_", "-")
-            return {"cli": flag, "adapter": f"adapter limits.{name}", "kind": f"the {kind} default"}[source]
-
         raise RelayError(
             "max_event_bytes must be at least 1024 and at most a quarter of max_log_bytes; got "
             f"{budget['max_event_bytes']} from {origin('max_event_bytes')} and "
@@ -565,6 +565,7 @@ def salvage(
     clone: Clone | None,
     before: dict[str, str] | None,
     answer: str | None,
+    provider_capture: Capture | None = None,
 ) -> None:
     """Keep a stopped or failed worker's edits and words before Relay discards its clone."""
     try:
@@ -578,15 +579,21 @@ def salvage(
             else:
                 try:
                     _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+                    if provider_capture is not None:
+                        # Stopped during checks: say which changes the checks, not the worker, made.
+                        result["check_side_effects"] = sorted(
+                            set(_captured_paths(captured)) ^ set(_captured_paths(provider_capture))
+                        )
                 except (RelayError, OSError, ValueError) as exc:
                     # The clone is kept (no diff_path); still try to save the worker's words below.
                     result["salvage_error"] = str(exc)
         limit = task["max_answer_chars"]
         if answer is not None:
-            answer_path = output / "answer.txt"
-            answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
+            # Fields first: a failed file write must not also lose the text from result.json.
             field = "provider_claims" if "tools" in task else "answer"
             result.update({field: answer[:limit], f"{field}_truncated": len(answer) > limit})
+            answer_path = output / "answer.txt"
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
             result["answer_path"] = str(answer_path)
             return
         partial = (
@@ -597,14 +604,14 @@ def salvage(
             else None
         )
         if partial:
-            partial_path = output / "partial-answer.txt"
-            partial_path.write_text(partial + "\n", encoding="utf-8", errors="replace")
             result.update(
                 # The end, not the start: a stopped run's latest words are what the lead needs.
                 partial_answer=partial[-limit:],
                 partial_answer_truncated=len(partial) > limit,
-                partial_answer_path=str(partial_path),
             )
+            partial_path = output / "partial-answer.txt"
+            partial_path.write_text(partial + "\n", encoding="utf-8", errors="replace")
+            result["partial_answer_path"] = str(partial_path)
     except (RelayError, OSError, ValueError) as exc:
         result["salvage_error"] = str(exc)
 
@@ -618,6 +625,7 @@ def run_prepared(
     clone: Clone | None = None
     before: dict[str, str] | None = None
     answer: str | None = None
+    provider_capture: Capture | None = None
     try:
         if "tools" in task:
             options = task["tools"]
@@ -741,36 +749,39 @@ def run_prepared(
         # User cancellation keeps its job-level meaning; timeouts and runaways are a distinct terminal status.
         status = "cancelled" if isinstance(exc, RelayCancelled) else "stopped"
         result.update(status=status, stop_reason=exc.reason, error=str(exc))
-        salvage(task, result, output, clone, before, answer)
+        salvage(task, result, output, clone, before, answer, provider_capture)
     except (RelayError, OSError, ValueError) as exc:
         result.update(status="error", error=str(exc))
         # A provider that edited the clone and then exited nonzero or returned no answer still keeps its edits.
-        salvage(task, result, output, clone, before, answer)
+        salvage(task, result, output, clone, before, answer, provider_capture)
     except KeyboardInterrupt:
         result.update(
             status="cancelled", stop_reason="cancelled", error="Delegation interrupted; worker process group stopped."
         )
-        salvage(task, result, output, clone, before, answer)
+        salvage(task, result, output, clone, before, answer, provider_capture)
     except Exception as exc:
         # Never publish "running" for a finished run; keep the work, then surface the bug to the caller.
         result.update(status="error", error=f"Internal error: {exc!r}")
-        salvage(task, result, output, clone, before, answer)
+        salvage(task, result, output, clone, before, answer, provider_capture)
         raise
     finally:
         # Once the provider has run, the clone is the only copy of its work until changes.diff is written; a
         # failed capture, a failed write, or a second interrupt during salvage therefore keeps it for recovery.
-        if clone is not None and before is not None and "diff_path" not in result:
-            result["clone"] = str(clone.work)
-        elif clone is not None and not (
-            result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}
-        ):
-            try:
-                remove_clone(clone.directory)
-            except (RelayError, OSError) as exc:
-                result["cleanup_error"] = str(exc)
-            result["clone"] = None
-        result["duration_seconds"] = round(time.monotonic() - started, 3)
-        write_json(output / "result.json", result)
+        try:
+            if clone is not None and before is not None and "diff_path" not in result:
+                result["clone"] = str(clone.work)
+            elif clone is not None and not (
+                result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}
+            ):
+                try:
+                    remove_clone(clone.directory)
+                except (RelayError, OSError) as exc:
+                    result["cleanup_error"] = str(exc)
+                result["clone"] = None
+        finally:
+            # Published even if a second signal interrupts the clone removal.
+            result["duration_seconds"] = round(time.monotonic() - started, 3)
+            write_json(output / "result.json", result)
     return result
 
 

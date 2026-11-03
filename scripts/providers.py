@@ -524,6 +524,17 @@ def _decodable_events(raw: str) -> list[dict[str, Any]]:
     return events
 
 
+def _assistant_texts(event: dict[str, Any]) -> list[Any]:
+    message = event.get("message")
+    if (
+        event.get("type") != "assistant"
+        or not isinstance(message, dict)
+        or not isinstance(message.get("content"), list)
+    ):
+        return []
+    return [item.get("text") for item in message["content"] if isinstance(item, dict)]
+
+
 def decode_partial(raw: str, output: str) -> str | None:
     """Best-effort answer from a stopped worker's log; malformed or missing events are skipped."""
     if output == "text":
@@ -538,16 +549,17 @@ def decode_partial(raw: str, output: str) -> str | None:
             return decode_response(raw, output)[0]
     parts: list[Any] = []
     if output == "cursor-jsonl":
-        if clipped and any(event.get("type") == "assistant" for event in events):
+        # Drop the clipped result only when unclipped assistant messages actually carry text.
+        if clipped and any(
+            isinstance(text, str) and text.strip()
+            for event in events
+            if "relay_truncated_bytes" not in event
+            for text in _assistant_texts(event)
+        ):
             events = [event for event in events if event.get("type") != "result"]
         for event in events:
-            message = event.get("message")
-            if (
-                event.get("type") == "assistant"
-                and isinstance(message, dict)
-                and isinstance(message.get("content"), list)
-            ):
-                parts += [item.get("text") for item in message["content"] if isinstance(item, dict)]
+            if event.get("type") == "assistant":
+                parts += _assistant_texts(event)
             elif event.get("type") == "result":
                 # A failed or malformed result still carries the provider's last words.
                 parts.append(event.get("result"))

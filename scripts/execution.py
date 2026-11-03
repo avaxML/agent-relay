@@ -110,11 +110,17 @@ def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: b
     """
 
     def render(candidate: dict[str, Any]) -> bytes:
-        marked = {**candidate, "relay_truncated_bytes": original}
-        # ASCII escapes keep a lone surrogate from a provider from failing the encode.
-        data = json.dumps(marked, separators=(",", ":")).encode()
-        marked["relay_truncated_bytes"] = max(0, original - len(data) - 1)
-        return json.dumps(marked, separators=(",", ":")).encode() + b"\n"
+        marked = {**candidate, "relay_truncated_bytes": 0}
+        # ASCII escapes keep a lone surrogate from a provider from failing the encode. The marker's own digits
+        # change the length, so settle on the value that matches the final line (a few rounds at most).
+        data = b""
+        for _ in range(4):
+            data = json.dumps(marked, separators=(",", ":")).encode() + b"\n"
+            removed = max(0, original - len(data))
+            if removed == marked["relay_truncated_bytes"]:
+                break
+            marked["relay_truncated_bytes"] = removed
+        return data
 
     best: bytes | None = None
     try:
@@ -348,13 +354,20 @@ class BoundedLog:
         return kept + b"\n"
 
     def _trim_tail(self) -> None:
-        """Drop whole lines from the front until the tail fits; every line fits on its own."""
+        """Drop whole lines from the front until the tail fits."""
         if not self.tail:
             return
         excess = len(self.tail) - self.tail_limit
         if excess <= 0:
             return
         cut = self.tail.find(b"\n", excess - 1) + 1
+        if cut == 0 or cut >= len(self.tail):
+            # Only the last line is left and it alone is too long (the marker's room was taken after it was
+            # accepted): keep its end, where a text answer usually is, from a character boundary.
+            cut = excess
+            while cut < len(self.tail) and self.tail[cut] & 0xC0 == 0x80:
+                cut += 1
+            self.stats["dropped_answer_events"] += 1
         lines = self.tail.count(b"\n", 0, cut)
         self.stats["dropped_events"] += lines
         self.stats["dropped_answer_events"] += lines

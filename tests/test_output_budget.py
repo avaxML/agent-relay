@@ -393,6 +393,30 @@ class BoundedLogTests(unittest.TestCase):
         log = self.write("cursor-jsonl", [line, cursor_stream(0)[-1]], 20_000, 1_024)
         self.assertEqual(log.stats["dropped_answer_events"], 0)
 
+    def test_marker_room_never_deletes_a_long_final_line(self) -> None:
+        # Head 9,001 bytes; the tail drops a 6,001-byte line at close, then must reserve marker room inside the
+        # one 10,900-byte line that is left.
+        chunks = [b"h" * 9_000 + b"\n", b"m" * 6_000 + b"\n", b"END" * 3_633 + b"\n"]
+        log = self.write("text", chunks, 20_000, 1_024)
+        self.assertGreater(log.stats["dropped_answer_events"], 0)
+        persisted = self.path.read_bytes()
+        self.assertLessEqual(len(persisted), 20_000)
+        self.assertTrue(persisted.rstrip(b"\n").endswith(b"END"))
+
+    def test_an_unterminated_final_line_stays_under_the_cap(self) -> None:
+        chunks = [b"h" * 9_000 + b"\n", b"m" * 6_000 + b"\n", b"END" * 3_633]
+        self.write("text", chunks, 20_000, 1_024)
+        persisted = self.path.read_bytes()
+        self.assertLessEqual(len(persisted), 20_000)
+        self.assertTrue(persisted.endswith(b"END"))
+
+    def test_the_truncation_marker_is_exact(self) -> None:
+        event = {"type": "tool_call", "out": "x" * 1_100}
+        line = json.dumps(event, separators=(",", ":")).encode() + b"\n"
+        shrunk = shrink_event(event, len(line), 1_024)
+        assert shrunk is not None
+        self.assertEqual(json.loads(shrunk)["relay_truncated_bytes"], len(line) - len(shrunk))
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")
@@ -410,6 +434,8 @@ class DecodePartialTests(unittest.TestCase):
         clipped = json.dumps({"type": "result", "subtype": "success", "result": "fin", "relay_truncated_bytes": 9})
         full = cursor_stream(0, "the whole final answer")[-2].decode()
         self.assertEqual(decode_partial(full + clipped + "\n", "cursor-jsonl"), "the whole final answer")
+        tool_only = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read"}]}})
+        self.assertEqual(decode_partial(tool_only + "\n" + clipped + "\n", "cursor-jsonl"), "fin")
         failed = json.dumps({"type": "result", "subtype": "error", "is_error": True, "result": "gave up: quota"})
         self.assertEqual(decode_partial(failed + "\n", "cursor-jsonl"), "gave up: quota")
         huge = '{"type":"tool_call","n":' + "9" * 6_000 + "}"

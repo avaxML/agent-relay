@@ -28,8 +28,9 @@ from providers import (
 DRAIN_SECONDS = 2.0
 TEXT_DROP_MARKER = "[agent-relay dropped {} lines, {} bytes]"
 MARKER_RESERVE = 128
-# Most bytes of one unfinished line held in memory, whatever the log budget; a longer line fails the run closed.
-MAX_LINE_BUFFER = 64 << 20
+# Most bytes of one line held in memory and parsed, whatever the log budget (the default probe/execute budget);
+# a longer JSONL line fails the run closed and a longer text line keeps its end.
+MAX_LINE_BUFFER = 16 << 20
 # Below this, a clipped protected event would carry too little of its answer to be worth writing.
 MIN_PROTECTED_BYTES = 1024
 

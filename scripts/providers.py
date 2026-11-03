@@ -459,7 +459,9 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             raise RelayError("Worker returned no text.")
         return raw.strip(), {}
     # One pass that keeps only what the decision needs, so millions of small events cannot exhaust memory.
-    results: list[Any] = []
+    # Only the first terminal result and a count: more than one is already a failure.
+    first_result: Any = None
+    result_count = 0
     parts: list[Any] = []
     session_ids: set[str] = set()
     failed = False
@@ -474,10 +476,12 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             raise RelayError("Worker event must be an object.")
         if output == "agy-jsonl":
             if event.get("event") == "result":
-                results.append(event.get("result"))
+                result_count += 1
+                first_result = event.get("result") if result_count == 1 else first_result
         elif output == "cursor-jsonl":
             if event.get("type") == "result":
-                results.append(event)
+                result_count += 1
+                first_result = event if result_count == 1 else first_result
         else:
             failed = failed or event.get("type") == "error" or bool(event.get("error"))
             if event.get("type") == "text" and isinstance(event.get("part"), dict):
@@ -485,9 +489,9 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             if isinstance(event.get("sessionID"), str):
                 session_ids.add(event["sessionID"])
     if output == "agy-jsonl":
-        if len(results) != 1 or not isinstance(results[0], dict):
+        if result_count != 1 or not isinstance(first_result, dict):
             raise RelayError("Antigravity did not return exactly one terminal result.")
-        agy_result = results[0]
+        agy_result = first_result
         if agy_result.get("status") != "SUCCESS":
             raise RelayError("Antigravity reported failure; inspect stdout.log.")
         answer = agy_result.get("response")
@@ -495,9 +499,9 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             key: agy_result[key] for key in ("conversation_id", "usage", "duration_seconds") if key in agy_result
         }
     elif output == "cursor-jsonl":
-        if len(results) != 1:
+        if result_count != 1:
             raise RelayError("Cursor did not return exactly one terminal result.")
-        cursor_result = results[0]
+        cursor_result = first_result
         if cursor_result.get("is_error") or cursor_result.get("subtype") != "success":
             raise RelayError("Cursor reported failure; inspect stdout.log.")
         answer = cursor_result.get("result")
@@ -552,25 +556,6 @@ def event_classifier(output: str) -> Callable[[dict[str, Any]], int] | None:
     return EVENT_LEVELS.get(output)
 
 
-def _answer_events(raw: str, output: str) -> list[dict[str, Any]]:
-    """The parseable events that can carry answer text; ordinary events are not kept, bounding memory."""
-    events = []
-    for line in _lines(raw):
-        try:
-            event = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(event, dict) and (
-            event.get("type") in ("result", "assistant")
-            if output == "cursor-jsonl"
-            else event.get("event") == "result"
-            if output == "agy-jsonl"
-            else event.get("type") == "text"
-        ):
-            events.append(event)
-    return events
-
-
 def _assistant_texts(event: dict[str, Any]) -> list[Any]:
     message = event.get("message")
     if (
@@ -582,37 +567,44 @@ def _assistant_texts(event: dict[str, Any]) -> list[Any]:
     return [item.get("text") for item in message["content"] if isinstance(item, dict)]
 
 
+def _answer_texts(event: dict[str, Any], output: str) -> list[Any]:
+    """The answer text one event carries, if any."""
+    if output == "cursor-jsonl":
+        if event.get("type") == "assistant":
+            return _assistant_texts(event)
+        # A failed, malformed or clipped result still carries the provider's last words.
+        return [event.get("result")] if event.get("type") == "result" else []
+    if output == "agy-jsonl":
+        result = event.get("result")
+        return [result.get("response")] if event.get("event") == "result" and isinstance(result, dict) else []
+    part = event.get("part")
+    return [part.get("text")] if event.get("type") == "text" and isinstance(part, dict) else []
+
+
 def decode_partial(raw: str, output: str) -> str | None:
-    """Best-effort answer from a stopped worker's log; malformed or missing events are skipped."""
+    """Best-effort answer from a stopped worker's log; malformed or missing events are skipped.
+
+    One pass that keeps only answer strings, never event objects, so memory stays near the size of the text.
+    """
     if output == "text":
         return raw.strip() or None
-    events = _answer_events(raw, output)
     level = EVENT_LEVELS[output]
-    # A terminal event Relay clipped to fit would decode as if it were whole; then gather every answer text.
-    clipped = [event for event in events if level(event) == TERMINAL and "relay_truncated_bytes" in event]
+    parts: list[str] = []
+    clipped = False
+    for line in _lines(raw):
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        parts += [text for text in _answer_texts(event, output) if isinstance(text, str)]
+        # A terminal event Relay clipped to fit would decode as if it were whole. Then keep every answer text,
+        # assistant and result alike: the clip may have shortened only other fields.
+        clipped = clipped or (level(event) == TERMINAL and "relay_truncated_bytes" in event)
     if not clipped:
         # ValueError and RecursionError: one hostile event (huge integer, deep nesting) must not cost the rest.
         with suppress(RelayError, ValueError, RecursionError):
             return decode_response(raw, output)[0]
-    parts: list[Any] = []
-    if output == "cursor-jsonl":
-        # With a clipped result, keep both the assistant text and what is left of the result: the clip may have
-        # shortened only other fields, and guessing which copy is whole could lose the answer.
-        for event in events:
-            if event.get("type") == "assistant":
-                parts += _assistant_texts(event)
-            elif event.get("type") == "result":
-                # A failed or malformed result still carries the provider's last words.
-                parts.append(event.get("result"))
-    elif output == "agy-jsonl":
-        for event in events:
-            result = event.get("result")
-            if event.get("event") == "result" and isinstance(result, dict):
-                parts.append(result.get("response"))
-    else:
-        for event in events:
-            part = event.get("part")
-            if event.get("type") == "text" and isinstance(part, dict):
-                parts.append(part.get("text"))
-    answer = "\n".join(part for part in parts if isinstance(part, str)).strip()
+    answer = "\n".join(parts).strip()
     return answer or None

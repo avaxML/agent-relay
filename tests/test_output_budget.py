@@ -21,7 +21,7 @@ import dispatch
 import execution
 import task_runner
 from execution import BoundedLog, OutputBudget, execute, shrink_event
-from providers import RelayError, RelayStopped, decode_partial, decode_response, validate_adapter
+from providers import RelayError, RelayStopped, decode_exit_failure, decode_partial, decode_response, validate_adapter
 from task_runner import KINDS, prepare_task, provider_stdout, resolve_log_budget, run, run_check
 
 TOOL_RESULT = "x" * 50_000
@@ -424,6 +424,25 @@ class BoundedLogTests(unittest.TestCase):
     def test_a_line_cut_to_fit_the_tail_keeps_its_end(self) -> None:
         self.write("text", [b"h" * 9_000 + b"\n", b"w" * 13_000 + b"FINAL_ANSWER\n"], 20_000, 1_024)
         self.assertTrue(self.path.read_bytes().rstrip(b"\n").endswith(b"FINAL_ANSWER"))
+
+    def test_one_line_never_holds_more_memory_than_the_line_buffer(self) -> None:
+        with mock.patch.object(execution, "MAX_LINE_BUFFER", 1_000):
+            log = self.write(
+                "cursor-jsonl", [b'{"type":"result","result":"' + b"r" * 5_000 + b'"}\n'], 1_000_000, 8_000
+            )
+            self.assertEqual(log.stats["dropped_answer_events"], 1)
+            self.assertLessEqual(len(log.pending), 1_000)
+
+    def test_exit_signatures_survive_a_dropped_stderr_middle(self) -> None:
+        signature = "listen tcp 127.0.0.1:0: bind: operation not permitted"
+        log = BoundedLog(self.path, "text", 100_000, 8_000, (signature,))
+        log.feed(b"noise line\n" * 100_000 + signature[:20].encode())
+        log.feed(signature[20:].encode() + b"\n" + b"more noise\n" * 100_000)
+        log.close()
+        self.assertNotIn(signature, self.path.read_text(encoding="utf-8"))
+        self.assertEqual(log.seen, {signature})
+        failure = decode_exit_failure({"name": "antigravity"}, 1, self.path, log.seen)
+        self.assertIn("localhost listener", str(failure))
 
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)

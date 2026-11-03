@@ -28,6 +28,8 @@ from providers import (
 DRAIN_SECONDS = 2.0
 TEXT_DROP_MARKER = "[agent-relay dropped {} lines, {} bytes]"
 MARKER_RESERVE = 128
+# Most bytes of one unfinished line held in memory, whatever the log budget; a longer line fails the run closed.
+MAX_LINE_BUFFER = 64 << 20
 # Below this, a clipped protected event would carry too little of its answer to be worth writing.
 MIN_PROTECTED_BYTES = 1024
 
@@ -176,8 +178,15 @@ class BoundedLog:
     cap stays reserved for answer-carrying events (see PROTECTED). Text streams keep the head and the tail.
     """
 
-    def __init__(self, path: Path, output: str, max_bytes: int, max_event_bytes: int) -> None:
+    def __init__(
+        self, path: Path, output: str, max_bytes: int, max_event_bytes: int, watch: tuple[str, ...] = ()
+    ) -> None:
         self.stream: IO[bytes] = path.open("wb")
+        # Diagnostics to notice even if the bytes holding them are later dropped; a rolling carry catches a
+        # signature split across two reads.
+        self.watch = tuple(signature.encode() for signature in watch)
+        self.seen: set[str] = set()
+        self.scan_carry = b""
         self.protected = event_classifier(output)
         self.max_bytes = max_bytes
         self.max_event_bytes = max_event_bytes
@@ -189,11 +198,12 @@ class BoundedLog:
         if self.protected is None:
             self.head_limit = max_bytes // 2
             self.tail_limit = max_bytes - self.head_limit
-            # A text answer can be one long line, so a line is cut only when it could not fit in the whole log.
-            self.line_limit = max_bytes
+            # A text answer can be one long line, so a line is cut only when it could not fit in the whole log
+            # (or in memory).
+            self.line_limit = min(max_bytes, MAX_LINE_BUFFER)
         else:
             self.reserve = max_bytes // 4
-            self.line_limit = max_bytes
+            self.line_limit = min(max_bytes, MAX_LINE_BUFFER)
         # Whole lines in one buffer, trimmed in batches: one object per line would let millions of tiny lines
         # cost far more memory than the bytes they hold.
         self.tail = bytearray()
@@ -213,6 +223,10 @@ class BoundedLog:
 
     def feed(self, data: bytes) -> None:
         self.stats["received_bytes"] += len(data)
+        if self.watch:
+            window = self.scan_carry + data
+            self.seen.update(signature.decode() for signature in self.watch if signature in window)
+            self.scan_carry = window[-max(len(signature) for signature in self.watch) :]
         start = 0
         while (index := data.find(b"\n", start)) >= 0:
             self._append(data[start : index + 1])
@@ -352,7 +366,7 @@ class BoundedLog:
         if len(line) > self.tail_limit:
             line = self._cut(line, self.tail_limit, keep_end=True)
         self.tail += line
-        if len(self.tail) > 2 * self.tail_limit:
+        if len(self.tail) > self.tail_limit + min(self.tail_limit, MAX_LINE_BUFFER):
             self._trim_tail()
 
     def _cut(self, line: bytes, limit: int, keep_end: bool = False) -> bytes:
@@ -400,6 +414,7 @@ class OutputBudget:
     max_log_bytes: int
     max_event_bytes: int
     hard_ceiling_bytes: int
+    stderr_watch: tuple[str, ...] = ()
     logs: dict[str, BoundedLog] = field(default_factory=dict)
 
     def open(self, output: Path) -> dict[str, BoundedLog]:
@@ -409,7 +424,9 @@ class OutputBudget:
         self.logs["stdout"] = BoundedLog(
             output / "stdout.log", self.output_format, self.max_log_bytes - stderr_bytes, self.max_event_bytes
         )
-        self.logs["stderr"] = BoundedLog(output / "stderr.log", "text", stderr_bytes, self.max_event_bytes)
+        self.logs["stderr"] = BoundedLog(
+            output / "stderr.log", "text", stderr_bytes, self.max_event_bytes, self.stderr_watch
+        )
         return self.logs
 
     def received(self) -> int:

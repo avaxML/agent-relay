@@ -36,6 +36,7 @@ from providers import (
     decode_exit_failure,
     decode_partial,
     decode_response,
+    exit_signatures,
     load_adapter,
     resolve_effort,
     resolve_invocation,
@@ -63,7 +64,7 @@ TOOL_LOG_BYTES, TOOL_EVENT_BYTES = 16_000_000, 64_000
 # Output past this multiple of the persisted cap is a runaway, not verbosity.
 HARD_CEILING_FACTOR = 16
 # Far beyond any real log; it also keeps the values JSON can record (Python caps integer digits).
-MAX_LOG_BYTES = 1 << 40
+MAX_LOG_BYTES = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -145,7 +146,7 @@ def resolve_log_budget(
         return {"cli": flag, "adapter": f"adapter limits.{name}", "kind": f"the {kind} default"}[source]
 
     if budget["max_log_bytes"] > MAX_LOG_BYTES:
-        raise RelayError(f"max_log_bytes from {origin('max_log_bytes')} must be at most {MAX_LOG_BYTES} (1 TiB).")
+        raise RelayError(f"max_log_bytes from {origin('max_log_bytes')} must be at most {MAX_LOG_BYTES} (1 GiB).")
     if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
         raise RelayError(
             "max_event_bytes must be at least 1024 and at most a quarter of max_log_bytes; got "
@@ -372,7 +373,11 @@ def invoke_provider(
     argv = [adapter["executable"]] + [arg.format_map(values) for arg in args] + task["effort_args"]
     limits = task["log_budget"]
     budget = OutputBudget(
-        adapter["output"], limits["max_log_bytes"], limits["max_event_bytes"], limits["hard_ceiling_bytes"]
+        adapter["output"],
+        limits["max_log_bytes"],
+        limits["max_event_bytes"],
+        limits["hard_ceiling_bytes"],
+        stderr_watch=exit_signatures(adapter),
     )
     try:
         code = execute(
@@ -391,7 +396,7 @@ def invoke_provider(
             result["log_stats"] = budget.stats()
     result["exit_code"] = code
     if code:
-        raise decode_exit_failure(adapter, code, output / "stderr.log")
+        raise decode_exit_failure(adapter, code, output / "stderr.log", budget.logs["stderr"].seen)
     stdout_stats = result["log_stats"]["stdout"]
     if stdout_stats["dropped_answer_events"] or stdout_stats["truncated_answer_events"]:
         # Decoding what is left would pass part of the answer off as all of it.

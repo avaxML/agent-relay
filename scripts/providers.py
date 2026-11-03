@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from string import Formatter
@@ -410,10 +410,21 @@ def resolve_timeout(adapter: dict[str, Any], effort: str | None, model: str, tim
     return DEFAULT_TIMEOUT
 
 
-def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -> RelayError:
+AGY_LISTENER_BLOCKED = "listen tcp 127.0.0.1:0: bind: operation not permitted"
+# Exit diagnostics decode_exit_failure looks for, watched while stderr streams: a bounded stderr.log may drop them.
+EXIT_SIGNATURES = {"antigravity": (AGY_LISTENER_BLOCKED,)}
+
+
+def exit_signatures(adapter: dict[str, Any]) -> tuple[str, ...]:
+    return EXIT_SIGNATURES.get(adapter["name"], ())
+
+
+def decode_exit_failure(
+    adapter: dict[str, Any], code: int, stderr_path: Path, seen: Collection[str] = ()
+) -> RelayError:
     if adapter["name"] == "antigravity" and (
-        "listen tcp 127.0.0.1:0: bind: operation not permitted"
-        in stderr_path.read_text(encoding="utf-8", errors="replace")
+        AGY_LISTENER_BLOCKED in seen
+        or AGY_LISTENER_BLOCKED in stderr_path.read_text(encoding="utf-8", errors="replace")
     ):
         return RelayError(
             "Antigravity could not start: the host sandbox blocked its localhost listener. "

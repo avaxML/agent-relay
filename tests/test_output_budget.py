@@ -182,6 +182,26 @@ class BoundedLogTests(unittest.TestCase):
         line = json.dumps(event).encode()
         self.assertLessEqual(len(shrink_event(event, len(line), 2_000)), 2_000)
 
+    def test_hostile_json_is_kept_as_unparseable_instead_of_crashing(self) -> None:
+        nested = b"[" * 5_000 + b"]" * 5_000
+        huge_int = b'{"type":"tool_call","n":' + b"9" * 6_000 + b"}"
+        surrogate = json.dumps({"type": "tool_call", "out": "\ud800" + "x" * 20_000}).encode()
+        log = self.write("cursor-jsonl", [nested + b"\n", huge_int + b"\n", surrogate + b"\n"], 1_000_000, 8_000)
+        lines = self.path.read_bytes().splitlines()
+        self.assertEqual(lines[:2], [nested, huge_int])
+        self.assertLessEqual(len(lines[2]), 8_000)
+        self.assertEqual(log.stats["truncated_events"], 1)
+
+    def test_a_terminal_event_that_does_not_fit_is_clipped_not_dropped(self) -> None:
+        answer = "A" * 300_000
+        chunks = [*cursor_stream(60)[:-2], *cursor_stream(0, answer)[-1:]]
+        log = self.write("cursor-jsonl", chunks, 400_000, 4_000)
+        decoded = decode_response(self.path.read_text(encoding="utf-8"), "cursor-jsonl")[0]
+        self.assertTrue(answer.startswith(decoded.rstrip("…")))
+        self.assertGreater(len(decoded), 10_000)
+        self.assertLessEqual(self.path.stat().st_size, 400_000)
+        self.assertGreater(log.stats["truncated_events"], 0)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")

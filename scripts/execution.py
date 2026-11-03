@@ -18,6 +18,8 @@ from typing import IO, Any
 from providers import ORDINARY, PARTIAL, TERMINAL, RelayCancelled, RelayError, RelayStopped, event_classifier
 
 DRAIN_SECONDS = 2.0
+# Below this, a clipped protected event would carry too little of its answer to be worth writing.
+MIN_PROTECTED_BYTES = 1024
 
 
 def _signal_group(process: subprocess.Popen[bytes], number: int) -> None:
@@ -73,9 +75,10 @@ def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
 
     def render(candidate: dict[str, Any]) -> bytes:
         marked = {**candidate, "relay_truncated_bytes": original}
-        data = json.dumps(marked, ensure_ascii=False, separators=(",", ":")).encode()
+        # ASCII escapes keep a lone surrogate from a provider from failing the encode.
+        data = json.dumps(marked, separators=(",", ":")).encode()
         marked["relay_truncated_bytes"] = original - len(data) - 1
-        return json.dumps(marked, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        return json.dumps(marked, separators=(",", ":")).encode() + b"\n"
 
     best: bytes | None = None
     # No string longer than the limit can fit, so the search starts there instead of at a multi-megabyte string.
@@ -191,18 +194,25 @@ class BoundedLog:
         original = len(line)
         oversized = original > self.max_event_bytes
         level = ORDINARY
+        event: dict[str, Any] | None = None
         if oversized or self.written + len(line) > self.max_bytes - self.reserve:
             try:
-                event = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                event = None
-            if isinstance(event, dict):
+                parsed = json.loads(line)
+            except (ValueError, RecursionError):
+                # Malformed, non-UTF-8, too deeply nested, or an integer past Python's digit limit.
+                parsed = None
+            if isinstance(parsed, dict):
+                event = parsed
                 level = self.protected(event)
                 if oversized and level == ORDINARY:
                     line = shrink_event(event, len(line), self.max_event_bytes)
         headroom = {ORDINARY: self.reserve, PARTIAL: self.reserve // 2, TERMINAL: 0}[level]
-        if self.written + len(line) <= self.max_bytes - headroom:
-            if oversized and level == ORDINARY:
+        available = self.max_bytes - headroom - self.written
+        if level != ORDINARY and len(line) > available >= MIN_PROTECTED_BYTES and event is not None:
+            # A clipped answer is better than none: the decoder still finds its event.
+            line = shrink_event(event, original, available)
+        if len(line) <= available:
+            if len(line) < original:
                 self.stats["truncated_events"] += 1
                 self.stats["truncated_bytes"] += original - len(line)
             self._write(line)
@@ -242,12 +252,12 @@ class OutputBudget:
 
     def open(self, output: Path) -> dict[str, BoundedLog]:
         stderr_bytes = self.max_log_bytes // 8
-        self.logs = {
-            "stdout": BoundedLog(
-                output / "stdout.log", self.output_format, self.max_log_bytes - stderr_bytes, self.max_event_bytes
-            ),
-            "stderr": BoundedLog(output / "stderr.log", "text", stderr_bytes, self.max_event_bytes),
-        }
+        # Built one at a time so the caller can close whatever opened if the second open fails.
+        self.logs = {}
+        self.logs["stdout"] = BoundedLog(
+            output / "stdout.log", self.output_format, self.max_log_bytes - stderr_bytes, self.max_event_bytes
+        )
+        self.logs["stderr"] = BoundedLog(output / "stderr.log", "text", stderr_bytes, self.max_event_bytes)
         return self.logs
 
     def received(self) -> int:
@@ -280,10 +290,11 @@ def _execute_bounded(
     budget: OutputBudget,
     check_control: Callable[[], None],
 ) -> int:
-    logs = budget.open(output)
+    logs: dict[str, BoundedLog] = {}
     selector = selectors.DefaultSelector()
     process: subprocess.Popen[bytes] | None = None
     try:
+        logs = budget.open(output)
         with stdin.open("rb") as source:
             process = subprocess.Popen(
                 argv,
@@ -316,15 +327,19 @@ def _execute_bounded(
         if process is not None:
             # Also clean up descendants left behind by a completed private CLI, then drain what they wrote.
             stop_process(process)
+        # Cleanup must not replace the exception that stopped the worker, such as a timeout with work to salvage.
         deadline = time.monotonic() + DRAIN_SECONDS
-        while selector.get_map() and time.monotonic() < deadline:
-            _pump(selector, 0.05)
+        with suppress(OSError):
+            while selector.get_map() and time.monotonic() < deadline:
+                _pump(selector, 0.05)
         for key in list(selector.get_map().values()):
             selector.unregister(key.fileobj)
-            key.fileobj.close()  # type: ignore[union-attr]
+            with suppress(OSError):
+                key.fileobj.close()  # type: ignore[union-attr]
         selector.close()
-        for log in logs.values():
-            log.close()
+        for log in budget.logs.values():
+            with suppress(OSError):
+                log.close()
 
 
 def execute(

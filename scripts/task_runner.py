@@ -706,6 +706,11 @@ def run_prepared(
             status="cancelled", stop_reason="cancelled", error="Delegation interrupted; worker process group stopped."
         )
         salvage(task, result, output, clone, before, answer)
+    except Exception as exc:
+        # Never publish "running" for a finished run; keep the work, then surface the bug to the caller.
+        result.update(status="error", error=f"Internal error: {exc!r}")
+        salvage(task, result, output, clone, before, answer)
+        raise
     finally:
         if clone is not None and not (
             result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}

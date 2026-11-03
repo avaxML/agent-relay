@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import isolation
+import task_runner
 from providers import RelayError
 from task_runner import prepare_task, run, run_prepared
 
@@ -326,6 +327,30 @@ class ToolsTests(unittest.TestCase):
         self.assertIn("code 3", result["error"])
         self.assertNotIn("stop_reason", result)
         self.assertIn("+    return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(list(self.clones.iterdir()), [])
+
+    def test_an_internal_error_still_publishes_a_terminal_result_and_the_diff(self) -> None:
+        args = self.make_args("execute", owns=["app.py"])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        real = task_runner.decode_response
+
+        def broken(*arguments: Any) -> Any:
+            real(*arguments)
+            raise RuntimeError("decoder bug")
+
+        environment = {"FAKE_MODE": "edit", "AGENT_RELAY_CLONES_DIR": str(self.clones)}
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(task_runner, "decode_response", broken),
+            self.assertRaisesRegex(RuntimeError, "decoder bug"),
+        ):
+            run_prepared(task, output)
+        recorded = json.loads((output / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(recorded["status"], "error")
+        self.assertIn("decoder bug", recorded["error"])
+        self.assertIn("+    return 2", (output / "changes.diff").read_text(encoding="utf-8"))
         self.assertEqual(list(self.clones.iterdir()), [])
 
     def test_stopped_probe_keeps_its_untracked_files(self) -> None:

@@ -353,6 +353,16 @@ class ToolsTests(unittest.TestCase):
         self.assertIn("+    return 2", (output / "changes.diff").read_text(encoding="utf-8"))
         self.assertEqual(list(self.clones.iterdir()), [])
 
+    def test_failed_capture_keeps_the_clone_for_manual_recovery(self) -> None:
+        with mock.patch.object(task_runner, "capture", side_effect=RelayError("git timed out")):
+            result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assertEqual(result["capture_error"], "git timed out")
+        clone = Path(result["clone"])
+        self.assertIn("return 2", (clone / "app.py").read_text(encoding="utf-8"))
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(clone.parent)
+
     def test_stopped_probe_keeps_its_untracked_files(self) -> None:
         result = self.run_kind("probe", "probe-sleep", timeout=2)
         self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))

@@ -120,6 +120,8 @@ def validate_limits(config: Any) -> None:
     for field, value in config.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise RelayError(f"Adapter limits.{field} must be a positive integer number of bytes.")
+    if set(config) >= LIMIT_FIELDS and config["max_event_bytes"] * 4 > config["max_log_bytes"]:
+        raise RelayError("Adapter limits.max_event_bytes must be at most a quarter of limits.max_log_bytes.")
 
 
 def _check_placeholders(values: list[str], allowed: frozenset[str]) -> None:
@@ -421,9 +423,11 @@ def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -
 
 def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if output == "text":
-        if not raw.strip():
+        # When Relay dropped the middle of a long text stream, the answer is what followed the drop.
+        answer = TEXT_DROP_PATTERN.split(raw)[-1].strip()
+        if not answer:
             raise RelayError("Worker returned no text.")
-        return raw.strip(), {}
+        return answer, {}
     events = []
     for line in raw.splitlines():
         if not line.strip():
@@ -478,10 +482,14 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
 # cap; partial-answer events are never clipped and may use half the reserve; events a decoder needs for the final
 # answer or a failure are never clipped and may use the whole cap.
 ORDINARY, PARTIAL, TERMINAL = 0, 1, 2
+TEXT_DROP_MARKER = "[agent-relay dropped {} lines, {} bytes]"
+TEXT_DROP_PATTERN = re.compile(r"^\[agent-relay dropped \d+ lines, \d+ bytes\]$", re.MULTILINE)
 
 
+# Comparisons, not hashing: a hostile event may carry a list or object where a type string belongs.
 def _cursor_level(event: dict[str, Any]) -> int:
-    return {"result": TERMINAL, "assistant": PARTIAL}.get(event.get("type"), ORDINARY)  # type: ignore[arg-type]
+    kind = event.get("type")
+    return TERMINAL if kind == "result" else PARTIAL if kind == "assistant" else ORDINARY
 
 
 def _agy_level(event: dict[str, Any]) -> int:
@@ -489,7 +497,7 @@ def _agy_level(event: dict[str, Any]) -> int:
 
 
 def _opencode_level(event: dict[str, Any]) -> int:
-    return TERMINAL if event.get("type") in {"text", "error"} or "error" in event else ORDINARY
+    return TERMINAL if event.get("type") in ("text", "error") or "error" in event else ORDINARY
 
 
 EVENT_LEVELS: dict[str, Callable[[dict[str, Any]], int]] = {
@@ -521,7 +529,7 @@ def decode_partial(raw: str, output: str) -> str | None:
     with suppress(RelayError):
         return decode_response(raw, output)[0]
     if output == "text":
-        return raw.strip() or None
+        return TEXT_DROP_PATTERN.split(raw)[-1].strip() or None
     events = _decodable_events(raw)
     parts: list[Any] = []
     if output == "cursor-jsonl":

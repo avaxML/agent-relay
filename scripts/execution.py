@@ -8,14 +8,22 @@ import selectors
 import signal
 import subprocess
 import time
-from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from providers import ORDINARY, PARTIAL, TERMINAL, RelayCancelled, RelayError, RelayStopped, event_classifier
+from providers import (
+    ORDINARY,
+    PARTIAL,
+    TERMINAL,
+    TEXT_DROP_MARKER,
+    RelayCancelled,
+    RelayError,
+    RelayStopped,
+    event_classifier,
+)
 
 DRAIN_SECONDS = 2.0
 # Below this, a clipped protected event would carry too little of its answer to be worth writing.
@@ -48,6 +56,17 @@ def _utf8_prefix(data: bytes, limit: int) -> bytes:
     while 0 < end < len(data) and end > limit - 4 and data[end] & 0xC0 == 0x80:
         end -= 1
     return data[:end]
+
+
+# Fields decoders and readers key on; short values survive clipping verbatim.
+DISCRIMINATORS = ("type", "subtype", "event")
+
+
+def _clip_event(event: dict[str, Any], cap: int) -> dict[str, Any]:
+    return {
+        key: value if key in DISCRIMINATORS and isinstance(value, str) and len(value) <= 256 else _clip(value, cap)
+        for key, value in event.items()
+    }
 
 
 def _clip(value: Any, cap: int) -> Any:
@@ -85,7 +104,7 @@ def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
     low, high = 0, min(_longest_string(event), limit)
     while low <= high:
         cap = (low + high) // 2
-        data = render(_clip(event, cap))
+        data = render(_clip_event(event, cap))
         if len(data) <= limit:
             best, low = data, cap + 1
         else:
@@ -100,7 +119,7 @@ def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
         }
         best = render(stub)
         if len(best) > limit:
-            best = render({key: _clip(event[key], 64) for key in ("type", "subtype", "event") if key in event})
+            best = render({key: _clip(event[key], 64) for key in DISCRIMINATORS if key in event})
     return best
 
 
@@ -128,8 +147,9 @@ class BoundedLog:
         else:
             self.reserve = max_bytes // 4
             self.line_limit = max_bytes
-        self.tail: deque[bytes] = deque()
-        self.tail_bytes = 0
+        # Whole lines in one buffer, trimmed in batches: one object per line would let millions of tiny lines
+        # cost far more memory than the bytes they hold.
+        self.tail = bytearray()
         self.stats = {
             "max_bytes": max_bytes,
             "received_bytes": 0,
@@ -138,6 +158,8 @@ class BoundedLog:
             "truncated_bytes": 0,
             "dropped_events": 0,
             "dropped_bytes": 0,
+            "dropped_answer_events": 0,
+            "dropped_malformed_events": 0,
         }
 
     def feed(self, data: bytes) -> None:
@@ -152,11 +174,11 @@ class BoundedLog:
     def close(self) -> None:
         if self.pending or self.overflow:
             self._end_line()
+        self._trim_tail()
         if self.protected is None and self.stats["dropped_events"]:
             dropped = self.stats["dropped_events"], self.stats["dropped_bytes"]
-            self._write(f"[agent-relay dropped {dropped[0]} lines, {dropped[1]} bytes]\n".encode())
-        for line in self.tail:
-            self._write(line)
+            self._write(TEXT_DROP_MARKER.format(*dropped).encode() + b"\n")
+        self._write(bytes(self.tail))
         self.stats["written_bytes"] = self.written
         self.stream.close()
 
@@ -195,12 +217,14 @@ class BoundedLog:
         oversized = original > self.max_event_bytes
         level = ORDINARY
         event: dict[str, Any] | None = None
+        malformed = False
         if oversized or self.written + len(line) > self.max_bytes - self.reserve:
             try:
                 parsed = json.loads(line)
             except (ValueError, RecursionError):
                 # Malformed, non-UTF-8, too deeply nested, or an integer past Python's digit limit.
                 parsed = None
+            malformed = not isinstance(parsed, dict)
             if isinstance(parsed, dict):
                 event = parsed
                 level = self.protected(event)
@@ -219,6 +243,11 @@ class BoundedLog:
         else:
             self.stats["dropped_events"] += 1
             self.stats["dropped_bytes"] += len(line)
+            if level == TERMINAL:
+                self.stats["dropped_answer_events"] += 1
+            elif malformed:
+                # The decoder would have rejected this line; dropping it must not turn a protocol error into success.
+                self.stats["dropped_malformed_events"] += 1
 
     def _text_line(self, line: bytes, overflowed: bool) -> None:
         if overflowed or len(line) > self.line_limit:
@@ -231,13 +260,21 @@ class BoundedLog:
         if not self.tail and self.written + len(line) <= self.head_limit:
             self._write(line)
             return
-        self.tail.append(line)
-        self.tail_bytes += len(line)
-        while self.tail_bytes > self.tail_limit:
-            dropped = self.tail.popleft()
-            self.tail_bytes -= len(dropped)
-            self.stats["dropped_events"] += 1
-            self.stats["dropped_bytes"] += len(dropped)
+        self.tail += line
+        if len(self.tail) > 2 * self.tail_limit:
+            self._trim_tail()
+
+    def _trim_tail(self) -> None:
+        """Drop whole lines from the front until the tail fits; every line fits on its own."""
+        if not self.tail:
+            return
+        excess = len(self.tail) - self.tail_limit
+        if excess <= 0:
+            return
+        cut = self.tail.find(b"\n", excess - 1) + 1
+        self.stats["dropped_events"] += self.tail.count(b"\n", 0, cut)
+        self.stats["dropped_bytes"] += cut
+        del self.tail[:cut]
 
 
 @dataclass

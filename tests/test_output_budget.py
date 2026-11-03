@@ -202,6 +202,44 @@ class BoundedLogTests(unittest.TestCase):
         self.assertLessEqual(self.path.stat().st_size, 400_000)
         self.assertGreater(log.stats["truncated_events"], 0)
 
+    def test_answer_events_that_cannot_fit_are_counted(self) -> None:
+        chunks = [json.dumps({"type": "text", "part": {"text": "t" * 50_000}}).encode() + b"\n" for _ in range(20)]
+        log = self.write("opencode-jsonl", chunks, 400_000, 4_000)
+        self.assertGreater(log.stats["dropped_answer_events"], 0)
+        self.assertLessEqual(self.path.stat().st_size, 400_000)
+
+    def test_text_answer_is_what_followed_the_drop(self) -> None:
+        self.write("text", text_stream(30_000, "the real answer"), 200_000, 8_000)
+        self.assertEqual(
+            decode_response(self.path.read_text(encoding="utf-8"), "text")[0].splitlines()[-1], "the real answer"
+        )
+        self.assertNotIn("progress line 0 ", decode_response(self.path.read_text(encoding="utf-8"), "text")[0])
+
+    def test_unhashable_discriminators_do_not_crash_classification(self) -> None:
+        for output in ("cursor-jsonl", "opencode-jsonl", "agy-jsonl"):
+            with self.subTest(output=output):
+                event = {"type": [], "event": {}, "pad": "x" * 20_000}
+                log = self.write(output, [json.dumps(event).encode() + b"\n"], 1_000_000, 8_000)
+                self.assertEqual(log.stats["truncated_events"], 1)
+
+    def test_discriminators_survive_clipping_of_many_short_fields(self) -> None:
+        event = {"type": "tool_call", "subtype": "completed", **{f"f{index}": "y" * 20 for index in range(400)}}
+        line = json.dumps(event).encode()
+        shrunk = json.loads(shrink_event(event, len(line), 4_000))
+        self.assertEqual((shrunk["type"], shrunk["subtype"]), ("tool_call", "completed"))
+
+    def test_a_dropped_malformed_line_is_counted(self) -> None:
+        chunks = [*cursor_stream(40)[:-1], b"{not json " + b"z" * 5_000 + b"\n", cursor_stream(0)[-1]]
+        log = self.write("cursor-jsonl", chunks, 200_000, 4_000)
+        self.assertEqual(log.stats["dropped_malformed_events"], 1)
+
+    def test_millions_of_tiny_text_lines_keep_a_bounded_tail(self) -> None:
+        log = self.write("text", [b"\n" * 3_000_000, b"done\n"], 100_000, 8_000)
+        persisted = self.path.read_text(encoding="utf-8")
+        self.assertLessEqual(len(persisted.encode()), 100_000)
+        self.assertTrue(persisted.endswith("done\n"))
+        self.assertEqual(log.stats["dropped_events"] + persisted.count("\n") - 1, 3_000_001)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")
@@ -433,9 +471,14 @@ class BudgetResolutionTests(unittest.TestCase):
         self.assertEqual((from_cli["max_log_bytes"], from_cli["max_event_bytes"]), (2_000_000, 100_000))
         self.assertEqual(from_cli["sources"], {"max_log_bytes": "cli", "max_event_bytes": "adapter"})
 
-    def test_inconsistent_budgets_are_rejected(self) -> None:
-        with self.assertRaisesRegex(RelayError, "max-event-bytes"):
+    def test_inconsistent_budgets_are_rejected_naming_their_sources(self) -> None:
+        with self.assertRaisesRegex(RelayError, "from --max-event-bytes and 100000 from --max-log-bytes"):
             resolve_log_budget(self.adapter(), "read", 100_000, 50_000)
+        adapter = self.adapter(limits={"max_log_bytes": 100_000})
+        with self.assertRaisesRegex(RelayError, "from the read default and 100000 from adapter limits.max_log_bytes"):
+            resolve_log_budget(adapter, "read", None, None)
+        with self.assertRaisesRegex(RelayError, "at most a quarter"):
+            validate_adapter(self.adapter(limits={"max_log_bytes": 100_000, "max_event_bytes": 50_000}), "fake")
 
     def test_adapter_limits_are_validated(self) -> None:
         validate_adapter(self.adapter(limits={"max_log_bytes": 8_000_000}), "fake")
@@ -560,6 +603,19 @@ class BudgetResolutionTests(unittest.TestCase):
                     result = run(self.args(path, output=self.directory / f"out-{index}", **flags))
                 self.assertEqual(result["status"], "ok", result.get("error"))
                 self.assertEqual((seen[0].max_log_bytes, seen[0].max_event_bytes), expected)
+
+    def test_a_dropped_answer_event_fails_the_run_instead_of_passing_a_prefix(self) -> None:
+        self.script.write_text(
+            "import json\nfor _ in range(30):\n"
+            "    print(json.dumps({'type': 'text', 'part': {'text': 't' * 50_000}}))\n",
+            encoding="utf-8",
+        )
+        path = self.directory / "fake.json"
+        path.write_text(json.dumps(self.adapter(output="opencode-jsonl")), encoding="utf-8")
+        result = run(self.args(path, max_log_bytes=400_000, max_event_bytes=4_000))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did not fit", result["error"])
+        self.assertGreater(result["log_stats"]["stdout"]["dropped_answer_events"], 0)
 
     def test_prepared_task_carries_the_budget_for_detached_jobs(self) -> None:
         path = self.directory / "fake.json"

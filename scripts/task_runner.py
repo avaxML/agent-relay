@@ -137,9 +137,16 @@ def resolve_log_budget(
         else:
             budget[name], budget["sources"][name] = default, "kind"
     if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
+
+        def origin(name: str) -> str:
+            source = budget["sources"][name]
+            flag = "--" + name.replace("_", "-")
+            return {"cli": flag, "adapter": f"adapter limits.{name}", "kind": f"the {kind} default"}[source]
+
         raise RelayError(
-            "--max-event-bytes must be at least 1024 and at most a quarter of --max-log-bytes "
-            f"(got {budget['max_event_bytes']} and {budget['max_log_bytes']})."
+            "max_event_bytes must be at least 1024 and at most a quarter of max_log_bytes; got "
+            f"{budget['max_event_bytes']} from {origin('max_event_bytes')} and "
+            f"{budget['max_log_bytes']} from {origin('max_log_bytes')}."
         )
     budget["hard_ceiling_bytes"] = budget["max_log_bytes"] * HARD_CEILING_FACTOR
     return budget
@@ -380,6 +387,15 @@ def invoke_provider(
     result["exit_code"] = code
     if code:
         raise decode_exit_failure(adapter, code, output / "stderr.log")
+    stdout_stats = result["log_stats"]["stdout"]
+    if stdout_stats["dropped_answer_events"]:
+        # Decoding what is left would pass part of the answer off as all of it.
+        raise RelayError(
+            f"An answer event did not fit the {limits['max_log_bytes']}-byte log budget; "
+            "rerun with a larger --max-log-bytes and inspect stdout.log."
+        )
+    if stdout_stats["dropped_malformed_events"]:
+        raise RelayError("Worker returned malformed JSON output past the log budget; inspect stdout.log.")
     return decode_response((output / "stdout.log").read_text(encoding="utf-8"), adapter["output"])
 
 
@@ -536,7 +552,9 @@ def salvage(
             try:
                 captured = capture(clone, before, output / "relay", options["check_timeout"])
             except (RelayError, OSError) as exc:
+                # Without a diff the clone is the only copy of the work, so it is kept for manual recovery.
                 result["capture_error"] = str(exc)
+                result["clone"] = str(clone.work)
             else:
                 _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
         limit = task["max_answer_chars"]
@@ -712,8 +730,10 @@ def run_prepared(
         salvage(task, result, output, clone, before, answer)
         raise
     finally:
-        if clone is not None and not (
-            result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}
+        if (
+            clone is not None
+            and "capture_error" not in result
+            and not (result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"})
         ):
             try:
                 remove_clone(clone.directory)

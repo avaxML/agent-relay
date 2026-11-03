@@ -472,7 +472,10 @@ class DecodePartialTests(unittest.TestCase):
         self.assertIsNone(decode_partial("", "cursor-jsonl"))
         clipped = json.dumps({"type": "result", "subtype": "success", "result": "fin", "relay_truncated_bytes": 9})
         full = cursor_stream(0, "the whole final answer")[-2].decode()
-        self.assertEqual(decode_partial(full + clipped + "\n", "cursor-jsonl"), "the whole final answer")
+        both = decode_partial(full + clipped + "\n", "cursor-jsonl")
+        assert both is not None
+        self.assertIn("the whole final answer", both)
+        self.assertIn("fin", both)
         tool_only = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read"}]}})
         self.assertEqual(decode_partial(tool_only + "\n" + clipped + "\n", "cursor-jsonl"), "fin")
         failed = json.dumps({"type": "result", "subtype": "error", "is_error": True, "result": "gave up: quota"})
@@ -792,6 +795,7 @@ class BudgetResolutionTests(unittest.TestCase):
         validate_adapter(self.adapter(limits={"max_log_bytes": 8_000_000}), "fake")
         for limits in (
             {"max_log_bytes": 2 << 30},
+            {"max_log_bytes": 1},
             {"max_event_bytes": 1 << 30},
             {"max_event_bytes": 1000},
             {"max_log_bytes": 0},

@@ -126,6 +126,8 @@ def validate_limits(config: Any) -> None:
         raise RelayError(
             f"Adapter limits must keep max_log_bytes at most {MAX_LOG_BYTES} (1 GiB) and max_event_bytes at most a quarter of that."
         )
+    if config.get("max_log_bytes", 4096) < 4096:
+        raise RelayError("Adapter limits.max_log_bytes must be at least 4096 bytes (four 1024-byte events).")
     if config.get("max_event_bytes", 1024) < 1024:
         raise RelayError("Adapter limits.max_event_bytes must be at least 1024 bytes.")
     if set(config) >= LIMIT_FIELDS and config["max_event_bytes"] * 4 > config["max_log_bytes"]:
@@ -586,7 +588,7 @@ def decode_partial(raw: str, output: str) -> str | None:
         return raw.strip() or None
     events = _answer_events(raw, output)
     level = EVENT_LEVELS[output]
-    # A terminal event Relay clipped to fit would decode as a shortened answer; then prefer the unclipped text.
+    # A terminal event Relay clipped to fit would decode as if it were whole; then gather every answer text.
     clipped = [event for event in events if level(event) == TERMINAL and "relay_truncated_bytes" in event]
     if not clipped:
         # ValueError and RecursionError: one hostile event (huge integer, deep nesting) must not cost the rest.
@@ -594,14 +596,8 @@ def decode_partial(raw: str, output: str) -> str | None:
             return decode_response(raw, output)[0]
     parts: list[Any] = []
     if output == "cursor-jsonl":
-        # Drop the clipped result only when unclipped assistant messages actually carry text.
-        if clipped and any(
-            isinstance(text, str) and text.strip()
-            for event in events
-            if "relay_truncated_bytes" not in event
-            for text in _assistant_texts(event)
-        ):
-            events = [event for event in events if event.get("type") != "result"]
+        # With a clipped result, keep both the assistant text and what is left of the result: the clip may have
+        # shortened only other fields, and guessing which copy is whole could lose the answer.
         for event in events:
             if event.get("type") == "assistant":
                 parts += _assistant_texts(event)

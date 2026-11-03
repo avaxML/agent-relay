@@ -321,7 +321,7 @@ def run_check(
         error = str(exc)
     duration_seconds = round(time.monotonic() - started, 3)
     output_tail = "".join(
-        (directory / name).read_text(encoding="utf-8", errors="replace")
+        (directory / name).read_text(encoding="utf-8", errors="backslashreplace")
         for name in ("stdout.log", "stderr.log")
         if (directory / name).is_file()
     )
@@ -601,7 +601,7 @@ def salvage(
             field = "provider_claims" if "tools" in task else "answer"
             result.update({field: answer[:limit], f"{field}_truncated": len(answer) > limit})
             answer_path = output / "answer.txt"
-            answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="backslashreplace")
             result["answer_path"] = str(answer_path)
             return
         partial = (
@@ -618,7 +618,7 @@ def salvage(
                 partial_answer_truncated=len(partial) > limit,
             )
             partial_path = output / "partial-answer.txt"
-            partial_path.write_text(partial + "\n", encoding="utf-8", errors="replace")
+            partial_path.write_text(partial + "\n", encoding="utf-8", errors="backslashreplace")
             result["partial_answer_path"] = str(partial_path)
     except (RelayError, OSError, ValueError) as exc:
         result["salvage_error"] = str(exc)
@@ -717,7 +717,7 @@ def run_prepared(
             else:
                 status = "ok"
             answer_path = output / "answer.txt"
-            answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="backslashreplace")
             result.update(
                 status=status,
                 checks=check_results,
@@ -750,7 +750,7 @@ def run_prepared(
                 if cancel_file is not None and cancel_file.exists():
                     raise RelayCancelled("Cancellation requested before result publication.")
                 answer_path = output / "answer.txt"
-                answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
+                answer_path.write_text(answer + "\n", encoding="utf-8", errors="backslashreplace")
                 result.update(
                     status="ok",
                     answer=answer[: task["max_answer_chars"]],

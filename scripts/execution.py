@@ -100,7 +100,7 @@ def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: b
         marked = {**candidate, "relay_truncated_bytes": original}
         # ASCII escapes keep a lone surrogate from a provider from failing the encode.
         data = json.dumps(marked, separators=(",", ":")).encode()
-        marked["relay_truncated_bytes"] = original - len(data) - 1
+        marked["relay_truncated_bytes"] = max(0, original - len(data) - 1)
         return json.dumps(marked, separators=(",", ":")).encode() + b"\n"
 
     best: bytes | None = None
@@ -258,7 +258,9 @@ class BoundedLog:
         malformed = False
         if oversized or self.written + len(line) > self.max_bytes - self.reserve:
             try:
-                parsed = json.loads(line)
+                # Strict UTF-8 text first, as the decoder reads it: bytes input would also accept a BOM the decoder
+                # rejects, and clipping would then hide that malformed line.
+                parsed = json.loads(line.decode("utf-8"))
             except (ValueError, RecursionError):
                 # Malformed, non-UTF-8, too deeply nested, or an integer past Python's digit limit.
                 parsed = None
@@ -295,8 +297,9 @@ class BoundedLog:
         if overflowed or len(line) > self.line_limit:
             body = line.removesuffix(b"\n")
             kept = _utf8_prefix(body, self.line_limit - 1)
-            # The end of the line is lost, and a text answer often ends there.
-            self.stats["truncated_answer_events"] += 1
+            # The end of the line is lost, and a text answer often ends there (unless it was only whitespace).
+            if not (overflowed and self.overflow_blank):
+                self.stats["truncated_answer_events"] += 1
             self.stats["truncated_events"] += 1
             self.stats["truncated_bytes"] += len(body) - len(kept)
             kept += b"\n"

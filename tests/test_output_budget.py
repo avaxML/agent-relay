@@ -318,6 +318,17 @@ class BoundedLogTests(unittest.TestCase):
         assert shrunk is not None
         self.assertLessEqual(len(shrunk), 1_024)
 
+    def test_a_bom_prefixed_event_stays_malformed(self) -> None:
+        event = b"\xef\xbb\xbf" + json.dumps({"type": "tool_call", "out": "x" * 20_000}).encode()
+        self.write("cursor-jsonl", [event + b"\n", cursor_stream(0)[-1]], 1_000_000, 4_000)
+        with self.assertRaisesRegex(RelayError, "malformed JSON"):
+            decode_response(self.path.read_text(encoding="utf-8"), "cursor-jsonl")
+
+    def test_a_whitespace_only_text_overflow_is_not_a_lost_answer(self) -> None:
+        log = self.write("text", [b" " * 30_000 + b"\n", b"answer\n"], 20_000, 1_024)
+        self.assertEqual(log.stats["truncated_answer_events"], 0)
+        self.assertEqual(log.stats["truncated_events"], 1)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")

@@ -86,7 +86,7 @@ An adapter may override the defaults for every kind:
 Both keys are optional and must be positive integers. `--max-log-bytes` and `--max-event-bytes` on `run`, `submit`, and `dispatch` take precedence over the adapter, which takes precedence over the kind's default. `max_event_bytes` must be at least 1024 and at most a quarter of `max_log_bytes`. `result.json` records:
 
 - `log_budget`, always: the effective values, plus `sources`, which says whether each value came from `cli`, `adapter`, or `kind`;
-- `log_stats`, once the provider has been launched: for stdout and stderr, the bytes received and written, and the number of events and bytes truncated (and kept) or dropped.
+- `log_stats`, once Relay has opened the provider's logs: for stdout and stderr, the bytes received and written, and the number of events and bytes truncated (and kept) or dropped.
 
 Relay's own setup and check commands and its git calls do not use the budget. Their output is either complete or refused: checks keep a 1 MB limit and git an 8 MB one, and passing that limit stops the command.
 

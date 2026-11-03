@@ -596,7 +596,8 @@ def salvage(
             partial_path = output / "partial-answer.txt"
             partial_path.write_text(partial + "\n", encoding="utf-8", errors="replace")
             result.update(
-                partial_answer=partial[:limit],
+                # The end, not the start: a stopped run's latest words are what the lead needs.
+                partial_answer=partial[-limit:],
                 partial_answer_truncated=len(partial) > limit,
                 partial_answer_path=str(partial_path),
             )

@@ -17,11 +17,22 @@ from typing import IO, Any
 
 from providers import RelayCancelled, RelayError, RelayStopped
 
-# Events each decoder depends on are never truncated, so the final answer and any failure survive.
-PROTECTED: dict[str, Callable[[dict[str, Any]], bool]] = {
-    "cursor-jsonl": lambda event: event.get("type") == "result",
-    "agy-jsonl": lambda event: event.get("event") == "result",
-    "opencode-jsonl": lambda event: event.get("type") in {"text", "error"} or "error" in event,
+# Protection levels: ordinary events may be clipped and stop at three quarters of the cap; partial-answer events
+# are never clipped and may use half the reserve; events a decoder depends on for the final answer or a failure
+# are never clipped and may use the whole cap.
+ORDINARY, PARTIAL, TERMINAL = 0, 1, 2
+
+
+def _cursor_level(event: dict[str, Any]) -> int:
+    return {"result": TERMINAL, "assistant": PARTIAL}.get(event.get("type"), ORDINARY)  # type: ignore[arg-type]
+
+
+PROTECTED: dict[str, Callable[[dict[str, Any]], int]] = {
+    "cursor-jsonl": _cursor_level,
+    "agy-jsonl": lambda event: TERMINAL if event.get("event") == "result" else ORDINARY,
+    "opencode-jsonl": lambda event: (
+        TERMINAL if event.get("type") in {"text", "error"} or "error" in event else ORDINARY
+    ),
 }
 DRAIN_SECONDS = 2.0
 
@@ -99,8 +110,8 @@ class BoundedLog:
     """Persist a provider stream under max_bytes without stopping the provider for verbosity.
 
     JSONL streams keep events byte for byte unless an event exceeds max_event_bytes, in which case its longest
-    strings are clipped. Once the log nears its cap, unprotected events are dropped and counted; a quarter of
-    the cap stays reserved for the events the decoder needs. Text streams keep the head and the tail.
+    strings are clipped. Once the log nears its cap, ordinary events are dropped and counted; a quarter of the
+    cap stays reserved for answer-carrying events (see PROTECTED). Text streams keep the head and the tail.
     """
 
     def __init__(self, path: Path, output: str, max_bytes: int, max_event_bytes: int) -> None:
@@ -183,20 +194,21 @@ class BoundedLog:
     def _event_line(self, line: bytes) -> None:
         assert self.protected is not None
         oversized = len(line) > self.max_event_bytes
-        protected = False
+        level = ORDINARY
         if oversized or self.written + len(line) > self.max_bytes - self.reserve:
             try:
                 event = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 event = None
             if isinstance(event, dict):
-                protected = self.protected(event)
-                if oversized and not protected:
+                level = self.protected(event)
+                if oversized and level == ORDINARY:
                     shrunk = shrink_event(event, len(line), self.max_event_bytes)
                     self.stats["truncated_events"] += 1
                     self.stats["truncated_bytes"] += len(line) - len(shrunk)
                     line = shrunk
-        if self.written + len(line) <= self.max_bytes - (0 if protected else self.reserve):
+        headroom = {ORDINARY: self.reserve, PARTIAL: self.reserve // 2, TERMINAL: 0}[level]
+        if self.written + len(line) <= self.max_bytes - headroom:
             self._write(line)
         else:
             self.stats["dropped_events"] += 1

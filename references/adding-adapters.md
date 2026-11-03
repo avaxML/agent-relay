@@ -63,12 +63,12 @@ The `probe` and `execute` kinds need a tools mode. Without one, a provider rejec
 Relay streams a provider's stdout and stderr through a bounded writer instead of letting the CLI write the log files directly. A verbose provider is never stopped for being verbose. Cursor's `stream-json` output, for example, repeats every tool result in full, and a long `execute` run can exceed 4 MB of output.
 
 - **Per-event truncation.** A JSONL event larger than `max_event_bytes` is re-serialized with its longest string values clipped. Its keys, `type`, and `subtype` are kept, and a `relay_truncated_bytes` field records how much was removed. In practice this clips Cursor's `tool_call`/`completed` results first, because they are the large events. Lines that are not JSON pass through unchanged.
-- **Protected events.** Relay never truncates or drops the events a decoder depends on:
+- **Protected events.** Relay never truncates the events a decoder depends on, and keeps them past the point where ordinary events are dropped:
   - `cursor-jsonl` and `agy-jsonl`: the terminal `result` event;
   - `opencode-jsonl`: every `text` event, and every event that has a `type` of `error` or an `error` key.
 
-  Each decoder therefore still finds the final answer, and still reports a provider failure.
-- **Persisted cap.** stderr gets an eighth of `max_log_bytes` and stdout the rest, so the two log files together stay under `max_log_bytes`. Once stdout reaches three quarters of its share, unprotected events are dropped; the last quarter is reserved for protected events. A `text` stream (and stderr) keeps its first half and its last lines, with a `[agent-relay dropped N lines, B bytes]` marker between them, so a final answer printed last survives. A text line longer than `max_event_bytes` is cut on a UTF-8 boundary.
+  These events may use the whole cap, so each decoder still finds the final answer and still reports a provider failure. Cursor `assistant` messages are never truncated either. They may use half of the reserved quarter, so a stopped run still has a partial answer.
+- **Persisted cap.** stderr gets an eighth of `max_log_bytes` and stdout the rest, so the two log files together stay under `max_log_bytes`. Once stdout reaches three quarters of its share, ordinary events are dropped; the last quarter is reserved for protected events. A `text` stream (and stderr) keeps its first half and its last lines, with a `[agent-relay dropped N lines, B bytes]` marker between them, so a final answer printed last survives. A text line longer than `max_event_bytes` is cut on a UTF-8 boundary.
 - **Runaway ceiling.** Relay stops the worker only when the raw output passes `hard_ceiling_bytes`, which is 16 × `max_log_bytes`. This is a genuine runaway rather than verbosity.
 
 | Budget | `read`, `review`, `patch`, `chaos` | `probe`, `execute` |

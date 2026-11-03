@@ -118,6 +118,12 @@ class BoundedLogTests(unittest.TestCase):
         self.assertGreater(log.stats["dropped_bytes"], 0)
         self.assertEqual(decode_response(persisted.decode("utf-8"), "cursor-jsonl")[0], "final answer")
 
+    def test_cursor_assistant_messages_survive_the_cap_for_partial_answers(self) -> None:
+        chunks = cursor_stream(400, "latest progress")[:-1]
+        log = self.write("cursor-jsonl", chunks, 400_000, 4_000)
+        self.assertGreater(log.stats["dropped_events"], 0)
+        self.assertEqual(decode_partial(self.path.read_text(encoding="utf-8"), "cursor-jsonl"), "latest progress")
+
     def test_answer_events_are_never_truncated(self) -> None:
         answer = "A" * 20_000
         for output, chunks in (

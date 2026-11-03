@@ -369,6 +369,7 @@ class ToolsTests(unittest.TestCase):
             result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
         self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
         self.assertIn("No space left", result["salvage_error"])
+        self.assertIn("still working", result["partial_answer"])
         clone = Path(result["clone"])
         self.assertIn("return 2", (clone / "app.py").read_text(encoding="utf-8"))
         with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):

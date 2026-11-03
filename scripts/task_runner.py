@@ -572,7 +572,11 @@ def salvage(
             except (RelayError, OSError) as exc:
                 result["capture_error"] = str(exc)
             else:
-                _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+                try:
+                    _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+                except (RelayError, OSError, ValueError) as exc:
+                    # The clone is kept (no diff_path); still try to save the worker's words below.
+                    result["salvage_error"] = str(exc)
         limit = task["max_answer_chars"]
         if answer is not None:
             answer_path = output / "answer.txt"

@@ -307,6 +307,10 @@ class BoundedLogTests(unittest.TestCase):
         self.assertEqual(log.stats["truncated_events"], 2)  # this event and the stream's own tool result
         self.assertEqual(log.stats["truncated_answer_events"], 0)
 
+    def test_a_whitespace_only_overflow_line_is_not_a_lost_answer(self) -> None:
+        log = self.write("cursor-jsonl", [b" " * 300_000 + b"\n", cursor_stream(0)[-1]], 200_000, 4_000)
+        self.assertEqual(log.stats["dropped_answer_events"], 0)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")

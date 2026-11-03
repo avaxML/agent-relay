@@ -149,6 +149,7 @@ class BoundedLog:
         self.max_event_bytes = max_event_bytes
         self.pending = bytearray()
         self.overflow = False
+        self.overflow_blank = False
         self.written = 0
         if self.protected is None:
             self.head_limit = max_bytes // 2
@@ -217,9 +218,11 @@ class BoundedLog:
             return
         if self.overflow:
             self.stats["dropped_bytes" if self.protected else "truncated_bytes"] += len(piece)
+            self.overflow_blank = self.overflow_blank and not piece.strip()
             return
         self.pending += piece
         if len(self.pending) > self.line_limit:
+            self.overflow_blank = not self.pending.strip()
             # Bound memory for a line with no newline yet: text keeps a prefix, JSONL cannot be cut.
             excess = len(self.pending) - (self.line_limit if self.protected is None else 0)
             del self.pending[len(self.pending) - excess :]
@@ -232,10 +235,13 @@ class BoundedLog:
         self.overflow = False
         if self.protected is None:
             self._text_line(line, overflowed)
-        elif overflowed:
+        elif overflowed and not self.overflow_blank:
             # Too long to parse in bounded memory, so it may have been the answer: fail closed.
             self.stats["dropped_events"] += 1
             self.stats["dropped_answer_events"] += 1
+        elif overflowed:
+            # Only whitespace, which every decoder skips.
+            self.stats["dropped_events"] += 1
         else:
             self._event_line(line)
 

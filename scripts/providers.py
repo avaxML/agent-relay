@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from string import Formatter
@@ -472,6 +472,36 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if not isinstance(answer, str) or not answer.strip():
         raise RelayError("Worker returned no answer.")
     return answer.strip(), metadata
+
+
+# Protection levels for bounded provider logs: ordinary events may be clipped and stop at three quarters of the
+# cap; partial-answer events are never clipped and may use half the reserve; events a decoder needs for the final
+# answer or a failure are never clipped and may use the whole cap.
+ORDINARY, PARTIAL, TERMINAL = 0, 1, 2
+
+
+def _cursor_level(event: dict[str, Any]) -> int:
+    return {"result": TERMINAL, "assistant": PARTIAL}.get(event.get("type"), ORDINARY)  # type: ignore[arg-type]
+
+
+def _agy_level(event: dict[str, Any]) -> int:
+    return TERMINAL if event.get("event") == "result" else ORDINARY
+
+
+def _opencode_level(event: dict[str, Any]) -> int:
+    return TERMINAL if event.get("type") in {"text", "error"} or "error" in event else ORDINARY
+
+
+EVENT_LEVELS: dict[str, Callable[[dict[str, Any]], int]] = {
+    "cursor-jsonl": _cursor_level,
+    "agy-jsonl": _agy_level,
+    "opencode-jsonl": _opencode_level,
+}
+
+
+def event_classifier(output: str) -> Callable[[dict[str, Any]], int] | None:
+    """Return how decode_response depends on each event of a JSONL output, or None for unstructured text."""
+    return EVENT_LEVELS.get(output)
 
 
 def _decodable_events(raw: str) -> list[dict[str, Any]]:

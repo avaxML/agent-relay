@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import dispatch
 import task_runner
-from execution import BoundedLog, OutputBudget, execute
+from execution import BoundedLog, OutputBudget, execute, shrink_event
 from providers import RelayError, RelayStopped, decode_partial, decode_response, validate_adapter
 from task_runner import KINDS, prepare_task, resolve_log_budget, run, run_check
 
@@ -155,10 +156,31 @@ class BoundedLogTests(unittest.TestCase):
         self.assertTrue(decode_response(persisted, "text")[0].endswith("final answer"))
 
     def test_text_lines_are_cut_on_utf8_boundaries(self) -> None:
-        self.write("text", ["é".encode() * 10_000 + b"\n", b"done\n"], 200_000, 1_001)
+        log = self.write("text", ["é".encode() * 10_000 + b"\n", b"done\n"], 20_000, 1_024)
+        self.assertEqual(log.stats["truncated_events"], 1)
         persisted = self.path.read_bytes()
         persisted.decode("utf-8")
         self.assertTrue(persisted.endswith(b"done\n"))
+
+    def test_a_long_single_line_text_answer_is_not_cut_at_the_event_limit(self) -> None:
+        answer = "word " * 20_000
+        self.write("text", [answer.encode() + b"\n"], 1_000_000, 8_000)
+        self.assertEqual(decode_response(self.path.read_text(encoding="utf-8"), "text")[0], answer.strip())
+
+    def test_text_drop_marker_is_written_whenever_lines_are_dropped(self) -> None:
+        self.write("text", text_stream(5_000), 20_000, 1_024)
+        self.assertIn("[agent-relay dropped", self.path.read_text(encoding="utf-8"))
+
+    def test_dropped_events_are_not_also_counted_as_truncated(self) -> None:
+        log = self.write("cursor-jsonl", cursor_stream(400), 400_000, 4_000)
+        events = [json.loads(line) for line in self.path.read_bytes().splitlines()]
+        kept = sum(1 for event in events if "relay_truncated_bytes" in event)
+        self.assertEqual(log.stats["truncated_events"], kept)
+
+    def test_fallback_stub_respects_the_event_limit(self) -> None:
+        event = {"type": "tool_call", "subtype": "completed", **{f"k{index}": index for index in range(5_000)}}
+        line = json.dumps(event).encode()
+        self.assertLessEqual(len(shrink_event(event, len(line), 2_000)), 2_000)
 
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
@@ -225,7 +247,8 @@ class ExecuteBudgetTests(unittest.TestCase):
         self.assertLessEqual(stdout.stat().st_size + stderr.stat().st_size, 4_000_000)
         self.assertEqual(decode_response(stdout.read_text(encoding="utf-8"), "cursor-jsonl")[0], "done")
         stats = budget.stats()
-        self.assertEqual(stats["stdout"]["truncated_events"], 200)
+        self.assertGreater(stats["stdout"]["truncated_events"], 0)
+        self.assertEqual(stats["stdout"]["truncated_events"] + stats["stdout"]["dropped_events"], 200)
         self.assertGreater(stats["stderr"]["truncated_bytes"], 2_000_000)
 
     def test_runaway_output_past_the_hard_ceiling_is_stopped(self) -> None:
@@ -291,6 +314,25 @@ class ExecuteBudgetTests(unittest.TestCase):
                 budget=budget,
             )
         self.assertEqual(code, 0)
+
+    def test_eperm_on_a_live_group_still_stops_the_child(self) -> None:
+        sleeper = self.script("sleep.py", "import time\ntime.sleep(30)\n")
+        budget = OutputBudget("text", 100_000, 8_000, 2_000_000)
+        started = time.monotonic()
+        with (
+            mock.patch("execution.os.killpg", side_effect=PermissionError(1, "Operation not permitted")),
+            self.assertRaises(RelayStopped),
+        ):
+            execute(
+                [sys.executable, str(sleeper)],
+                self.directory,
+                dict(os.environ),
+                self.stdin,
+                self.directory,
+                1,
+                budget=budget,
+            )
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_without_a_budget_the_strict_cap_still_kills(self) -> None:
         # Git and Relay checks rely on this: their stdout is never truncated, only refused.
@@ -474,6 +516,30 @@ class BudgetResolutionTests(unittest.TestCase):
         self.assertEqual((args.max_log_bytes, args.max_event_bytes), (6_000_000, 50_000))
         defaults = dispatch.task_arguments(task, {"root": str(self.root), "settings": {}})
         self.assertEqual((defaults.max_log_bytes, defaults.max_event_bytes), (None, None))
+
+    def test_each_flag_and_adapter_override_reaches_execute_independently(self) -> None:
+        path = self.directory / "fake.json"
+        seen: list[OutputBudget] = []
+        real = task_runner.execute
+
+        def spy(*args: Any, **kwargs: Any) -> int:
+            seen.append(kwargs["budget"])
+            return real(*args, **kwargs)
+
+        cases = [
+            ({"max_log_bytes": 9_000_000}, {}, (9_000_000, KINDS["read"].max_event_bytes)),
+            ({}, {"max_event_bytes": 12_000}, (KINDS["read"].max_log_bytes, 12_000)),
+            ({"max_log_bytes": 9_000_000}, {"max_log_bytes": 5_000_000}, (5_000_000, KINDS["read"].max_event_bytes)),
+            ({"max_event_bytes": 20_000}, {"max_event_bytes": 30_000}, (KINDS["read"].max_log_bytes, 30_000)),
+        ]
+        for index, (limits, flags, expected) in enumerate(cases):
+            with self.subTest(limits=limits, flags=flags):
+                path.write_text(json.dumps(self.adapter(limits=limits)), encoding="utf-8")
+                seen.clear()
+                with mock.patch.object(task_runner, "execute", spy):
+                    result = run(self.args(path, output=self.directory / f"out-{index}", **flags))
+                self.assertEqual(result["status"], "ok", result.get("error"))
+                self.assertEqual((seen[0].max_log_bytes, seen[0].max_event_bytes), expected)
 
     def test_prepared_task_carries_the_budget_for_detached_jobs(self) -> None:
         path = self.directory / "fake.json"

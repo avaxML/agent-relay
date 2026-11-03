@@ -15,37 +15,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from providers import RelayCancelled, RelayError, RelayStopped
+from providers import ORDINARY, PARTIAL, TERMINAL, RelayCancelled, RelayError, RelayStopped, event_classifier
 
-# Protection levels: ordinary events may be clipped and stop at three quarters of the cap; partial-answer events
-# are never clipped and may use half the reserve; events a decoder depends on for the final answer or a failure
-# are never clipped and may use the whole cap.
-ORDINARY, PARTIAL, TERMINAL = 0, 1, 2
-
-
-def _cursor_level(event: dict[str, Any]) -> int:
-    return {"result": TERMINAL, "assistant": PARTIAL}.get(event.get("type"), ORDINARY)  # type: ignore[arg-type]
-
-
-PROTECTED: dict[str, Callable[[dict[str, Any]], int]] = {
-    "cursor-jsonl": _cursor_level,
-    "agy-jsonl": lambda event: TERMINAL if event.get("event") == "result" else ORDINARY,
-    "opencode-jsonl": lambda event: (
-        TERMINAL if event.get("type") in {"text", "error"} or "error" in event else ORDINARY
-    ),
-}
 DRAIN_SECONDS = 2.0
+
+
+def _signal_group(process: subprocess.Popen[bytes], number: int) -> None:
+    try:
+        os.killpg(process.pid, number)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # macOS reports EPERM, not ESRCH, for a group whose remaining members are zombies. Signal the child
+        # directly so a live child can never leave the final wait unbounded.
+        process.send_signal(number)
 
 
 def stop_process(process: subprocess.Popen[bytes]) -> None:
     """Stop the CLI and descendants in its own process group."""
-    # macOS reports EPERM, not ESRCH, for a group whose remaining members are zombies.
-    with suppress(ProcessLookupError, PermissionError):
-        os.killpg(process.pid, signal.SIGTERM)
+    _signal_group(process, signal.SIGTERM)
     with suppress(subprocess.TimeoutExpired):
         process.wait(timeout=1)
-    with suppress(ProcessLookupError, PermissionError):
-        os.killpg(process.pid, signal.SIGKILL)
+    _signal_group(process, signal.SIGKILL)
     process.wait()
 
 
@@ -97,13 +88,16 @@ def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
         else:
             high = cap - 1
     if best is None:
-        # Too many fields to fit: keep only short top-level scalars such as type, subtype and IDs.
+        # Too many fields to fit: keep only short top-level scalars such as type, subtype and IDs, then only the
+        # fields every decoder keys on.
         stub = {
             key: value
             for key, value in event.items()
             if isinstance(value, (int, float, bool)) or (isinstance(value, str) and len(value) <= 256)
         }
         best = render(stub)
+        if len(best) > limit:
+            best = render({key: _clip(event[key], 64) for key in ("type", "subtype", "event") if key in event})
     return best
 
 
@@ -117,7 +111,7 @@ class BoundedLog:
 
     def __init__(self, path: Path, output: str, max_bytes: int, max_event_bytes: int) -> None:
         self.stream: IO[bytes] = path.open("wb")
-        self.protected = PROTECTED.get(output)
+        self.protected = event_classifier(output)
         self.max_bytes = max_bytes
         self.max_event_bytes = max_event_bytes
         self.pending = bytearray()
@@ -126,7 +120,8 @@ class BoundedLog:
         if self.protected is None:
             self.head_limit = max_bytes // 2
             self.tail_limit = max_bytes - self.head_limit - 128
-            self.line_limit = max_event_bytes
+            # A text answer can be one long line, so cut a line only when it could not fit in the tail at all.
+            self.line_limit = self.tail_limit
         else:
             self.reserve = max_bytes // 4
             self.line_limit = max_bytes
@@ -154,12 +149,11 @@ class BoundedLog:
     def close(self) -> None:
         if self.pending or self.overflow:
             self._end_line()
-        if self.tail:
-            if self.stats["dropped_events"]:
-                dropped = self.stats["dropped_events"], self.stats["dropped_bytes"]
-                self._write(f"[agent-relay dropped {dropped[0]} lines, {dropped[1]} bytes]\n".encode())
-            for line in self.tail:
-                self._write(line)
+        if self.protected is None and self.stats["dropped_events"]:
+            dropped = self.stats["dropped_events"], self.stats["dropped_bytes"]
+            self._write(f"[agent-relay dropped {dropped[0]} lines, {dropped[1]} bytes]\n".encode())
+        for line in self.tail:
+            self._write(line)
         self.stats["written_bytes"] = self.written
         self.stream.close()
 
@@ -194,7 +188,8 @@ class BoundedLog:
 
     def _event_line(self, line: bytes) -> None:
         assert self.protected is not None
-        oversized = len(line) > self.max_event_bytes
+        original = len(line)
+        oversized = original > self.max_event_bytes
         level = ORDINARY
         if oversized or self.written + len(line) > self.max_bytes - self.reserve:
             try:
@@ -204,21 +199,21 @@ class BoundedLog:
             if isinstance(event, dict):
                 level = self.protected(event)
                 if oversized and level == ORDINARY:
-                    shrunk = shrink_event(event, len(line), self.max_event_bytes)
-                    self.stats["truncated_events"] += 1
-                    self.stats["truncated_bytes"] += len(line) - len(shrunk)
-                    line = shrunk
+                    line = shrink_event(event, len(line), self.max_event_bytes)
         headroom = {ORDINARY: self.reserve, PARTIAL: self.reserve // 2, TERMINAL: 0}[level]
         if self.written + len(line) <= self.max_bytes - headroom:
+            if oversized and level == ORDINARY:
+                self.stats["truncated_events"] += 1
+                self.stats["truncated_bytes"] += original - len(line)
             self._write(line)
         else:
             self.stats["dropped_events"] += 1
             self.stats["dropped_bytes"] += len(line)
 
     def _text_line(self, line: bytes, overflowed: bool) -> None:
-        if overflowed or len(line) > self.max_event_bytes:
+        if overflowed or len(line) > self.line_limit:
             body = line.removesuffix(b"\n")
-            kept = _utf8_prefix(body, self.max_event_bytes - 1)
+            kept = _utf8_prefix(body, self.line_limit - 1)
             self.stats["truncated_events"] += 1
             self.stats["truncated_bytes"] += len(body) - len(kept)
             kept += b"\n"

@@ -80,6 +80,13 @@ elif mode == "edit-cancel":
     print("edited app.py", flush=True)
     pathlib.Path(os.environ["FAKE_CANCEL"]).write_text("cancel", encoding="utf-8")
     time.sleep(30)
+elif mode == "edit-fail":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    raise SystemExit(3)
+elif mode == "probe-sleep":
+    pathlib.Path("probe.txt").write_text("7319\\n", encoding="utf-8")
+    print("wrote probe.txt", flush=True)
+    time.sleep(30)
 elif mode == "edit-flood":
     pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
     while True:
@@ -313,6 +320,23 @@ class ToolsTests(unittest.TestCase):
         self.assertEqual(result["log_budget"]["max_log_bytes"], 200_000)
         self.assertGreater(result["log_stats"]["stdout"]["dropped_bytes"], 0)
 
+    def test_provider_failure_after_edits_keeps_the_workers_diff(self) -> None:
+        result = self.run_kind("execute", "edit-fail", owns=["app.py"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("code 3", result["error"])
+        self.assertNotIn("stop_reason", result)
+        self.assertIn("+    return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(list(self.clones.iterdir()), [])
+
+    def test_stopped_probe_keeps_its_untracked_files(self) -> None:
+        result = self.run_kind("probe", "probe-sleep", timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assertEqual(result["untracked_files"], ["probe.txt"])
+        self.assertIn("+7319", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["violations"], [])
+        self.assertIn("wrote probe.txt", result["partial_answer"])
+        self.assertEqual(list(self.clones.iterdir()), [])
+
     def test_tool_results_record_the_effective_log_budget(self) -> None:
         result = self.run_kind("execute", "edit", owns=["app.py"])
         self.assertEqual(result["log_budget"]["sources"], {"max_log_bytes": "kind", "max_event_bytes": "kind"})
@@ -352,6 +376,7 @@ class ToolsTests(unittest.TestCase):
         self.assertEqual(result["status"], "cancelled")
         self.assertLess(result["duration_seconds"], 15)
         self.assertEqual(result["stop_reason"], "cancelled")
+        self.assertEqual(result["checks"], [])
         self.assertIn("app.py", Path(result["diff_path"]).read_text(encoding="utf-8"))
         self.assertIn("edited app.py", result["provider_claims"])
         self.assertIsNone(result["clone"])

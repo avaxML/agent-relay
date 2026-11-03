@@ -529,7 +529,7 @@ def salvage(
     before: dict[str, str] | None,
     answer: str | None,
 ) -> None:
-    """Keep a stopped worker's edits and words before Relay discards its clone."""
+    """Keep a stopped or failed worker's edits and words before Relay discards its clone."""
     try:
         if clone is not None and before is not None:
             options = task["tools"]
@@ -543,11 +543,9 @@ def salvage(
         if answer is not None:
             answer_path = output / "answer.txt"
             answer_path.write_text(answer + "\n", encoding="utf-8")
-            result.update(
-                provider_claims=answer[:limit],
-                provider_claims_truncated=len(answer) > limit,
-                answer_path=str(answer_path),
-            )
+            field = "provider_claims" if "tools" in task else "answer"
+            result.update({field: answer[:limit], f"{field}_truncated": len(answer) > limit})
+            result["answer_path"] = str(answer_path)
             return
         stdout = output / "stdout.log"
         partial = (
@@ -622,18 +620,21 @@ def run_prepared(
                 heartbeat,
             )
             provider_capture = capture(clone, before, logs, options["check_timeout"])
-            check_results = [
-                run_check(
-                    command,
-                    clone.work,
-                    env,
-                    output / "checks" / f"{index:02d}",
-                    options["check_timeout"],
-                    cancel_file,
-                    heartbeat,
+            # Published as they finish, so a cancellation during checks keeps the records of completed ones.
+            check_results: list[dict[str, Any]] = []
+            result["checks"] = check_results
+            for index, command in enumerate(options["checks"]):
+                check_results.append(
+                    run_check(
+                        command,
+                        clone.work,
+                        env,
+                        output / "checks" / f"{index:02d}",
+                        options["check_timeout"],
+                        cancel_file,
+                        heartbeat,
+                    )
                 )
-                for index, command in enumerate(options["checks"])
-            ]
             if cancel_file is not None and cancel_file.exists():
                 raise RelayCancelled("Cancellation requested before result publication.")
             # Checks run code the provider may have edited; judge the clone as the lead will find it.
@@ -698,6 +699,8 @@ def run_prepared(
         salvage(task, result, output, clone, before, answer)
     except (RelayError, OSError, ValueError) as exc:
         result.update(status="error", error=str(exc))
+        # A provider that edited the clone and then exited nonzero or returned no answer still keeps its edits.
+        salvage(task, result, output, clone, before, answer)
     except KeyboardInterrupt:
         result.update(
             status="cancelled", stop_reason="cancelled", error="Delegation interrupted; worker process group stopped."

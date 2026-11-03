@@ -62,13 +62,13 @@ The `probe` and `execute` kinds need a tools mode. Without one, a provider rejec
 
 Relay streams a provider's stdout and stderr through a bounded writer instead of letting the CLI write the log files directly. A verbose provider is never stopped for being verbose. Cursor's `stream-json` output, for example, repeats every tool result in full, and a long `execute` run can exceed 4 MB of output.
 
-- **Per-event truncation.** A JSONL event larger than `max_event_bytes` is re-serialized with its longest string values clipped. Its keys, `type`, and `subtype` are kept, and a `relay_truncated_bytes` field records how much was removed. In practice this clips Cursor's `tool_call`/`completed` results first, because they are the large events. Lines that are not JSON pass through unchanged.
+- **Per-event truncation.** A JSONL event larger than `max_event_bytes` is re-serialized with its longest string values clipped. Its keys, `type`, and `subtype` are kept, and a `relay_truncated_bytes` field records how much was removed. In practice this clips Cursor's `tool_call`/`completed` results first, because they are the large events. Lines that are not JSON pass through unchanged, subject to the cap. An event longer than the whole stdout share cannot be parsed in bounded memory, so it is dropped and counted.
 - **Protected events.** Relay never truncates the events a decoder depends on, and keeps them past the point where ordinary events are dropped:
   - `cursor-jsonl` and `agy-jsonl`: the terminal `result` event;
   - `opencode-jsonl`: every `text` event, and every event that has a `type` of `error` or an `error` key.
 
   These events may use the whole cap, so each decoder still finds the final answer and still reports a provider failure. Cursor `assistant` messages are never truncated either. They may use half of the reserved quarter, so a stopped run still has a partial answer.
-- **Persisted cap.** stderr gets an eighth of `max_log_bytes` and stdout the rest, so the two log files together stay under `max_log_bytes`. Once stdout reaches three quarters of its share, ordinary events are dropped; the last quarter is reserved for protected events. A `text` stream (and stderr) keeps its first half and its last lines, with a `[agent-relay dropped N lines, B bytes]` marker between them, so a final answer printed last survives. A text line longer than `max_event_bytes` is cut on a UTF-8 boundary.
+- **Persisted cap.** stderr gets an eighth of `max_log_bytes` and stdout the rest, so the two log files together stay under `max_log_bytes`. Once stdout reaches three quarters of its share, ordinary events are dropped; the last quarter is reserved for protected events. A `text` stream (and stderr) keeps its first half and its last lines, with a `[agent-relay dropped N lines, B bytes]` marker between them, so a final answer printed last survives. A text line is cut, on a UTF-8 boundary, only when it is too long to fit in the tail; `max_event_bytes` applies to JSONL events, so a long single-line text answer is kept whole.
 - **Runaway ceiling.** Relay stops the worker only when the raw output passes `hard_ceiling_bytes`, which is 16 × `max_log_bytes`. This is a genuine runaway rather than verbosity.
 
 | Budget | `read`, `review`, `patch`, `chaos` | `probe`, `execute` |
@@ -83,10 +83,10 @@ An adapter may override the defaults for every kind:
 "limits": {"max_log_bytes": 32000000, "max_event_bytes": 128000}
 ```
 
-Both keys are optional and must be positive integers. `--max-log-bytes` and `--max-event-bytes` on `run`, `submit`, and `dispatch` take precedence over the adapter, which takes precedence over the kind's default. `max_event_bytes` must be at least 1024 and at most a quarter of `max_log_bytes`. Every `result.json` records:
+Both keys are optional and must be positive integers. `--max-log-bytes` and `--max-event-bytes` on `run`, `submit`, and `dispatch` take precedence over the adapter, which takes precedence over the kind's default. `max_event_bytes` must be at least 1024 and at most a quarter of `max_log_bytes`. `result.json` records:
 
-- `log_budget`: the effective values, plus `sources`, which says whether each value came from `cli`, `adapter`, or `kind`;
-- `log_stats`: for stdout and stderr, the bytes received and written, and the number of events and bytes truncated or dropped.
+- `log_budget`, always: the effective values, plus `sources`, which says whether each value came from `cli`, `adapter`, or `kind`;
+- `log_stats`, once the provider has been launched: for stdout and stderr, the bytes received and written, and the number of events and bytes truncated (and kept) or dropped.
 
 Relay's own setup and check commands and its git calls do not use the budget. Their output is either complete or refused: checks keep a 1 MB limit and git an 8 MB one, and passing that limit stops the command.
 
@@ -96,7 +96,7 @@ Relay's own setup and check commands and its git calls do not use the budget. Th
 - Runaway output: `status: "stopped"`, `stop_reason: "runaway_output"`.
 - Cancellation, whether by `cancel` or by a signal to the runner: `status: "cancelled"`, `stop_reason: "cancelled"`. This happens even when the cancellation arrives during Relay checks.
 
-Before it discards the clone of a stopped tool run, Relay captures it with the same rules as a successful run. It writes `changes.diff` and records `diff_path`, `files_changed`, `tracked_changes`, `untracked_files`, and `violations`. If that capture fails, Relay records `capture_error`.
+Before it discards the clone of a tool run that stopped or failed after the provider started, Relay captures the clone with the same rules as a successful run. This covers a stop, a cancellation, and a plain `error` such as a nonzero exit or an undecodable answer. Relay writes `changes.diff` and records `diff_path`, `files_changed`, `tracked_changes`, `untracked_files`, and `violations`. If that capture fails, Relay records `capture_error`. A run that stops before the provider starts, for example during setup, has no worker edits to capture.
 
 Relay also decodes whatever answer the log holds:
 

@@ -62,7 +62,7 @@ python3 <plugin-root>/scripts/relay.py collect --dispatch /abs/path/ledger.json 
 
 For every task:
 
-1. Read `result.json`: `status`, `stop_reason`, `violations`, `checks`, `provider_claims`, `env_removed`, `log_stats`. Treat `provider_claims` and `partial_answer` as unverified. A `stopped` or `cancelled` task still has a `changes.diff` holding the worker's edits up to the stop, but its checks never ran. Treat it as unfinished work to recover: read the diff, apply it, finish or re-dispatch the rest, and run the checks yourself.
+1. Read `result.json`: `status`, `stop_reason`, `violations`, `checks`, `provider_claims`, `env_removed`, `log_stats`. Treat `provider_claims` and `partial_answer` as unverified. A `stopped` or `cancelled` task still has a `changes.diff` holding the worker's edits up to the stop, but its checks did not complete: `checks` lists only the ones that finished before the stop. Treat it as unfinished work to recover: read the diff, apply it, finish or re-dispatch the rest, and run the checks yourself.
 2. Read the whole `changes.diff`. Confirm it touches only owned paths and does what the task asked.
 3. Confirm Relay's checks ran and passed. `check_failed` or `violation` is never acceptable as is.
 4. Apply in the real checkout with `git apply --check changes.diff`, then `git apply changes.diff`, then rerun the checks there yourself.

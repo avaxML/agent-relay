@@ -281,6 +281,32 @@ class BoundedLogTests(unittest.TestCase):
             with self.subTest(line=line[:10]), self.assertRaisesRegex(RelayError, "malformed JSON"):
                 decode_response(line + "\n", "cursor-jsonl")
 
+    def test_a_cut_text_line_counts_as_a_truncated_answer(self) -> None:
+        log = self.write("text", [b"A" * 30_000 + b"FINAL_ANSWER\n"], 20_000, 1_024)
+        self.assertEqual(log.stats["truncated_answer_events"], 1)
+
+    def test_stub_fallback_ignores_nested_discriminators(self) -> None:
+        nested: Any = "t"
+        for _ in range(2_000):
+            nested = [nested]
+        event = {"type": nested, **{f"k{index}": index for index in range(3_000)}}
+        shrunk = shrink_event(event, 100_000, 2_000)
+        assert shrunk is not None
+        self.assertLessEqual(len(shrunk), 2_000)
+
+    def test_write_failures_are_counted_not_raised(self) -> None:
+        log = BoundedLog(self.path, "cursor-jsonl", 1_000_000, 8_000)
+        with mock.patch.object(log.stream, "write", side_effect=OSError(28, "No space left on device")):
+            log.feed(b'{"type":"result","subtype":"success","result":"ok"}\n')
+        log.close()
+        self.assertEqual(log.stats["write_errors"], 1)
+
+    def test_opencode_null_error_events_are_ordinary(self) -> None:
+        event = {"type": "tool_use", "error": None, "part": {"state": {"output": TOOL_RESULT}}}
+        log = self.write("opencode-jsonl", [json.dumps(event).encode() + b"\n", *opencode_stream(1)], 1_000_000, 8_000)
+        self.assertEqual(log.stats["truncated_events"], 2)  # this event and the stream's own tool result
+        self.assertEqual(log.stats["truncated_answer_events"], 0)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")
@@ -689,6 +715,20 @@ class BudgetResolutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("did not fit", result["error"])
         self.assertGreater(result["log_stats"]["stdout"]["dropped_answer_events"], 0)
+
+    def test_a_text_answer_cut_mid_line_fails_the_run(self) -> None:
+        self.script.write_text("print('A' * 300_000 + 'FINAL_ANSWER')\n", encoding="utf-8")
+        path = self.directory / "fake.json"
+        path.write_text(json.dumps(self.adapter()), encoding="utf-8")
+        result = run(self.args(path, max_log_bytes=200_000, max_event_bytes=8_000))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did not fit", result["error"])
+        self.assertTrue(result["partial_answer"].startswith("AAAA"))
+
+    def test_result_records_survive_lone_surrogates(self) -> None:
+        target = self.directory / "record.json"
+        task_runner.write_json(target, {"metadata": {"session_ids": ["\ud800"]}})
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["metadata"]["session_ids"], ["\ud800"])
 
     def test_prepared_task_carries_the_budget_for_detached_jobs(self) -> None:
         path = self.directory / "fake.json"

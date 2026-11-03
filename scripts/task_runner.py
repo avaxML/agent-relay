@@ -395,6 +395,8 @@ def invoke_provider(
             f"The answer did not fit the {limits['max_log_bytes']}-byte log budget; rerun with a larger "
             "--max-log-bytes. What fit is in partial_answer and stdout.log."
         )
+    if stdout_stats["write_errors"]:
+        raise RelayError("Relay could not write the full stdout.log (disk full?); the answer cannot be trusted.")
     if stdout_stats["dropped_malformed_events"]:
         raise RelayError("Worker returned malformed JSON output past the log budget; inspect stdout.log.")
     return decode_response(provider_stdout(output, result["log_stats"]), adapter["output"])
@@ -411,7 +413,8 @@ def write_json(path: Path, value: Any) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".record-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, ensure_ascii=False)
+            # ASCII escapes: provider metadata may carry a lone surrogate that UTF-8 cannot encode.
+            json.dump(value, stream, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -529,7 +532,14 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
 
 def _record_capture(result: dict[str, Any], output: Path, captured: Capture, owns: list[str] | None) -> Path:
     diff_path = output / "changes.diff"
-    diff_path.write_bytes(captured.diff)
+    # Atomic, so a failed rewrite can never leave a truncated diff behind a diff_path the cleanup trusts.
+    descriptor, temporary = tempfile.mkstemp(prefix=".changes-", dir=output)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(captured.diff)
+        os.replace(temporary, diff_path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     if result["kind"] == "execute":
         files_changed = [*captured.tracked_changes, *captured.untracked_files]
     else:
@@ -554,7 +564,8 @@ def salvage(
 ) -> None:
     """Keep a stopped or failed worker's edits and words before Relay discards its clone."""
     try:
-        if clone is not None and before is not None:
+        # A diff already published by the normal path is final; salvage never recaptures over it.
+        if clone is not None and before is not None and "diff_path" not in result:
             options = task["tools"]
             try:
                 captured = capture(clone, before, output / "relay", options["check_timeout"])
@@ -565,7 +576,7 @@ def salvage(
         limit = task["max_answer_chars"]
         if answer is not None:
             answer_path = output / "answer.txt"
-            answer_path.write_text(answer + "\n", encoding="utf-8")
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
             field = "provider_claims" if "tools" in task else "answer"
             result.update({field: answer[:limit], f"{field}_truncated": len(answer) > limit})
             result["answer_path"] = str(answer_path)
@@ -579,7 +590,7 @@ def salvage(
         )
         if partial:
             partial_path = output / "partial-answer.txt"
-            partial_path.write_text(partial + "\n", encoding="utf-8")
+            partial_path.write_text(partial + "\n", encoding="utf-8", errors="replace")
             result.update(
                 partial_answer=partial[:limit],
                 partial_answer_truncated=len(partial) > limit,
@@ -676,7 +687,7 @@ def run_prepared(
             else:
                 status = "ok"
             answer_path = output / "answer.txt"
-            answer_path.write_text(answer + "\n", encoding="utf-8")
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
             result.update(
                 status=status,
                 checks=check_results,
@@ -709,7 +720,7 @@ def run_prepared(
                 if cancel_file is not None and cancel_file.exists():
                     raise RelayCancelled("Cancellation requested before result publication.")
                 answer_path = output / "answer.txt"
-                answer_path.write_text(answer + "\n", encoding="utf-8")
+                answer_path.write_text(answer + "\n", encoding="utf-8", errors="replace")
                 result.update(
                     status="ok",
                     answer=answer[: task["max_answer_chars"]],

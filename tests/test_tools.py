@@ -395,6 +395,18 @@ class ToolsTests(unittest.TestCase):
         self.assertIn("+    return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
         self.assertEqual(list(self.clones.iterdir()), [])
 
+    def test_salvage_never_recaptures_over_a_published_diff(self) -> None:
+        output = self.directory / "salvage-out"
+        output.mkdir()
+        (output / "changes.diff").write_text("original diff\n", encoding="utf-8")
+        result: dict[str, Any] = {"kind": "execute", "diff_path": str(output / "changes.diff")}
+        task: dict[str, Any] = {"tools": {"check_timeout": 5, "owns": []}, "max_answer_chars": 100}
+        task["adapter"] = {"output": "text"}
+        with mock.patch.object(task_runner, "capture", side_effect=AssertionError("recaptured")):
+            task_runner.salvage(task, result, output, mock.Mock(), {}, "answer")
+        self.assertEqual((output / "changes.diff").read_text(encoding="utf-8"), "original diff\n")
+        self.assertNotIn("capture_error", result)
+
     def test_stopped_probe_keeps_its_untracked_files(self) -> None:
         result = self.run_kind("probe", "probe-sleep", timeout=2)
         self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))

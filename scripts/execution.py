@@ -129,7 +129,8 @@ def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: b
         }
         best = render(stub)
         if len(best) > limit:
-            best = render({key: _clip(event[key], 64) for key in DISCRIMINATORS if key in event})
+            # Only string discriminators: a nested value here could recurse past the limit or never fit.
+            best = render({key: event[key][:64] for key in DISCRIMINATORS if isinstance(event.get(key), str)})
     return best
 
 
@@ -171,6 +172,7 @@ class BoundedLog:
             "dropped_answer_events": 0,
             "truncated_answer_events": 0,
             "dropped_malformed_events": 0,
+            "write_errors": 0,
         }
 
     def feed(self, data: bytes) -> None:
@@ -193,10 +195,21 @@ class BoundedLog:
             self._write(TEXT_DROP_MARKER.format(*dropped).encode() + b"\n")
         self._write(bytes(self.tail))
         self.stats["written_bytes"] = self.written
-        self.stream.close()
+        try:
+            self.stream.close()
+        except OSError:
+            self.stats["write_errors"] += 1
 
     def _write(self, data: bytes) -> None:
-        self.stream.write(data)
+        # A failed write (disk full) must not end the run silently or as a crash: it is counted, and a provider
+        # whose stdout log failed is never decoded as a success.
+        if self.stats["write_errors"]:
+            return
+        try:
+            self.stream.write(data)
+        except OSError:
+            self.stats["write_errors"] += 1
+            return
         self.written += len(data)
 
     def _append(self, piece: bytes) -> None:
@@ -272,6 +285,8 @@ class BoundedLog:
         if overflowed or len(line) > self.line_limit:
             body = line.removesuffix(b"\n")
             kept = _utf8_prefix(body, self.line_limit - 1)
+            # The end of the line is lost, and a text answer often ends there.
+            self.stats["truncated_answer_events"] += 1
             self.stats["truncated_events"] += 1
             self.stats["truncated_bytes"] += len(body) - len(kept)
             kept += b"\n"
@@ -383,13 +398,16 @@ def _execute_bounded(
         if process is not None:
             # Also clean up descendants left behind by a completed private CLI. Keep reading during the SIGTERM
             # grace period so a provider flushing on shutdown is not blocked on a full pipe and then killed.
-            _signal_group(process, signal.SIGTERM)
-            grace = time.monotonic() + 1
-            with suppress(OSError):
-                while process.poll() is None and time.monotonic() < grace:
-                    _pump(selector, 0.05)
-            _signal_group(process, signal.SIGKILL)
-            process.wait()
+            try:
+                _signal_group(process, signal.SIGTERM)
+                grace = time.monotonic() + 1
+                with suppress(OSError):
+                    while process.poll() is None and time.monotonic() < grace:
+                        _pump(selector, 0.05)
+            finally:
+                # Whatever the drain did, the group is killed and reaped.
+                _signal_group(process, signal.SIGKILL)
+                process.wait()
         # Cleanup must not replace the exception that stopped the worker, such as a timeout with work to salvage.
         deadline = time.monotonic() + DRAIN_SECONDS
         with suppress(OSError):

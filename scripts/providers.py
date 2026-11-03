@@ -496,7 +496,8 @@ def _agy_level(event: dict[str, Any]) -> int:
 
 
 def _opencode_level(event: dict[str, Any]) -> int:
-    return TERMINAL if event.get("type") in ("text", "error") or "error" in event else ORDINARY
+    # Exactly the decoder's failure test: a truthy error, not merely an error key.
+    return TERMINAL if event.get("type") in ("text", "error") or event.get("error") else ORDINARY
 
 
 EVENT_LEVELS: dict[str, Callable[[dict[str, Any]], int]] = {

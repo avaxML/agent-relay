@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import isolation
+import task_runner
 from providers import RelayError
 from task_runner import prepare_task, run, run_prepared
 
@@ -71,6 +72,26 @@ elif mode == "sleep":
 elif mode == "cancel":
     pathlib.Path(os.environ["FAKE_CANCEL"]).write_text("cancel", encoding="utf-8")
     time.sleep(30)
+elif mode == "edit-sleep":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    print("edited app.py, still working", flush=True)
+    time.sleep(30)
+elif mode == "edit-cancel":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    print("edited app.py", flush=True)
+    pathlib.Path(os.environ["FAKE_CANCEL"]).write_text("cancel", encoding="utf-8")
+    time.sleep(30)
+elif mode == "edit-fail":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    raise SystemExit(3)
+elif mode == "probe-sleep":
+    pathlib.Path("probe.txt").write_text("7319\\n", encoding="utf-8")
+    print("wrote probe.txt", flush=True)
+    time.sleep(30)
+elif mode == "edit-flood":
+    pathlib.Path("app.py").write_text("def answer():\\n    return 2\\n", encoding="utf-8")
+    while True:
+        sys.stdout.write("noise " * 10000 + "\\n")
 else:
     raise SystemExit(f"unknown FAKE_MODE {mode}")
 """
@@ -250,11 +271,190 @@ class ToolsTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(list(self.clones.iterdir()), [])
 
-    def test_provider_timeout_is_an_error_and_keeps_logs(self) -> None:
+    def test_provider_timeout_is_a_stop_and_keeps_logs(self) -> None:
         result = self.run_kind("probe", "sleep", timeout=1)
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["stop_reason"], "timeout")
         self.assertEqual(list(self.clones.iterdir()), [])
         self.assertTrue((Path(result["output_dir"]) / "stderr.log").is_file())
+
+    def assert_edit_salvaged(self, result: dict[str, Any]) -> None:
+        diff_path = Path(result["diff_path"])
+        self.assertEqual(diff_path, Path(result["output_dir"]) / "changes.diff")
+        self.assertIn("+    return 2", diff_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["files_changed"], ["app.py"])
+        self.assertEqual(result["violations"], [])
+        self.assertIsNone(result["clone"])
+        self.assertEqual(list(self.clones.iterdir()), [])
+        recorded = json.loads((Path(result["output_dir"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(recorded["stop_reason"], result["stop_reason"])
+        self.assertEqual(self._status(), "")
+
+    def test_timeout_keeps_the_workers_diff_and_partial_answer(self) -> None:
+        result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assert_edit_salvaged(result)
+        self.assertEqual(result["checks"], [])
+        self.assertIn("still working", result["partial_answer"])
+        self.assertIn("still working", Path(result["partial_answer_path"]).read_text(encoding="utf-8"))
+
+    def test_cancellation_keeps_the_workers_diff(self) -> None:
+        cancel_file = self.directory / "cancel.request"
+        args = self.make_args("execute", owns=["app.py"])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        environment = {
+            "FAKE_MODE": "edit-cancel",
+            "FAKE_CANCEL": str(cancel_file),
+            "AGENT_RELAY_CLONES_DIR": str(self.clones),
+        }
+        with mock.patch.dict(os.environ, environment):
+            result = run_prepared(task, output, cancel_file)
+        self.assertEqual((result["status"], result["stop_reason"]), ("cancelled", "cancelled"))
+        self.assert_edit_salvaged(result)
+
+    def test_runaway_output_keeps_the_workers_diff(self) -> None:
+        result = self.run_kind("execute", "edit-flood", owns=["app.py"], max_log_bytes=200_000, max_event_bytes=10_000)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "runaway_output"))
+        self.assert_edit_salvaged(result)
+        self.assertLessEqual((Path(result["output_dir"]) / "stdout.log").stat().st_size, 200_000)
+        self.assertEqual(result["log_budget"]["max_log_bytes"], 200_000)
+        self.assertGreater(result["log_stats"]["stdout"]["dropped_bytes"], 0)
+
+    def test_provider_failure_after_edits_keeps_the_workers_diff(self) -> None:
+        result = self.run_kind("execute", "edit-fail", owns=["app.py"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("code 3", result["error"])
+        self.assertNotIn("stop_reason", result)
+        self.assertIn("+    return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(list(self.clones.iterdir()), [])
+
+    def test_an_internal_error_still_publishes_a_terminal_result_and_the_diff(self) -> None:
+        args = self.make_args("execute", owns=["app.py"])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        real = task_runner.decode_response
+
+        def broken(*arguments: Any) -> Any:
+            real(*arguments)
+            raise RuntimeError("decoder bug")
+
+        environment = {"FAKE_MODE": "edit", "AGENT_RELAY_CLONES_DIR": str(self.clones)}
+        with (
+            mock.patch.dict(os.environ, environment),
+            mock.patch.object(task_runner, "decode_response", broken),
+            self.assertRaisesRegex(RuntimeError, "decoder bug"),
+        ):
+            run_prepared(task, output)
+        recorded = json.loads((output / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(recorded["status"], "error")
+        self.assertIn("decoder bug", recorded["error"])
+        self.assertIn("+    return 2", (output / "changes.diff").read_text(encoding="utf-8"))
+        self.assertEqual(list(self.clones.iterdir()), [])
+
+    def test_failed_capture_keeps_the_clone_for_manual_recovery(self) -> None:
+        with mock.patch.object(task_runner, "capture", side_effect=RelayError("git timed out")):
+            result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assertEqual(result["capture_error"], "git timed out")
+        clone = Path(result["clone"])
+        self.assertIn("return 2", (clone / "app.py").read_text(encoding="utf-8"))
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(clone.parent)
+
+    def test_a_failed_diff_write_keeps_the_clone(self) -> None:
+        with mock.patch.object(task_runner, "_record_capture", side_effect=OSError(28, "No space left on device")):
+            result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assertIn("No space left", result["salvage_error"])
+        self.assertIn("still working", result["partial_answer"])
+        clone = Path(result["clone"])
+        self.assertIn("return 2", (clone / "app.py").read_text(encoding="utf-8"))
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(clone.parent)
+
+    def test_a_clipped_answer_fails_the_run_but_keeps_what_fit(self) -> None:
+        script = self.directory / "clipped.py"
+        script.write_text(
+            "import json, pathlib\n"
+            "pathlib.Path('app.py').write_text('def answer():\\n    return 2\\n')\n"
+            "for i in range(60):\n"
+            "    print(json.dumps({'type': 'tool_call', 'subtype': 'completed', 'r': 'x' * 4000}))\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'A' * 300000}))\n",
+            encoding="utf-8",
+        )
+        adapter = json.loads(self.adapter.read_text(encoding="utf-8"))
+        adapter["output"] = "cursor-jsonl"
+        adapter["tools"]["args"] = [str(script), "{request_file}"]
+        self.adapter.write_text(json.dumps(adapter), encoding="utf-8")
+        result = self.run_kind("execute", "edit", owns=["app.py"], max_log_bytes=400_000, max_event_bytes=4_000)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did not fit", result["error"])
+        self.assertTrue(result["partial_answer"].startswith("AAAA"))
+        self.assertIn("+    return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(list(self.clones.iterdir()), [])
+
+    def test_salvage_never_recaptures_over_a_published_diff(self) -> None:
+        output = self.directory / "salvage-out"
+        output.mkdir()
+        (output / "changes.diff").write_text("original diff\n", encoding="utf-8")
+        result: dict[str, Any] = {"kind": "execute", "diff_path": str(output / "changes.diff")}
+        task: dict[str, Any] = {"tools": {"check_timeout": 5, "owns": []}, "max_answer_chars": 100}
+        task["adapter"] = {"output": "text"}
+        with mock.patch.object(task_runner, "capture", side_effect=AssertionError("recaptured")):
+            task_runner.salvage(task, result, output, mock.Mock(), {}, "answer")
+        self.assertEqual((output / "changes.diff").read_text(encoding="utf-8"), "original diff\n")
+        self.assertNotIn("capture_error", result)
+
+    def test_a_stop_during_checks_reports_what_the_checks_changed(self) -> None:
+        cancel_file = self.directory / "cancel.request"
+        first = 'python3 -c \'open("stray.txt", "w").write("x")\''
+        second = (
+            f"python3 -c 'import pathlib, time; pathlib.Path({json.dumps(str(cancel_file))}).touch(); time.sleep(30)'"
+        )
+        args = self.make_args("execute", owns=["app.py"], checks=[first, second])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        with mock.patch.dict(os.environ, {"FAKE_MODE": "edit", "AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            result = run_prepared(task, output, cancel_file)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["check_side_effects"], ["stray.txt"])
+        self.assertEqual([record["exit_code"] for record in result["checks"]], [0])
+
+    def test_a_check_that_reverts_the_edits_cannot_erase_them(self) -> None:
+        cancel_file = self.directory / "cancel.request"
+        revert = "git checkout -- app.py"
+        stall = (
+            f"python3 -c 'import pathlib, time; pathlib.Path({json.dumps(str(cancel_file))}).touch(); time.sleep(30)'"
+        )
+        args = self.make_args("execute", owns=["app.py"], checks=[revert, stall])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        with mock.patch.dict(os.environ, {"FAKE_MODE": "edit", "AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            result = run_prepared(task, output, cancel_file)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertNotIn("return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertIn("+    return 2", Path(result["provider_diff_path"]).read_text(encoding="utf-8"))
+
+    def test_stopped_probe_keeps_its_untracked_files(self) -> None:
+        result = self.run_kind("probe", "probe-sleep", timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assertEqual(result["untracked_files"], ["probe.txt"])
+        self.assertIn("+7319", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["violations"], [])
+        self.assertIn("wrote probe.txt", result["partial_answer"])
+        self.assertEqual(list(self.clones.iterdir()), [])
+
+    def test_tool_results_record_the_effective_log_budget(self) -> None:
+        result = self.run_kind("execute", "edit", owns=["app.py"])
+        self.assertEqual(result["log_budget"]["sources"], {"max_log_bytes": "kind", "max_event_bytes": "kind"})
+        self.assertGreater(result["log_budget"]["hard_ceiling_bytes"], result["log_budget"]["max_log_bytes"])
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(Path(result["clone"]).parent)
 
     def test_cancellation_removes_the_clone(self) -> None:
         cancel_file = self.directory / "cancel.request"
@@ -287,6 +487,11 @@ class ToolsTests(unittest.TestCase):
             result = run_prepared(task, output, cancel_file)
         self.assertEqual(result["status"], "cancelled")
         self.assertLess(result["duration_seconds"], 15)
+        self.assertEqual(result["stop_reason"], "cancelled")
+        self.assertEqual(result["checks"], [])
+        self.assertEqual(result["check_side_effects"], [])
+        self.assertIn("app.py", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertIn("edited app.py", result["provider_claims"])
         self.assertIsNone(result["clone"])
         self.assertEqual(list(self.clones.iterdir()), [])
 

@@ -66,7 +66,7 @@ python3 scripts/relay.py run \
   --kind read
 ```
 
-Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout SECONDS` (default 180, or the effort level's declared timeout), `--max-input-bytes 400000`, and `--max-answer-chars 12000`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
+Use `--kind review` for an independent review, `--kind chaos` for a bounded proposal-only resilience review, or `--kind patch` for an implementation proposal. Chaos tasks must state a steady-state hypothesis and invariants; the returned fault scenarios and experiments remain hypotheses for the lead agent to verify in source. Optional controls include `--model`, `--effort`, `--timeout SECONDS` (default 180, or the effort level's declared timeout), `--max-input-bytes 400000`, `--max-answer-chars 12000`, `--max-log-bytes`, and `--max-event-bytes`. `--adapter-file ABSOLUTE_JSON` selects a provider definition for one invocation. `--registry-dir PATH` selects a different adapter registry. See [adding a CLI adapter](references/adding-adapters.md).
 
 ## Tool-enabled kinds and the executor
 
@@ -84,7 +84,10 @@ python3 scripts/relay.py run --provider opencode --kind execute \
 - `violations`, `files_changed` and `untracked_files`;
 - `diff_path` (`changes.diff`), and `clone` for `execute`, kept until cleanup;
 - `env_removed`;
-- `status`: `ok`, `violation`, `check_failed`, `error`, or `cancelled`.
+- `log_budget` (the effective log limits) and `log_stats` (bytes truncated or dropped);
+- `status`: `ok`, `violation`, `check_failed`, `error`, `stopped`, or `cancelled`, with `stop_reason` for a stop.
+
+Relay bounds provider logs rather than stopping verbose providers. Oversized events are truncated, events past the cap are dropped and counted, and only a runaway past 16 × `--max-log-bytes` stops the worker. If the answer itself was clipped or lost, the run fails rather than passing part of it off as all of it. A timeout, a runaway, or a cancellation still writes `changes.diff` and any partial answer before Relay removes the clone. See [the log budget](references/adding-adapters.md#log-budget-truncation-and-stops).
 
 A tracked change in a probe, a change outside `--owns`, or any `.git` change is a violation. Empty provider output is an error. Apply an `execute` result yourself with `git apply --check` and `git apply` after reading the diff.
 

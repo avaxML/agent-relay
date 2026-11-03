@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from execution import execute
+from execution import OutputBudget, execute
 from isolation import (
     Capture,
     Clone,
@@ -30,10 +30,14 @@ from isolation import (
     validate_globs,
 )
 from providers import (
+    MAX_LOG_BYTES,
     RelayCancelled,
     RelayError,
+    RelayStopped,
     decode_exit_failure,
+    decode_partial,
     decode_response,
+    exit_signatures,
     load_adapter,
     resolve_effort,
     resolve_invocation,
@@ -55,10 +59,25 @@ TOOLS = (
 )
 
 
+# Tool kinds run long agent loops whose streams echo every tool result, so they get larger log budgets.
+READ_LOG_BYTES, READ_EVENT_BYTES = 4_000_000, 32_000
+TOOL_LOG_BYTES, TOOL_EVENT_BYTES = 16_000_000, 64_000
+# Output past this multiple of the persisted cap is a runaway, not verbosity.
+HARD_CEILING_FACTOR = 16
+
+
 @dataclass(frozen=True)
 class Kind:
     instructions: str
     tools: bool = False
+
+    @property
+    def max_log_bytes(self) -> int:
+        return TOOL_LOG_BYTES if self.tools else READ_LOG_BYTES
+
+    @property
+    def max_event_bytes(self) -> int:
+        return TOOL_EVENT_BYTES if self.tools else READ_EVENT_BYTES
 
 
 KINDS: dict[str, Kind] = {
@@ -102,6 +121,39 @@ KINDS: dict[str, Kind] = {
         tools=True,
     ),
 }
+
+
+def resolve_log_budget(
+    adapter: dict[str, Any], kind: str, max_log_bytes: int | None, max_event_bytes: int | None
+) -> dict[str, Any]:
+    """An explicit flag wins, then the adapter's limits, then the kind's default."""
+    limits = adapter.get("limits", {})
+    defaults = {"max_log_bytes": KINDS[kind].max_log_bytes, "max_event_bytes": KINDS[kind].max_event_bytes}
+    given = {"max_log_bytes": max_log_bytes, "max_event_bytes": max_event_bytes}
+    budget: dict[str, Any] = {"sources": {}}
+    for name, default in defaults.items():
+        if given[name] is not None:
+            budget[name], budget["sources"][name] = given[name], "cli"
+        elif name in limits:
+            budget[name], budget["sources"][name] = limits[name], "adapter"
+        else:
+            budget[name], budget["sources"][name] = default, "kind"
+
+    def origin(name: str) -> str:
+        source = budget["sources"][name]
+        flag = "--" + name.replace("_", "-")
+        return {"cli": flag, "adapter": f"adapter limits.{name}", "kind": f"the {kind} default"}[source]
+
+    if budget["max_log_bytes"] > MAX_LOG_BYTES:
+        raise RelayError(f"max_log_bytes from {origin('max_log_bytes')} must be at most {MAX_LOG_BYTES} (256 MiB).")
+    if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
+        raise RelayError(
+            "max_event_bytes must be at least 1024 and at most a quarter of max_log_bytes; got "
+            f"{budget['max_event_bytes']} from {origin('max_event_bytes')} and "
+            f"{budget['max_log_bytes']} from {origin('max_log_bytes')}."
+        )
+    budget["hard_ceiling_bytes"] = budget["max_log_bytes"] * HARD_CEILING_FACTOR
+    return budget
 
 
 def provider_workspace(name: str) -> Path:
@@ -269,7 +321,7 @@ def run_check(
         error = str(exc)
     duration_seconds = round(time.monotonic() - started, 3)
     output_tail = "".join(
-        (directory / name).read_text(encoding="utf-8", errors="replace")
+        (directory / name).read_text(encoding="utf-8", errors="backslashreplace")
         for name in ("stdout.log", "stderr.log")
         if (directory / name).is_file()
     )
@@ -318,20 +370,50 @@ def invoke_provider(
         **extra,
     }
     argv = [adapter["executable"]] + [arg.format_map(values) for arg in args] + task["effort_args"]
-    code = execute(
-        argv,
-        cwd,
-        env,
-        stdin_file,
-        output,
-        task["timeout"],
-        cancel_file=cancel_file,
-        heartbeat=heartbeat,
+    limits = task["log_budget"]
+    budget = OutputBudget(
+        adapter["output"],
+        limits["max_log_bytes"],
+        limits["max_event_bytes"],
+        limits["hard_ceiling_bytes"],
+        stderr_watch=exit_signatures(adapter),
     )
+    try:
+        code = execute(
+            argv,
+            cwd,
+            env,
+            stdin_file,
+            output,
+            task["timeout"],
+            cancel_file=cancel_file,
+            heartbeat=heartbeat,
+            budget=budget,
+        )
+    finally:
+        if budget.logs:
+            result["log_stats"] = budget.stats()
     result["exit_code"] = code
     if code:
-        raise decode_exit_failure(adapter, code, output / "stderr.log")
-    return decode_response((output / "stdout.log").read_text(encoding="utf-8"), adapter["output"])
+        raise decode_exit_failure(adapter, code, output / "stderr.log", budget.logs["stderr"].seen)
+    stdout_stats = result["log_stats"]["stdout"]
+    if stdout_stats["dropped_answer_events"] or stdout_stats["truncated_answer_events"]:
+        # Decoding what is left would pass part of the answer off as all of it.
+        raise RelayError(
+            f"The answer did not fit the {limits['max_log_bytes']}-byte log budget; rerun with a larger "
+            "--max-log-bytes. What fit is in partial_answer and stdout.log."
+        )
+    if stdout_stats["write_errors"]:
+        raise RelayError("Relay could not write the full stdout.log (disk full?); the answer cannot be trusted.")
+    if stdout_stats["dropped_malformed_events"]:
+        raise RelayError("Worker returned malformed JSON output past the log budget; inspect stdout.log.")
+    return decode_response(provider_stdout(output, result["log_stats"]), adapter["output"])
+
+
+def provider_stdout(output: Path, log_stats: dict[str, Any], errors: str = "strict") -> str:
+    """The provider stdout a decoder should see: for a bounded text log, only what followed Relay's drop."""
+    data = (output / "stdout.log").read_bytes()
+    return data[log_stats.get("stdout", {}).get("tail_offset", 0) :].decode("utf-8", errors=errors)
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -339,7 +421,8 @@ def write_json(path: Path, value: Any) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".record-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, ensure_ascii=False)
+            # ASCII escapes: provider metadata may carry a lone surrogate that UTF-8 cannot encode.
+            json.dump(value, stream, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -375,6 +458,9 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     requested_model = args.model or adapter["default_model"]
     model, effort_args = resolve_effort(adapter, requested_model, args.effort)
     timeout = resolve_timeout(adapter, args.effort, model, args.timeout)
+    log_budget = resolve_log_budget(
+        adapter, args.kind, getattr(args, "max_log_bytes", None), getattr(args, "max_event_bytes", None)
+    )
     ref = getattr(args, "ref", "HEAD")
     owns = list(getattr(args, "owns", None) or [])
     checks = list(getattr(args, "checks", None) or [])
@@ -388,6 +474,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
             "request": request,
             "effort_args": effort_args,
             "timeout": timeout,
+            "log_budget": log_budget,
             "max_answer_chars": args.max_answer_chars,
             "result": {
                 "schema_version": 1,
@@ -400,6 +487,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
                 "kind": args.kind,
                 "sources": sources,
                 "input_bytes": len(request.encode()),
+                "log_budget": log_budget,
             },
         }
     resolve_invocation(adapter, True)
@@ -418,6 +506,7 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
         "request": request,
         "effort_args": effort_args,
         "timeout": timeout,
+        "log_budget": log_budget,
         "max_answer_chars": args.max_answer_chars,
         "tools": {
             "root": str(root),
@@ -444,8 +533,95 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
             "declared_checks": checks,
             "setup": setup,
             "input_bytes": len(request.encode()),
+            "log_budget": log_budget,
         },
     }
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Atomic, so a failed rewrite can never leave a truncated diff behind a path the cleanup trusts."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _record_capture(result: dict[str, Any], output: Path, captured: Capture, owns: list[str] | None) -> Path:
+    diff_path = output / "changes.diff"
+    _write_atomic(diff_path, captured.diff)
+    if result["kind"] == "execute":
+        files_changed = [*captured.tracked_changes, *captured.untracked_files]
+    else:
+        files_changed = list(captured.tracked_changes)
+    result.update(
+        diff_path=str(diff_path),
+        files_changed=files_changed,
+        tracked_changes=captured.tracked_changes,
+        untracked_files=captured.untracked_files,
+        violations=find_violations(captured, owns),
+    )
+    return diff_path
+
+
+def salvage(
+    task: dict[str, Any],
+    result: dict[str, Any],
+    output: Path,
+    clone: Clone | None,
+    before: dict[str, str] | None,
+    answer: str | None,
+    provider_capture: Capture | None = None,
+) -> None:
+    """Keep a stopped or failed worker's edits and words before Relay discards its clone."""
+    try:
+        # A diff already published by the normal path is final; salvage never recaptures over it.
+        if clone is not None and before is not None and "diff_path" not in result:
+            options = task["tools"]
+            try:
+                captured = capture(clone, before, output / "relay", options["check_timeout"])
+            except (RelayError, OSError) as exc:
+                result["capture_error"] = str(exc)
+            else:
+                try:
+                    _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+                    if provider_capture is not None:
+                        # Stopped during checks: say which changes the checks, not the worker, made.
+                        result["check_side_effects"] = sorted(
+                            set(_captured_paths(captured)) ^ set(_captured_paths(provider_capture))
+                        )
+                except (RelayError, OSError, ValueError) as exc:
+                    # The clone is kept (no diff_path); still try to save the worker's words below.
+                    result["salvage_error"] = str(exc)
+        limit = task["max_answer_chars"]
+        if answer is not None:
+            # Fields first: a failed file write must not also lose the text from result.json.
+            field = "provider_claims" if "tools" in task else "answer"
+            result.update({field: answer[:limit], f"{field}_truncated": len(answer) > limit})
+            answer_path = output / "answer.txt"
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="backslashreplace")
+            result["answer_path"] = str(answer_path)
+            return
+        partial = (
+            decode_partial(
+                provider_stdout(output, result.get("log_stats", {}), errors="replace"), task["adapter"]["output"]
+            )
+            if (output / "stdout.log").is_file()
+            else None
+        )
+        if partial:
+            result.update(
+                # The end, not the start: a stopped run's latest words are what the lead needs.
+                partial_answer=partial[-limit:],
+                partial_answer_truncated=len(partial) > limit,
+            )
+            partial_path = output / "partial-answer.txt"
+            partial_path.write_text(partial + "\n", encoding="utf-8", errors="backslashreplace")
+            result["partial_answer_path"] = str(partial_path)
+    except (RelayError, OSError, ValueError) as exc:
+        result["salvage_error"] = str(exc)
 
 
 def run_prepared(
@@ -455,6 +631,9 @@ def run_prepared(
     result = {**task["result"], "output_dir": str(output)}
     started = time.monotonic()
     clone: Clone | None = None
+    before: dict[str, str] | None = None
+    answer: str | None = None
+    provider_capture: Capture | None = None
     try:
         if "tools" in task:
             options = task["tools"]
@@ -486,6 +665,9 @@ def run_prepared(
                 if record["exit_code"] != 0:
                     raise RelayError(f"Setup command failed: {command}")
             before = snapshot_metadata(clone.work)
+            # Present from the provider's start, so a stop at any point reports which checks finished (none yet).
+            check_results: list[dict[str, Any]] = []
+            result["checks"] = check_results
             workdir = output / "workdir"
             workdir.mkdir(mode=0o700, parents=True)
             answer, metadata = invoke_provider(
@@ -501,31 +683,33 @@ def run_prepared(
                 heartbeat,
             )
             provider_capture = capture(clone, before, logs, options["check_timeout"])
-            check_results = [
-                run_check(
-                    command,
-                    clone.work,
-                    env,
-                    output / "checks" / f"{index:02d}",
-                    options["check_timeout"],
-                    cancel_file,
-                    heartbeat,
+            # The provider's own edits, saved before any check runs: a check may rewrite or revert them, and a
+            # stop during checks would otherwise capture only what the checks left.
+            provider_diff = output / "provider-changes.diff"
+            _write_atomic(provider_diff, provider_capture.diff)
+            result["provider_diff_path"] = str(provider_diff)
+            # Published as they finish, so a cancellation during checks keeps the records of completed ones.
+            for index, command in enumerate(options["checks"]):
+                check_results.append(
+                    run_check(
+                        command,
+                        clone.work,
+                        env,
+                        output / "checks" / f"{index:02d}",
+                        options["check_timeout"],
+                        cancel_file,
+                        heartbeat,
+                    )
                 )
-                for index, command in enumerate(options["checks"])
-            ]
             if cancel_file is not None and cancel_file.exists():
                 raise RelayCancelled("Cancellation requested before result publication.")
             # Checks run code the provider may have edited; judge the clone as the lead will find it.
             captured = capture(clone, before, logs, options["check_timeout"]) if check_results else provider_capture
             check_side_effects = sorted(set(_captured_paths(captured)) ^ set(_captured_paths(provider_capture)))
-            diff_path = output / "changes.diff"
-            diff_path.write_bytes(captured.diff)
-            violations = find_violations(captured, options["owns"] if result["kind"] == "execute" else None)
+            _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
+            violations = result["violations"]
+            files_changed = result["files_changed"]
             passed = sum(record["exit_code"] == 0 for record in check_results)
-            if result["kind"] == "execute":
-                files_changed = [*captured.tracked_changes, *captured.untracked_files]
-            else:
-                files_changed = list(captured.tracked_changes)
             if violations:
                 status = "violation"
             elif any(record["exit_code"] != 0 for record in check_results):
@@ -533,14 +717,9 @@ def run_prepared(
             else:
                 status = "ok"
             answer_path = output / "answer.txt"
-            answer_path.write_text(answer + "\n", encoding="utf-8")
+            answer_path.write_text(answer + "\n", encoding="utf-8", errors="backslashreplace")
             result.update(
                 status=status,
-                diff_path=str(diff_path),
-                files_changed=files_changed,
-                tracked_changes=captured.tracked_changes,
-                untracked_files=captured.untracked_files,
-                violations=violations,
                 checks=check_results,
                 check_side_effects=check_side_effects,
                 provider_claims=answer[: task["max_answer_chars"]],
@@ -571,7 +750,7 @@ def run_prepared(
                 if cancel_file is not None and cancel_file.exists():
                     raise RelayCancelled("Cancellation requested before result publication.")
                 answer_path = output / "answer.txt"
-                answer_path.write_text(answer + "\n", encoding="utf-8")
+                answer_path.write_text(answer + "\n", encoding="utf-8", errors="backslashreplace")
                 result.update(
                     status="ok",
                     answer=answer[: task["max_answer_chars"]],
@@ -579,23 +758,46 @@ def run_prepared(
                     answer_path=str(answer_path),
                     metadata=metadata,
                 )
-    except RelayCancelled as exc:
-        result.update(status="cancelled", error=str(exc))
+    except RelayStopped as exc:
+        # User cancellation keeps its job-level meaning; timeouts and runaways are a distinct terminal status.
+        status = "cancelled" if isinstance(exc, RelayCancelled) else "stopped"
+        result.update(status=status, stop_reason=exc.reason, error=str(exc))
+        salvage(task, result, output, clone, before, answer, provider_capture)
     except (RelayError, OSError, ValueError) as exc:
         result.update(status="error", error=str(exc))
+        # A provider that edited the clone and then exited nonzero or returned no answer still keeps its edits.
+        salvage(task, result, output, clone, before, answer, provider_capture)
     except KeyboardInterrupt:
-        result.update(status="cancelled", error="Delegation interrupted; worker process group stopped.")
+        result.update(
+            status="cancelled", stop_reason="cancelled", error="Delegation interrupted; worker process group stopped."
+        )
+        salvage(task, result, output, clone, before, answer, provider_capture)
+    except Exception as exc:
+        # Never publish "running" for a finished run; keep the work, then surface the bug to the caller.
+        result.update(status="error", error=f"Internal error: {exc!r}")
+        salvage(task, result, output, clone, before, answer, provider_capture)
+        raise
     finally:
-        if clone is not None and not (
-            result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}
-        ):
-            try:
-                remove_clone(clone.directory)
-            except (RelayError, OSError) as exc:
-                result["cleanup_error"] = str(exc)
-            result["clone"] = None
-        result["duration_seconds"] = round(time.monotonic() - started, 3)
-        write_json(output / "result.json", result)
+        # Once the provider has run, the clone is the only copy of its work until changes.diff is written; a
+        # failed capture, a failed write, or a second interrupt during salvage therefore keeps it for recovery.
+        try:
+            if clone is not None and before is not None and "diff_path" not in result:
+                result["clone"] = str(clone.work)
+            elif clone is not None and not (
+                result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}
+            ):
+                try:
+                    remove_clone(clone.directory)
+                except (RelayError, OSError) as exc:
+                    # Still on disk, so say where.
+                    result["cleanup_error"] = str(exc)
+                    result["clone"] = str(clone.work)
+                else:
+                    result["clone"] = None
+        finally:
+            # Published even if a second signal interrupts the clone removal.
+            result["duration_seconds"] = round(time.monotonic() - started, 3)
+            write_json(output / "result.json", result)
     return result
 
 

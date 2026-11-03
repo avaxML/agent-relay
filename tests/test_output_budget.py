@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -341,6 +342,18 @@ class BoundedLogTests(unittest.TestCase):
         log = self.write("text", [b"done\n", "\u00a0".encode() * 30_000 + b"\n"], 20_000, 1_024)
         self.assertEqual(log.stats["truncated_answer_events"], 0)
 
+    def test_the_tail_uses_head_space_the_head_left_unused(self) -> None:
+        chunks = [b"a" * 1_000 + b"\n", b"b" * 87_000 + b"\n", b"c" * 60_000 + b"\n"]
+        log = self.write("text", chunks, 175_000, 8_000)
+        self.assertEqual(log.stats["dropped_answer_events"], 0)
+        self.assertEqual(len(self.path.read_bytes()), 148_003)
+
+    def test_trimming_only_whitespace_lines_is_not_a_lost_answer(self) -> None:
+        chunks = [b"h" * 10_000 + b"\n", *([b" " * 3_000 + b"\n"] * 20), b"answer\n"]
+        log = self.write("text", chunks, 20_000, 1_024)
+        self.assertGreater(log.stats["dropped_events"], 0)
+        self.assertEqual(log.stats["dropped_answer_events"], 0)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")
@@ -544,6 +557,37 @@ class ExecuteBudgetTests(unittest.TestCase):
             )
         self.assertIn("assistant partial", (self.directory / "stdout.log").read_text(encoding="utf-8"))
         self.assertTrue(budget.logs["stdout"].stream.closed)
+
+    def test_output_is_drained_even_if_the_grace_period_is_interrupted(self) -> None:
+        flusher = self.script(
+            "flush2.py",
+            "import signal, sys, time\n"
+            "def bye(*_):\n"
+            "    sys.stdout.write('FINAL\\n'); sys.stdout.flush(); time.sleep(30)\n"
+            "signal.signal(signal.SIGTERM, bye)\n"
+            "print('started', flush=True)\n"
+            "time.sleep(30)\n",
+        )
+        budget = OutputBudget("text", 100_000, 8_000, 2_000_000)
+        real = execution._signal_group
+
+        def interrupted(process: Any, number: int) -> None:
+            real(process, number)
+            if number == signal.SIGTERM:
+                time.sleep(0.5)  # let the handler write before the interrupt cuts the grace period
+                raise KeyboardInterrupt
+
+        with mock.patch.object(execution, "_signal_group", interrupted), self.assertRaises(KeyboardInterrupt):
+            execute(
+                [sys.executable, str(flusher)],
+                self.directory,
+                dict(os.environ),
+                self.stdin,
+                self.directory,
+                1,
+                budget=budget,
+            )
+        self.assertIn("FINAL", (self.directory / "stdout.log").read_text(encoding="utf-8"))
 
     def test_without_a_budget_the_strict_cap_still_kills(self) -> None:
         # Git and Relay checks rely on this: their stdout is never truncated, only refused.

@@ -314,6 +314,9 @@ class BoundedLog:
         if not self.tail and self.written + len(line) <= self.head_limit:
             self._write(line)
             return
+        if not self.tail:
+            # The tail gets everything the head left unused, not only its fixed half.
+            self.tail_limit = self.max_bytes - self.written - 128
         self.tail += line
         # Without framing, text cannot show which lines were its answer, so any line dropped from stdout makes
         # the answer unprovable; invoke_provider fails the run and keeps the tail as the partial answer.
@@ -330,7 +333,8 @@ class BoundedLog:
         cut = self.tail.find(b"\n", excess - 1) + 1
         lines = self.tail.count(b"\n", 0, cut)
         self.stats["dropped_events"] += lines
-        self.stats["dropped_answer_events"] += lines
+        if not _blank(self.tail[:cut]):
+            self.stats["dropped_answer_events"] += lines
         self.stats["dropped_bytes"] += cut
         del self.tail[:cut]
 
@@ -435,18 +439,21 @@ def _execute_bounded(
                 finally:
                     _signal_group(process, signal.SIGKILL)
                     process.wait()
-            deadline = time.monotonic() + DRAIN_SECONDS
-            with suppress(OSError):
-                while selector.get_map() and time.monotonic() < deadline:
-                    _pump(selector, 0.05)
         finally:
-            for key in list(selector.get_map().values()):
-                selector.unregister(key.fileobj)
+            try:
+                # Read what is still in the pipes even if a second signal cut the grace period short.
+                deadline = time.monotonic() + DRAIN_SECONDS
                 with suppress(OSError):
-                    key.fileobj.close()  # type: ignore[union-attr]
-            selector.close()
-            for log in budget.logs.values():
-                log.close()
+                    while selector.get_map() and time.monotonic() < deadline:
+                        _pump(selector, 0.05)
+            finally:
+                for key in list(selector.get_map().values()):
+                    selector.unregister(key.fileobj)
+                    with suppress(OSError):
+                        key.fileobj.close()  # type: ignore[union-attr]
+                selector.close()
+                for log in budget.logs.values():
+                    log.close()
 
 
 def execute(

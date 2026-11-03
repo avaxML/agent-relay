@@ -87,7 +87,7 @@ python3 scripts/relay.py run --provider opencode --kind execute \
 - `log_budget` (the effective log limits) and `log_stats` (bytes truncated or dropped);
 - `status`: `ok`, `violation`, `check_failed`, `error`, `stopped`, or `cancelled`, with `stop_reason` for a stop.
 
-Relay bounds provider logs rather than stopping verbose providers. Oversized events are truncated, events past the cap are dropped and counted, and only a runaway past 16 × `--max-log-bytes` stops the worker. A timeout, a runaway, or a cancellation still writes `changes.diff` and any partial answer before Relay removes the clone. See [the log budget](references/adding-adapters.md#log-budget-truncation-and-stops).
+Relay bounds provider logs rather than stopping verbose providers. Oversized events are truncated, events past the cap are dropped and counted, and only a runaway past 16 × `--max-log-bytes` stops the worker. If the answer itself was clipped or lost, the run fails rather than passing part of it off as all of it. A timeout, a runaway, or a cancellation still writes `changes.diff` and any partial answer before Relay removes the clone. See [the log budget](references/adding-adapters.md#log-budget-truncation-and-stops).
 
 A tracked change in a probe, a change outside `--owns`, or any `.git` change is a violation. Empty provider output is an error. Apply an `execute` result yourself with `git apply --check` and `git apply` after reading the diff.
 

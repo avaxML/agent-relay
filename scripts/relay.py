@@ -298,7 +298,8 @@ def main() -> int:
                 ]
             }
             code = 0 if all(p["installed"] and p.get("exit_code", 0) == 0 for p in result["providers"]) else 1
-        print(json.dumps(result, ensure_ascii=False))
+        # ASCII escapes, as in result.json: provider text may carry a lone surrogate that stdout cannot encode.
+        print(json.dumps(result))
         return code
     except (RelayError, OSError, ValueError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))

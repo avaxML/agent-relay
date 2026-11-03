@@ -62,6 +62,8 @@ READ_LOG_BYTES, READ_EVENT_BYTES = 4_000_000, 32_000
 TOOL_LOG_BYTES, TOOL_EVENT_BYTES = 16_000_000, 64_000
 # Output past this multiple of the persisted cap is a runaway, not verbosity.
 HARD_CEILING_FACTOR = 16
+# Far beyond any real log; it also keeps the values JSON can record (Python caps integer digits).
+MAX_LOG_BYTES = 1 << 40
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,8 @@ def resolve_log_budget(
             budget[name], budget["sources"][name] = limits[name], "adapter"
         else:
             budget[name], budget["sources"][name] = default, "kind"
+    if budget["max_log_bytes"] > MAX_LOG_BYTES:
+        raise RelayError(f"max_log_bytes must be at most {MAX_LOG_BYTES} (1 TiB).")
     if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
 
         def origin(name: str) -> str:

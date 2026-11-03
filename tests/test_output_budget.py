@@ -198,7 +198,7 @@ class BoundedLogTests(unittest.TestCase):
         chunks = [*cursor_stream(60)[:-2], *cursor_stream(0, answer)[-1:]]
         log = self.write("cursor-jsonl", chunks, 400_000, 4_000)
         decoded = decode_response(self.path.read_text(encoding="utf-8"), "cursor-jsonl")[0]
-        self.assertTrue(answer.startswith(decoded.rstrip("…")))
+        self.assertTrue(answer.startswith(decoded))
         self.assertGreater(len(decoded), 10_000)
         self.assertLessEqual(self.path.stat().st_size, 400_000)
         self.assertEqual(log.stats["truncated_answer_events"], 1)
@@ -328,6 +328,18 @@ class BoundedLogTests(unittest.TestCase):
         log = self.write("text", [b" " * 30_000 + b"\n", b"answer\n"], 20_000, 1_024)
         self.assertEqual(log.stats["truncated_answer_events"], 0)
         self.assertEqual(log.stats["truncated_events"], 1)
+
+    def test_clipping_finds_a_fit_when_short_strings_dominate(self) -> None:
+        event = {"type": "result", "result": "R" * 30_000, **{f"m{index}": "v" for index in range(559)}}
+        line = json.dumps(event).encode()
+        shrunk = shrink_event(event, len(line), 6_143, allow_stub=False)
+        assert shrunk is not None
+        self.assertLessEqual(len(shrunk), 6_143)
+        self.assertEqual(json.loads(shrunk)["m0"], "v")
+
+    def test_unicode_whitespace_overflow_is_not_a_lost_answer(self) -> None:
+        log = self.write("text", [b"done\n", "\u00a0".encode() * 30_000 + b"\n"], 20_000, 1_024)
+        self.assertEqual(log.stats["truncated_answer_events"], 0)
 
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
@@ -621,6 +633,10 @@ class BudgetResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RelayError, "at most a quarter"):
             validate_adapter(self.adapter(limits={"max_log_bytes": 100_000, "max_event_bytes": 50_000}), "fake")
 
+    def test_absurd_budgets_are_rejected_before_anything_is_created(self) -> None:
+        with self.assertRaisesRegex(RelayError, "at most"):
+            resolve_log_budget(self.adapter(), "read", int("9" * 4_000), None)
+
     def test_adapter_limits_are_validated(self) -> None:
         validate_adapter(self.adapter(limits={"max_log_bytes": 8_000_000}), "fake")
         for limits in (
@@ -708,6 +724,40 @@ class BudgetResolutionTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         budget = json.loads(completed.stdout)["log_budget"]
         self.assertEqual((budget["max_log_bytes"], budget["max_event_bytes"]), (5_000_000, 40_000))
+
+    def test_relay_cli_prints_answers_with_lone_surrogates(self) -> None:
+        self.script.write_text(
+            "import json\nprint(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, "
+            "'result': 'ok \\ud800'}))\n",
+            encoding="utf-8",
+        )
+        path = self.directory / "fake.json"
+        path.write_text(json.dumps(self.adapter(output="cursor-jsonl")), encoding="utf-8")
+        (self.root / "notes.txt").write_text("notes\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "relay.py"),
+                "run",
+                "--provider",
+                "fake",
+                "--adapter-file",
+                str(path),
+                "--task-file",
+                str(self.task),
+                "--root",
+                str(self.root),
+                "--files",
+                "notes.txt",
+                "--output",
+                str(self.directory / "surrogate-out"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["status"], "ok")
 
     def test_dispatch_settings_reach_task_arguments(self) -> None:
         task = {

@@ -50,6 +50,11 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
+def _blank(data: bytes | bytearray) -> bool:
+    """Whitespace only, by the decoders' Unicode rules (a non-breaking space counts); split characters are ignored."""
+    return not bytes(data).decode("utf-8", "ignore").strip()
+
+
 def _utf8_prefix(data: bytes, limit: int) -> bytes:
     """Cut at most limit bytes without splitting a UTF-8 character."""
     end = min(limit, len(data))
@@ -71,7 +76,9 @@ def _clip_event(event: dict[str, Any], cap: int) -> dict[str, Any]:
 
 def _clip(value: Any, cap: int) -> Any:
     if isinstance(value, str):
-        return value if len(value) <= cap else value[:cap] + "…"
+        # No per-string ellipsis: escaped as \u2026 it would make a short string longer and break the size
+        # search; relay_truncated_bytes marks the event instead.
+        return value[:cap]
     if isinstance(value, dict):
         return {key: _clip(item, cap) for key, item in value.items()}
     if isinstance(value, list):
@@ -222,11 +229,11 @@ class BoundedLog:
             return
         if self.overflow:
             self.stats["dropped_bytes" if self.protected else "truncated_bytes"] += len(piece)
-            self.overflow_blank = self.overflow_blank and not piece.strip()
+            self.overflow_blank = self.overflow_blank and _blank(piece)
             return
         self.pending += piece
         if len(self.pending) > self.line_limit:
-            self.overflow_blank = not self.pending.strip()
+            self.overflow_blank = _blank(self.pending)
             # Bound memory for a line with no newline yet: text keeps a prefix, JSONL cannot be cut.
             excess = len(self.pending) - (self.line_limit if self.protected is None else 0)
             del self.pending[len(self.pending) - excess :]
@@ -265,7 +272,7 @@ class BoundedLog:
                 # Malformed, non-UTF-8, too deeply nested, or an integer past Python's digit limit.
                 parsed = None
             # Blank lines are skipped by every decoder, so dropping one changes nothing.
-            malformed = not isinstance(parsed, dict) and bool(line.strip())
+            malformed = not isinstance(parsed, dict) and not _blank(line)
             if isinstance(parsed, dict):
                 event = parsed
                 level = self.protected(event)

@@ -542,6 +542,9 @@ def decode_partial(raw: str, output: str) -> str | None:
                 and isinstance(message.get("content"), list)
             ):
                 parts += [item.get("text") for item in message["content"] if isinstance(item, dict)]
+            elif event.get("type") == "result":
+                # A failed or malformed result still carries the provider's last words.
+                parts.append(event.get("result"))
     elif output == "agy-jsonl":
         for event in events:
             result = event.get("result")

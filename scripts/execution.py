@@ -194,9 +194,10 @@ class BoundedLog:
         self._trim_tail()
         if self.protected is None and self.stats["dropped_events"]:
             dropped = self.stats["dropped_events"], self.stats["dropped_bytes"]
-            # The offset, not the marker text, tells readers where the tail starts: a provider can print the text.
-            self.stats["tail_offset"] = self.written + len(TEXT_DROP_MARKER.format(*dropped)) + 1
             self._write(TEXT_DROP_MARKER.format(*dropped).encode() + b"\n")
+            if not self.stats["write_errors"]:
+                # The offset, not the marker text, tells readers where the tail starts: a provider can print it.
+                self.stats["tail_offset"] = self.written
         self._write(bytes(self.tail))
         self.stats["written_bytes"] = self.written
         try:

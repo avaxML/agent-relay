@@ -332,6 +332,8 @@ class DecodePartialTests(unittest.TestCase):
         self.assertEqual(decode_partial("working...\n", "text"), "working...")
         self.assertIsNone(decode_partial(json.dumps({"event": "tool"}), "agy-jsonl"))
         self.assertIsNone(decode_partial("", "cursor-jsonl"))
+        failed = json.dumps({"type": "result", "subtype": "error", "is_error": True, "result": "gave up: quota"})
+        self.assertEqual(decode_partial(failed + "\n", "cursor-jsonl"), "gave up: quota")
         huge = '{"type":"tool_call","n":' + "9" * 6_000 + "}"
         self.assertEqual(decode_partial(cursor + huge + "\n", "cursor-jsonl"), "half done")
 

@@ -120,6 +120,8 @@ def validate_limits(config: Any) -> None:
     for field, value in config.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise RelayError(f"Adapter limits.{field} must be a positive integer number of bytes.")
+    if config.get("max_event_bytes", 1024) < 1024:
+        raise RelayError("Adapter limits.max_event_bytes must be at least 1024 bytes.")
     if set(config) >= LIMIT_FIELDS and config["max_event_bytes"] * 4 > config["max_log_bytes"]:
         raise RelayError("Adapter limits.max_event_bytes must be at most a quarter of limits.max_log_bytes.")
 
@@ -423,18 +425,16 @@ def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -
 
 def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if output == "text":
-        # When Relay dropped the middle of a long text stream, the answer is what followed the drop.
-        answer = TEXT_DROP_PATTERN.split(raw)[-1].strip()
-        if not answer:
+        if not raw.strip():
             raise RelayError("Worker returned no text.")
-        return answer, {}
+        return raw.strip(), {}
     events = []
     for line in raw.splitlines():
         if not line.strip():
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
             raise RelayError("Worker returned malformed JSON output; inspect stdout.log.") from exc
         if not isinstance(event, dict):
             raise RelayError("Worker event must be an object.")
@@ -478,12 +478,11 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     return answer.strip(), metadata
 
 
-# Protection levels for bounded provider logs: ordinary events may be clipped and stop at three quarters of the
-# cap; partial-answer events are never clipped and may use half the reserve; events a decoder needs for the final
-# answer or a failure are never clipped and may use the whole cap.
+# Protection levels for bounded provider logs. Ordinary events are clipped past max_event_bytes and stop at three
+# quarters of the cap. Partial-answer events may use half the reserve and terminal events (the final answer or a
+# failure) the whole cap; neither is clipped for size, only to fit the space left, and a clipped or dropped terminal
+# event fails the run.
 ORDINARY, PARTIAL, TERMINAL = 0, 1, 2
-TEXT_DROP_MARKER = "[agent-relay dropped {} lines, {} bytes]"
-TEXT_DROP_PATTERN = re.compile(r"^\[agent-relay dropped \d+ lines, \d+ bytes\]$", re.MULTILINE)
 
 
 # Comparisons, not hashing: a hostile event may carry a list or object where a type string belongs.
@@ -517,7 +516,7 @@ def _decodable_events(raw: str) -> list[dict[str, Any]]:
     for line in raw.splitlines():
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(event, dict):
             events.append(event)
@@ -526,10 +525,11 @@ def _decodable_events(raw: str) -> list[dict[str, Any]]:
 
 def decode_partial(raw: str, output: str) -> str | None:
     """Best-effort answer from a stopped worker's log; malformed or missing events are skipped."""
-    with suppress(RelayError):
+    # ValueError and RecursionError: a single hostile event (huge integer, deep nesting) must not cost the rest.
+    with suppress(RelayError, ValueError, RecursionError):
         return decode_response(raw, output)[0]
     if output == "text":
-        return TEXT_DROP_PATTERN.split(raw)[-1].strip() or None
+        return raw.strip() or None
     events = _decodable_events(raw)
     parts: list[Any] = []
     if output == "cursor-jsonl":

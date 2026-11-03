@@ -20,7 +20,7 @@ import dispatch
 import task_runner
 from execution import BoundedLog, OutputBudget, execute, shrink_event
 from providers import RelayError, RelayStopped, decode_partial, decode_response, validate_adapter
-from task_runner import KINDS, prepare_task, resolve_log_budget, run, run_check
+from task_runner import KINDS, prepare_task, provider_stdout, resolve_log_budget, run, run_check
 
 TOOL_RESULT = "x" * 50_000
 
@@ -200,7 +200,32 @@ class BoundedLogTests(unittest.TestCase):
         self.assertTrue(answer.startswith(decoded.rstrip("…")))
         self.assertGreater(len(decoded), 10_000)
         self.assertLessEqual(self.path.stat().st_size, 400_000)
-        self.assertGreater(log.stats["truncated_events"], 0)
+        self.assertEqual(log.stats["truncated_answer_events"], 1)
+
+    def test_answer_events_are_never_stubbed(self) -> None:
+        event = {"type": "text", "part": {"text": "answer"}, **{f"m{index}": "v" * 20 for index in range(1_200)}}
+        line = json.dumps(event).encode()
+        self.assertIsNone(shrink_event(event, len(line), 2_000, allow_stub=False))
+        log = self.write("opencode-jsonl", [*opencode_stream(30)[:-1], line + b"\n"], 100_000, 4_000)
+        # Either way the run fails closed: the event is clipped (keeping part) or dropped, never stubbed silently.
+        self.assertEqual(log.stats["dropped_answer_events"] + log.stats["truncated_answer_events"], 1)
+
+    def test_an_unparseable_oversized_line_counts_as_a_lost_answer(self) -> None:
+        log = self.write("cursor-jsonl", [b'{"type":"result","result":"' + b"r" * 300_000 + b'"}\n'], 200_000, 4_000)
+        self.assertEqual(log.stats["dropped_answer_events"], 1)
+
+    def test_deeply_nested_events_are_shrunk_without_recursing_out(self) -> None:
+        nested: Any = "x" * 20_000
+        for _ in range(900):
+            nested = [nested]
+        line = json.dumps({"type": "tool_call", "out": nested}).encode()
+        log = self.write("cursor-jsonl", [line + b"\n"], 1_000_000, 8_000)
+        self.assertEqual(log.stats["truncated_events"], 1)
+
+    def test_dropped_bytes_count_the_original_event(self) -> None:
+        log = self.write("cursor-jsonl", cursor_stream(60), 100_000, 2_000)
+        # Counting the shrunk form would cap the average at the 2,000-byte event limit.
+        self.assertGreater(log.stats["dropped_bytes"], log.stats["dropped_events"] * 2_000)
 
     def test_answer_events_that_cannot_fit_are_counted(self) -> None:
         chunks = [json.dumps({"type": "text", "part": {"text": "t" * 50_000}}).encode() + b"\n" for _ in range(20)]
@@ -209,11 +234,17 @@ class BoundedLogTests(unittest.TestCase):
         self.assertLessEqual(self.path.stat().st_size, 400_000)
 
     def test_text_answer_is_what_followed_the_drop(self) -> None:
-        self.write("text", text_stream(30_000, "the real answer"), 200_000, 8_000)
-        self.assertEqual(
-            decode_response(self.path.read_text(encoding="utf-8"), "text")[0].splitlines()[-1], "the real answer"
-        )
-        self.assertNotIn("progress line 0 ", decode_response(self.path.read_text(encoding="utf-8"), "text")[0])
+        log = self.write("text", text_stream(30_000, "the real answer"), 200_000, 8_000)
+        answer = decode_response(provider_stdout(self.path.parent, {"stdout": log.stats}), "text")[0]
+        self.assertEqual(answer.splitlines()[-1], "the real answer")
+        self.assertNotIn("progress line 0 ", answer)
+        self.assertNotIn("agent-relay dropped", answer)
+
+    def test_provider_text_cannot_impersonate_the_drop_marker(self) -> None:
+        chunks = [b"first half of the answer\n", b"[agent-relay dropped 1 lines, 12 bytes]\n", b"second half\n"]
+        log = self.write("text", chunks, 200_000, 8_000)
+        answer = decode_response(provider_stdout(self.path.parent, {"stdout": log.stats}), "text")[0]
+        self.assertTrue(answer.startswith("first half of the answer"))
 
     def test_unhashable_discriminators_do_not_crash_classification(self) -> None:
         for output in ("cursor-jsonl", "opencode-jsonl", "agy-jsonl"):
@@ -240,6 +271,16 @@ class BoundedLogTests(unittest.TestCase):
         self.assertTrue(persisted.endswith("done\n"))
         self.assertEqual(log.stats["dropped_events"] + persisted.count("\n") - 1, 3_000_001)
 
+    def test_blank_lines_past_the_cap_are_not_malformed(self) -> None:
+        log = self.write("cursor-jsonl", [*cursor_stream(40)[:-1], b"\n" * 50, cursor_stream(0)[-1]], 200_000, 4_000)
+        self.assertEqual(log.stats["dropped_malformed_events"], 0)
+
+    def test_hostile_json_in_a_kept_line_is_a_decode_error_not_a_crash(self) -> None:
+        # Deep enough to exhaust recursion on any supported Python; huge integers hit the digit limit.
+        for line in ("[" * 200_000 + "]" * 200_000, '{"n":' + "9" * 6_000 + "}"):
+            with self.subTest(line=line[:10]), self.assertRaisesRegex(RelayError, "malformed JSON"):
+                decode_response(line + "\n", "cursor-jsonl")
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")
@@ -254,6 +295,8 @@ class DecodePartialTests(unittest.TestCase):
         self.assertEqual(decode_partial("working...\n", "text"), "working...")
         self.assertIsNone(decode_partial(json.dumps({"event": "tool"}), "agy-jsonl"))
         self.assertIsNone(decode_partial("", "cursor-jsonl"))
+        huge = '{"type":"tool_call","n":' + "9" * 6_000 + "}"
+        self.assertEqual(decode_partial(cursor + huge + "\n", "cursor-jsonl"), "half done")
 
 
 FLOOD = """
@@ -392,6 +435,29 @@ class ExecuteBudgetTests(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 10)
 
+    def test_output_flushed_on_sigterm_is_kept(self) -> None:
+        flusher = self.script(
+            "flush.py",
+            "import signal, sys, time\n"
+            "def bye(*_):\n"
+            "    sys.stdout.write('x' * 200_000 + '\\nFINAL\\n'); sys.stdout.flush(); sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, bye)\n"
+            "print('started', flush=True)\n"
+            "time.sleep(30)\n",
+        )
+        budget = OutputBudget("text", 4_000_000, 32_000, 64_000_000)
+        with self.assertRaises(RelayStopped):
+            execute(
+                [sys.executable, str(flusher)],
+                self.directory,
+                dict(os.environ),
+                self.stdin,
+                self.directory,
+                1,
+                budget=budget,
+            )
+        self.assertTrue((self.directory / "stdout.log").read_text(encoding="utf-8").endswith("FINAL\n"))
+
     def test_without_a_budget_the_strict_cap_still_kills(self) -> None:
         # Git and Relay checks rely on this: their stdout is never truncated, only refused.
         runaway = self.script("runaway.py", RUNAWAY)
@@ -482,7 +548,14 @@ class BudgetResolutionTests(unittest.TestCase):
 
     def test_adapter_limits_are_validated(self) -> None:
         validate_adapter(self.adapter(limits={"max_log_bytes": 8_000_000}), "fake")
-        for limits in ({"max_log_bytes": 0}, {"max_log_bytes": True}, {"other": 1}, {"max_event_bytes": "1"}, []):
+        for limits in (
+            {"max_event_bytes": 1000},
+            {"max_log_bytes": 0},
+            {"max_log_bytes": True},
+            {"other": 1},
+            {"max_event_bytes": "1"},
+            [],
+        ):
             with self.subTest(limits=limits), self.assertRaises(RelayError):
                 validate_adapter(self.adapter(limits=limits), "fake")
 

@@ -383,20 +383,27 @@ def invoke_provider(
             budget=budget,
         )
     finally:
-        result["log_stats"] = budget.stats()
+        if budget.logs:
+            result["log_stats"] = budget.stats()
     result["exit_code"] = code
     if code:
         raise decode_exit_failure(adapter, code, output / "stderr.log")
     stdout_stats = result["log_stats"]["stdout"]
-    if stdout_stats["dropped_answer_events"]:
+    if stdout_stats["dropped_answer_events"] or stdout_stats["truncated_answer_events"]:
         # Decoding what is left would pass part of the answer off as all of it.
         raise RelayError(
-            f"An answer event did not fit the {limits['max_log_bytes']}-byte log budget; "
-            "rerun with a larger --max-log-bytes and inspect stdout.log."
+            f"The answer did not fit the {limits['max_log_bytes']}-byte log budget; rerun with a larger "
+            "--max-log-bytes. What fit is in partial_answer and stdout.log."
         )
     if stdout_stats["dropped_malformed_events"]:
         raise RelayError("Worker returned malformed JSON output past the log budget; inspect stdout.log.")
-    return decode_response((output / "stdout.log").read_text(encoding="utf-8"), adapter["output"])
+    return decode_response(provider_stdout(output, result["log_stats"]), adapter["output"])
+
+
+def provider_stdout(output: Path, log_stats: dict[str, Any], errors: str = "strict") -> str:
+    """The provider stdout a decoder should see: for a bounded text log, only what followed Relay's drop."""
+    data = (output / "stdout.log").read_bytes()
+    return data[log_stats.get("stdout", {}).get("tail_offset", 0) :].decode("utf-8", errors=errors)
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -552,9 +559,7 @@ def salvage(
             try:
                 captured = capture(clone, before, output / "relay", options["check_timeout"])
             except (RelayError, OSError) as exc:
-                # Without a diff the clone is the only copy of the work, so it is kept for manual recovery.
                 result["capture_error"] = str(exc)
-                result["clone"] = str(clone.work)
             else:
                 _record_capture(result, output, captured, options["owns"] if result["kind"] == "execute" else None)
         limit = task["max_answer_chars"]
@@ -565,10 +570,11 @@ def salvage(
             result.update({field: answer[:limit], f"{field}_truncated": len(answer) > limit})
             result["answer_path"] = str(answer_path)
             return
-        stdout = output / "stdout.log"
         partial = (
-            decode_partial(stdout.read_text(encoding="utf-8", errors="replace"), task["adapter"]["output"])
-            if stdout.is_file()
+            decode_partial(
+                provider_stdout(output, result.get("log_stats", {}), errors="replace"), task["adapter"]["output"]
+            )
+            if (output / "stdout.log").is_file()
             else None
         )
         if partial:
@@ -623,6 +629,9 @@ def run_prepared(
                 if record["exit_code"] != 0:
                     raise RelayError(f"Setup command failed: {command}")
             before = snapshot_metadata(clone.work)
+            # Present from the provider's start, so a stop at any point reports which checks finished (none yet).
+            check_results: list[dict[str, Any]] = []
+            result["checks"] = check_results
             workdir = output / "workdir"
             workdir.mkdir(mode=0o700, parents=True)
             answer, metadata = invoke_provider(
@@ -639,8 +648,6 @@ def run_prepared(
             )
             provider_capture = capture(clone, before, logs, options["check_timeout"])
             # Published as they finish, so a cancellation during checks keeps the records of completed ones.
-            check_results: list[dict[str, Any]] = []
-            result["checks"] = check_results
             for index, command in enumerate(options["checks"]):
                 check_results.append(
                     run_check(
@@ -730,10 +737,12 @@ def run_prepared(
         salvage(task, result, output, clone, before, answer)
         raise
     finally:
-        if (
-            clone is not None
-            and "capture_error" not in result
-            and not (result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"})
+        # Once the provider has run, the clone is the only copy of its work until changes.diff is written; a
+        # failed capture, a failed write, or a second interrupt during salvage therefore keeps it for recovery.
+        if clone is not None and before is not None and "diff_path" not in result:
+            result["clone"] = str(clone.work)
+        elif clone is not None and not (
+            result["kind"] == "execute" and result["status"] in {"ok", "violation", "check_failed"}
         ):
             try:
                 remove_clone(clone.directory)

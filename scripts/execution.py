@@ -18,7 +18,6 @@ from providers import (
     ORDINARY,
     PARTIAL,
     TERMINAL,
-    TEXT_DROP_MARKER,
     RelayCancelled,
     RelayError,
     RelayStopped,
@@ -26,6 +25,7 @@ from providers import (
 )
 
 DRAIN_SECONDS = 2.0
+TEXT_DROP_MARKER = "[agent-relay dropped {} lines, {} bytes]"
 # Below this, a clipped protected event would carry too little of its answer to be worth writing.
 MIN_PROTECTED_BYTES = 1024
 
@@ -89,8 +89,12 @@ def _longest_string(value: Any) -> int:
     return 0
 
 
-def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
-    """Re-serialize an event under limit bytes by clipping its longest strings; keys and types survive."""
+def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: bool = True) -> bytes | None:
+    """Re-serialize an event under limit bytes by clipping its longest strings; keys and types survive.
+
+    When no clipped form fits, an ordinary event becomes a stub of its short top-level fields. With allow_stub=False
+    (answer events, whose nested payload the decoder needs) it returns None instead.
+    """
 
     def render(candidate: dict[str, Any]) -> bytes:
         marked = {**candidate, "relay_truncated_bytes": original}
@@ -100,15 +104,21 @@ def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
         return json.dumps(marked, separators=(",", ":")).encode() + b"\n"
 
     best: bytes | None = None
-    # No string longer than the limit can fit, so the search starts there instead of at a multi-megabyte string.
-    low, high = 0, min(_longest_string(event), limit)
-    while low <= high:
-        cap = (low + high) // 2
-        data = render(_clip_event(event, cap))
-        if len(data) <= limit:
-            best, low = data, cap + 1
-        else:
-            high = cap - 1
+    try:
+        # No string longer than the limit can fit, so the search starts there instead of at a multi-megabyte one.
+        low, high = 0, min(_longest_string(event), limit)
+        while low <= high:
+            cap = (low + high) // 2
+            data = render(_clip_event(event, cap))
+            if len(data) <= limit:
+                best, low = data, cap + 1
+            else:
+                high = cap - 1
+    except RecursionError:
+        # json.loads accepts nesting deeper than these recursive helpers can walk; fall back to the stub.
+        best = None
+    if best is None and not allow_stub:
+        return None
     if best is None:
         # Too many fields to fit: keep only short top-level scalars such as type, subtype and IDs, then only the
         # fields every decoder keys on.
@@ -159,6 +169,7 @@ class BoundedLog:
             "dropped_events": 0,
             "dropped_bytes": 0,
             "dropped_answer_events": 0,
+            "truncated_answer_events": 0,
             "dropped_malformed_events": 0,
         }
 
@@ -177,6 +188,8 @@ class BoundedLog:
         self._trim_tail()
         if self.protected is None and self.stats["dropped_events"]:
             dropped = self.stats["dropped_events"], self.stats["dropped_bytes"]
+            # The offset, not the marker text, tells readers where the tail starts: a provider can print the text.
+            self.stats["tail_offset"] = self.written + len(TEXT_DROP_MARKER.format(*dropped)) + 1
             self._write(TEXT_DROP_MARKER.format(*dropped).encode() + b"\n")
         self._write(bytes(self.tail))
         self.stats["written_bytes"] = self.written
@@ -207,7 +220,9 @@ class BoundedLog:
         if self.protected is None:
             self._text_line(line, overflowed)
         elif overflowed:
+            # Too long to parse in bounded memory, so it may have been the answer: fail closed.
             self.stats["dropped_events"] += 1
+            self.stats["dropped_answer_events"] += 1
         else:
             self._event_line(line)
 
@@ -224,25 +239,29 @@ class BoundedLog:
             except (ValueError, RecursionError):
                 # Malformed, non-UTF-8, too deeply nested, or an integer past Python's digit limit.
                 parsed = None
-            malformed = not isinstance(parsed, dict)
+            # Blank lines are skipped by every decoder, so dropping one changes nothing.
+            malformed = not isinstance(parsed, dict) and bool(line.strip())
             if isinstance(parsed, dict):
                 event = parsed
                 level = self.protected(event)
                 if oversized and level == ORDINARY:
-                    line = shrink_event(event, len(line), self.max_event_bytes)
+                    line = shrink_event(event, len(line), self.max_event_bytes) or line
         headroom = {ORDINARY: self.reserve, PARTIAL: self.reserve // 2, TERMINAL: 0}[level]
         available = self.max_bytes - headroom - self.written
         if level != ORDINARY and len(line) > available >= MIN_PROTECTED_BYTES and event is not None:
-            # A clipped answer is better than none: the decoder still finds its event.
-            line = shrink_event(event, original, available)
+            # Keep what fits so a stopped or failed run still has the text; a clipped terminal answer is never
+            # published as complete (truncated_answer_events fails the run).
+            line = shrink_event(event, original, available, allow_stub=False) or line
         if len(line) <= available:
             if len(line) < original:
                 self.stats["truncated_events"] += 1
                 self.stats["truncated_bytes"] += original - len(line)
+                if level == TERMINAL:
+                    self.stats["truncated_answer_events"] += 1
             self._write(line)
         else:
             self.stats["dropped_events"] += 1
-            self.stats["dropped_bytes"] += len(line)
+            self.stats["dropped_bytes"] += original
             if level == TERMINAL:
                 self.stats["dropped_answer_events"] += 1
             elif malformed:
@@ -362,8 +381,15 @@ def _execute_bounded(
         return process.returncode
     finally:
         if process is not None:
-            # Also clean up descendants left behind by a completed private CLI, then drain what they wrote.
-            stop_process(process)
+            # Also clean up descendants left behind by a completed private CLI. Keep reading during the SIGTERM
+            # grace period so a provider flushing on shutdown is not blocked on a full pipe and then killed.
+            _signal_group(process, signal.SIGTERM)
+            grace = time.monotonic() + 1
+            with suppress(OSError):
+                while process.poll() is None and time.monotonic() < grace:
+                    _pump(selector, 0.05)
+            _signal_group(process, signal.SIGKILL)
+            process.wait()
         # Cleanup must not replace the exception that stopped the worker, such as a timeout with work to salvage.
         deadline = time.monotonic() + DRAIN_SECONDS
         with suppress(OSError):

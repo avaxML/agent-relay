@@ -294,6 +294,7 @@ class ToolsTests(unittest.TestCase):
         result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
         self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
         self.assert_edit_salvaged(result)
+        self.assertEqual(result["checks"], [])
         self.assertIn("still working", result["partial_answer"])
         self.assertIn("still working", Path(result["partial_answer_path"]).read_text(encoding="utf-8"))
 
@@ -362,6 +363,37 @@ class ToolsTests(unittest.TestCase):
         self.assertIn("return 2", (clone / "app.py").read_text(encoding="utf-8"))
         with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
             isolation.remove_clone(clone.parent)
+
+    def test_a_failed_diff_write_keeps_the_clone(self) -> None:
+        with mock.patch.object(task_runner, "_record_capture", side_effect=OSError(28, "No space left on device")):
+            result = self.run_kind("execute", "edit-sleep", owns=["app.py"], timeout=2)
+        self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))
+        self.assertIn("No space left", result["salvage_error"])
+        clone = Path(result["clone"])
+        self.assertIn("return 2", (clone / "app.py").read_text(encoding="utf-8"))
+        with mock.patch.dict(os.environ, {"AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            isolation.remove_clone(clone.parent)
+
+    def test_a_clipped_answer_fails_the_run_but_keeps_what_fit(self) -> None:
+        script = self.directory / "clipped.py"
+        script.write_text(
+            "import json, pathlib\n"
+            "pathlib.Path('app.py').write_text('def answer():\\n    return 2\\n')\n"
+            "for i in range(60):\n"
+            "    print(json.dumps({'type': 'tool_call', 'subtype': 'completed', 'r': 'x' * 4000}))\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'A' * 300000}))\n",
+            encoding="utf-8",
+        )
+        adapter = json.loads(self.adapter.read_text(encoding="utf-8"))
+        adapter["output"] = "cursor-jsonl"
+        adapter["tools"]["args"] = [str(script), "{request_file}"]
+        self.adapter.write_text(json.dumps(adapter), encoding="utf-8")
+        result = self.run_kind("execute", "edit", owns=["app.py"], max_log_bytes=400_000, max_event_bytes=4_000)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did not fit", result["error"])
+        self.assertTrue(result["partial_answer"].startswith("AAAA"))
+        self.assertIn("+    return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(list(self.clones.iterdir()), [])
 
     def test_stopped_probe_keeps_its_untracked_files(self) -> None:
         result = self.run_kind("probe", "probe-sleep", timeout=2)

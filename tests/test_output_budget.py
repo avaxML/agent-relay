@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import dispatch
+import execution
 import task_runner
 from execution import BoundedLog, OutputBudget, execute, shrink_event
 from providers import RelayError, RelayStopped, decode_partial, decode_response, validate_adapter
@@ -311,6 +312,12 @@ class BoundedLogTests(unittest.TestCase):
         log = self.write("cursor-jsonl", [b" " * 300_000 + b"\n", cursor_stream(0)[-1]], 200_000, 4_000)
         self.assertEqual(log.stats["dropped_answer_events"], 0)
 
+    def test_stub_respects_the_limit_even_when_escaping_inflates_it(self) -> None:
+        event = {key: "\0" * 64 for key in ("type", "subtype", "event")} | {f"k{i}": i for i in range(3_000)}
+        shrunk = shrink_event(event, 100_000, 1_024)
+        assert shrunk is not None
+        self.assertLessEqual(len(shrunk), 1_024)
+
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)
         self.assertEqual(self.path.read_bytes(), b"not json\n")
@@ -487,6 +494,31 @@ class ExecuteBudgetTests(unittest.TestCase):
                 budget=budget,
             )
         self.assertTrue((self.directory / "stdout.log").read_text(encoding="utf-8").endswith("FINAL\n"))
+
+    def test_logs_are_flushed_even_if_shutdown_is_interrupted(self) -> None:
+        sleeper = self.script("talk.py", "import time\nprint('assistant partial', flush=True)\ntime.sleep(30)\n")
+        budget = OutputBudget("text", 100_000, 8_000, 2_000_000)
+        real = execution._signal_group
+        calls: list[int] = []
+
+        def interrupted(process: Any, number: int) -> None:
+            calls.append(number)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            real(process, number)
+
+        with mock.patch.object(execution, "_signal_group", interrupted), self.assertRaises(KeyboardInterrupt):
+            execute(
+                [sys.executable, str(sleeper)],
+                self.directory,
+                dict(os.environ),
+                self.stdin,
+                self.directory,
+                1,
+                budget=budget,
+            )
+        self.assertIn("assistant partial", (self.directory / "stdout.log").read_text(encoding="utf-8"))
+        self.assertTrue(budget.logs["stdout"].stream.closed)
 
     def test_without_a_budget_the_strict_cap_still_kills(self) -> None:
         # Git and Relay checks rely on this: their stdout is never truncated, only refused.
@@ -728,6 +760,16 @@ class BudgetResolutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("did not fit", result["error"])
         self.assertTrue(result["partial_answer"].startswith("AAAA"))
+
+    def test_a_text_answer_that_lost_lines_fails_but_keeps_the_tail(self) -> None:
+        self.script.write_text("for i in range(5_000):\n    print(f'answer line {i} ' + '.' * 100)\n", encoding="utf-8")
+        path = self.directory / "fake.json"
+        path.write_text(json.dumps(self.adapter()), encoding="utf-8")
+        result = run(self.args(path, max_log_bytes=200_000, max_event_bytes=8_000))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("did not fit", result["error"])
+        self.assertIn("answer line 4999", Path(result["partial_answer_path"]).read_text(encoding="utf-8"))
+        self.assertNotIn("agent-relay dropped", result["partial_answer"])
 
     def test_result_records_survive_lone_surrogates(self) -> None:
         target = self.directory / "record.json"

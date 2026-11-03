@@ -131,6 +131,9 @@ def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: b
         if len(best) > limit:
             # Only string discriminators: a nested value here could recurse past the limit or never fit.
             best = render({key: event[key][:64] for key in DISCRIMINATORS if isinstance(event.get(key), str)})
+        if len(best) > limit:
+            # Escaping can still inflate short values (a NUL becomes six bytes); the marker alone always fits.
+            best = render({})
     return best
 
 
@@ -301,6 +304,8 @@ class BoundedLog:
             self._write(line)
             return
         self.tail += line
+        # Without framing, text cannot show which lines were its answer, so any line dropped from stdout makes
+        # the answer unprovable; invoke_provider fails the run and keeps the tail as the partial answer.
         if len(self.tail) > 2 * self.tail_limit:
             self._trim_tail()
 
@@ -312,7 +317,9 @@ class BoundedLog:
         if excess <= 0:
             return
         cut = self.tail.find(b"\n", excess - 1) + 1
-        self.stats["dropped_events"] += self.tail.count(b"\n", 0, cut)
+        lines = self.tail.count(b"\n", 0, cut)
+        self.stats["dropped_events"] += lines
+        self.stats["dropped_answer_events"] += lines
         self.stats["dropped_bytes"] += cut
         del self.tail[:cut]
 
@@ -401,31 +408,33 @@ def _execute_bounded(
         check_control()
         return process.returncode
     finally:
-        if process is not None:
-            # Also clean up descendants left behind by a completed private CLI. Keep reading during the SIGTERM
-            # grace period so a provider flushing on shutdown is not blocked on a full pipe and then killed.
-            try:
-                _signal_group(process, signal.SIGTERM)
-                grace = time.monotonic() + 1
+        # Each step runs even if an earlier one is interrupted (a second signal, a drain error), so the group is
+        # always reaped and the logs are always flushed before salvage reads them. Cleanup errors never replace
+        # the exception that stopped the worker.
+        try:
+            if process is not None:
+                # Also clean up descendants left behind by a completed private CLI. Keep reading during the
+                # SIGTERM grace period so a provider flushing on shutdown is not blocked on a full pipe and killed.
+                try:
+                    _signal_group(process, signal.SIGTERM)
+                    grace = time.monotonic() + 1
+                    with suppress(OSError):
+                        while process.poll() is None and time.monotonic() < grace:
+                            _pump(selector, 0.05)
+                finally:
+                    _signal_group(process, signal.SIGKILL)
+                    process.wait()
+            deadline = time.monotonic() + DRAIN_SECONDS
+            with suppress(OSError):
+                while selector.get_map() and time.monotonic() < deadline:
+                    _pump(selector, 0.05)
+        finally:
+            for key in list(selector.get_map().values()):
+                selector.unregister(key.fileobj)
                 with suppress(OSError):
-                    while process.poll() is None and time.monotonic() < grace:
-                        _pump(selector, 0.05)
-            finally:
-                # Whatever the drain did, the group is killed and reaped.
-                _signal_group(process, signal.SIGKILL)
-                process.wait()
-        # Cleanup must not replace the exception that stopped the worker, such as a timeout with work to salvage.
-        deadline = time.monotonic() + DRAIN_SECONDS
-        with suppress(OSError):
-            while selector.get_map() and time.monotonic() < deadline:
-                _pump(selector, 0.05)
-        for key in list(selector.get_map().values()):
-            selector.unregister(key.fileobj)
-            with suppress(OSError):
-                key.fileobj.close()  # type: ignore[union-attr]
-        selector.close()
-        for log in budget.logs.values():
-            with suppress(OSError):
+                    key.fileobj.close()  # type: ignore[union-attr]
+            selector.close()
+            for log in budget.logs.values():
                 log.close()
 
 

@@ -87,7 +87,8 @@ def shrink_event(event: dict[str, Any], original: int, limit: int) -> bytes:
         return json.dumps(marked, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
 
     best: bytes | None = None
-    low, high = 0, _longest_string(event)
+    # No string longer than the limit can fit, so the search starts there instead of at a multi-megabyte string.
+    low, high = 0, min(_longest_string(event), limit)
     while low <= high:
         cap = (low + high) // 2
         data = render(_clip(event, cap))

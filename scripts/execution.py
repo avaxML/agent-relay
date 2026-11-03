@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import selectors
@@ -26,6 +27,7 @@ from providers import (
 
 DRAIN_SECONDS = 2.0
 TEXT_DROP_MARKER = "[agent-relay dropped {} lines, {} bytes]"
+MARKER_RESERVE = 128
 # Below this, a clipped protected event would carry too little of its answer to be worth writing.
 MIN_PROTECTED_BYTES = 1024
 
@@ -66,13 +68,14 @@ def _utf8_prefix(data: bytes, limit: int) -> bytes:
     return data[:end]
 
 
-# Fields decoders and readers key on; short values survive clipping verbatim.
+# Fields decoders key on. A string value is never clipped: shortening "result..." could turn it into "result"
+# and invent a terminal event. One too long to keep is left out of the stub instead.
 DISCRIMINATORS = ("type", "subtype", "event")
 
 
 def _clip_event(event: dict[str, Any], cap: int) -> dict[str, Any]:
     return {
-        key: value if key in DISCRIMINATORS and isinstance(value, str) and len(value) <= 256 else _clip(value, cap)
+        key: value if key in DISCRIMINATORS and isinstance(value, str) else _clip(value, cap)
         for key, value in event.items()
     }
 
@@ -139,8 +142,10 @@ def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: b
         }
         best = render(stub)
         if len(best) > limit:
-            # Only string discriminators: a nested value here could recurse past the limit or never fit.
-            best = render({key: event[key][:64] for key in DISCRIMINATORS if isinstance(event.get(key), str)})
+            # Only short string discriminators, whole; a nested value could recurse past the limit or never fit.
+            best = render(
+                {key: event[key] for key in DISCRIMINATORS if isinstance(event.get(key), str) and len(event[key]) <= 64}
+            )
         if len(best) > limit:
             # Escaping can still inflate short values (a NUL becomes six bytes); the marker alone always fits.
             best = render({})
@@ -163,12 +168,13 @@ class BoundedLog:
         self.pending = bytearray()
         self.overflow = False
         self.overflow_blank = False
+        self.overflow_decoder = codecs.getincrementaldecoder("utf-8")()
         self.written = 0
         if self.protected is None:
             self.head_limit = max_bytes // 2
-            self.tail_limit = max_bytes - self.head_limit - 128
+            self.tail_limit = max_bytes - self.head_limit
             # A text answer can be one long line, so a line is cut only when it could not fit in the whole log.
-            self.line_limit = max_bytes - 128
+            self.line_limit = max_bytes
         else:
             self.reserve = max_bytes // 4
             self.line_limit = max_bytes
@@ -203,6 +209,9 @@ class BoundedLog:
             self._end_line()
         self._trim_tail()
         if self.protected is None and self.stats["dropped_events"]:
+            # Room for the marker is taken only once something was dropped, so lossless output can use it all.
+            self.tail_limit -= MARKER_RESERVE
+            self._trim_tail()
             dropped = self.stats["dropped_events"], self.stats["dropped_bytes"]
             self._write(TEXT_DROP_MARKER.format(*dropped).encode() + b"\n")
             if not self.stats["write_errors"]:
@@ -232,18 +241,28 @@ class BoundedLog:
             return
         if self.overflow:
             self.stats["dropped_bytes" if self.protected else "truncated_bytes"] += len(piece)
-            self.overflow_blank = self.overflow_blank and _blank(piece)
+            self.overflow_blank = self.overflow_blank and self._blank_so_far(piece)
             return
         self.pending += piece
         if len(self.pending) > self.line_limit:
-            self.overflow_blank = _blank(self.pending)
+            # Incremental, so a character split across reads is judged whole; invalid UTF-8 is never blank.
+            self.overflow_decoder = codecs.getincrementaldecoder("utf-8")()
+            self.overflow_blank = self._blank_so_far(bytes(self.pending))
             # Bound memory for a line with no newline yet: text keeps a prefix, JSONL cannot be cut.
             excess = len(self.pending) - (self.line_limit if self.protected is None else 0)
             del self.pending[len(self.pending) - excess :]
             self.stats["dropped_bytes" if self.protected else "truncated_bytes"] += excess
             self.overflow = True
 
+    def _blank_so_far(self, data: bytes, final: bool = False) -> bool:
+        try:
+            return not self.overflow_decoder.decode(data, final).strip()
+        except UnicodeDecodeError:
+            return False
+
     def _end_line(self) -> None:
+        if self.overflow and self.overflow_blank:
+            self.overflow_blank = self._blank_so_far(b"", final=True)
         line, overflowed = bytes(self.pending), self.overflow
         self.pending.clear()
         self.overflow = False
@@ -313,7 +332,7 @@ class BoundedLog:
             return
         if not self.tail:
             # The tail gets everything the head left unused, not only its fixed half.
-            self.tail_limit = self.max_bytes - self.written - 128
+            self.tail_limit = self.max_bytes - self.written
         if len(line) > self.tail_limit:
             line = self._cut(line, self.tail_limit)
         self.tail += line

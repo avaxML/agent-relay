@@ -526,14 +526,20 @@ def _decodable_events(raw: str) -> list[dict[str, Any]]:
 
 def decode_partial(raw: str, output: str) -> str | None:
     """Best-effort answer from a stopped worker's log; malformed or missing events are skipped."""
-    # ValueError and RecursionError: a single hostile event (huge integer, deep nesting) must not cost the rest.
-    with suppress(RelayError, ValueError, RecursionError):
-        return decode_response(raw, output)[0]
     if output == "text":
         return raw.strip() or None
     events = _decodable_events(raw)
+    level = EVENT_LEVELS[output]
+    # A terminal event Relay clipped to fit would decode as a shortened answer; then prefer the unclipped text.
+    clipped = [event for event in events if level(event) == TERMINAL and "relay_truncated_bytes" in event]
+    if not clipped:
+        # ValueError and RecursionError: one hostile event (huge integer, deep nesting) must not cost the rest.
+        with suppress(RelayError, ValueError, RecursionError):
+            return decode_response(raw, output)[0]
     parts: list[Any] = []
     if output == "cursor-jsonl":
+        if clipped and any(event.get("type") == "assistant" for event in events):
+            events = [event for event in events if event.get("type") != "result"]
         for event in events:
             message = event.get("message")
             if (

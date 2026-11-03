@@ -424,6 +424,22 @@ class ToolsTests(unittest.TestCase):
         self.assertEqual(result["check_side_effects"], ["stray.txt"])
         self.assertEqual([record["exit_code"] for record in result["checks"]], [0])
 
+    def test_a_check_that_reverts_the_edits_cannot_erase_them(self) -> None:
+        cancel_file = self.directory / "cancel.request"
+        revert = "git checkout -- app.py"
+        stall = (
+            f"python3 -c 'import pathlib, time; pathlib.Path({json.dumps(str(cancel_file))}).touch(); time.sleep(30)'"
+        )
+        args = self.make_args("execute", owns=["app.py"], checks=[revert, stall])
+        task = prepare_task(args)
+        output = args.output.resolve()
+        output.mkdir(mode=0o700, parents=True)
+        with mock.patch.dict(os.environ, {"FAKE_MODE": "edit", "AGENT_RELAY_CLONES_DIR": str(self.clones)}):
+            result = run_prepared(task, output, cancel_file)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertNotIn("return 2", Path(result["diff_path"]).read_text(encoding="utf-8"))
+        self.assertIn("+    return 2", Path(result["provider_diff_path"]).read_text(encoding="utf-8"))
+
     def test_stopped_probe_keeps_its_untracked_files(self) -> None:
         result = self.run_kind("probe", "probe-sleep", timeout=2)
         self.assertEqual((result["status"], result["stop_reason"]), ("stopped", "timeout"))

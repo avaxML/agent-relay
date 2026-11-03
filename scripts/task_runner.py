@@ -534,16 +534,20 @@ def prepare_task(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _record_capture(result: dict[str, Any], output: Path, captured: Capture, owns: list[str] | None) -> Path:
-    diff_path = output / "changes.diff"
-    # Atomic, so a failed rewrite can never leave a truncated diff behind a diff_path the cleanup trusts.
-    descriptor, temporary = tempfile.mkstemp(prefix=".changes-", dir=output)
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Atomic, so a failed rewrite can never leave a truncated diff behind a path the cleanup trusts."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            stream.write(captured.diff)
-        os.replace(temporary, diff_path)
+            stream.write(data)
+        os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def _record_capture(result: dict[str, Any], output: Path, captured: Capture, owns: list[str] | None) -> Path:
+    diff_path = output / "changes.diff"
+    _write_atomic(diff_path, captured.diff)
     if result["kind"] == "execute":
         files_changed = [*captured.tracked_changes, *captured.untracked_files]
     else:
@@ -675,6 +679,11 @@ def run_prepared(
                 heartbeat,
             )
             provider_capture = capture(clone, before, logs, options["check_timeout"])
+            # The provider's own edits, saved before any check runs: a check may rewrite or revert them, and a
+            # stop during checks would otherwise capture only what the checks left.
+            provider_diff = output / "provider-changes.diff"
+            _write_atomic(provider_diff, provider_capture.diff)
+            result["provider_diff_path"] = str(provider_diff)
             # Published as they finish, so a cancellation during checks keeps the records of completed ones.
             for index, command in enumerate(options["checks"]):
                 check_results.append(

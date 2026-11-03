@@ -111,16 +111,26 @@ def shrink_event(event: dict[str, Any], original: int, limit: int, allow_stub: b
 
     def render(candidate: dict[str, Any]) -> bytes:
         marked = {**candidate, "relay_truncated_bytes": 0}
-        # ASCII escapes keep a lone surrogate from a provider from failing the encode. The marker's own digits
-        # change the length, so settle on the value that matches the final line (a few rounds at most).
-        data = b""
-        for _ in range(4):
+
+        def encode() -> tuple[bytes, int]:
             data = json.dumps(marked, separators=(",", ":")).encode() + b"\n"
-            removed = max(0, original - len(data))
+            return data, max(0, original - len(data))
+
+        # ASCII escapes keep a lone surrogate from a provider from failing the encode. The marker's own digits
+        # change the length, so settle on the value that matches the final line.
+        for _ in range(4):
+            data, removed = encode()
             if removed == marked["relay_truncated_bytes"]:
-                break
+                return data
             marked["relay_truncated_bytes"] = removed
-        return data
+        # At a digit boundary (999 vs 1000) no value is self-consistent: take the smaller one and close the
+        # one-byte gap with JSON whitespace.
+        data, removed = encode()
+        if removed < marked["relay_truncated_bytes"]:
+            marked["relay_truncated_bytes"] = removed
+            data, removed = encode()
+        gap: int = removed - marked["relay_truncated_bytes"]
+        return data[:-1] + b" " * gap + b"\n"
 
     best: bytes | None = None
     try:
@@ -340,14 +350,21 @@ class BoundedLog:
             # The tail gets everything the head left unused, not only its fixed half.
             self.tail_limit = self.max_bytes - self.written
         if len(line) > self.tail_limit:
-            line = self._cut(line, self.tail_limit)
+            line = self._cut(line, self.tail_limit, keep_end=True)
         self.tail += line
         if len(self.tail) > 2 * self.tail_limit:
             self._trim_tail()
 
-    def _cut(self, line: bytes, limit: int) -> bytes:
+    def _cut(self, line: bytes, limit: int, keep_end: bool = False) -> bytes:
         body = line.removesuffix(b"\n")
-        kept = _utf8_prefix(body, limit - 1)
+        if keep_end:
+            # A line cut to fit the tail keeps its end, where a final answer usually is.
+            start = max(0, len(body) - (limit - 1))
+            while start < len(body) and body[start] & 0xC0 == 0x80:
+                start += 1
+            kept = body[start:]
+        else:
+            kept = _utf8_prefix(body, limit - 1)
         self.stats["truncated_answer_events"] += 1
         self.stats["truncated_events"] += 1
         self.stats["truncated_bytes"] += len(body) - len(kept)

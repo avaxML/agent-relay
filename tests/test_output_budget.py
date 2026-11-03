@@ -411,11 +411,19 @@ class BoundedLogTests(unittest.TestCase):
         self.assertTrue(persisted.endswith(b"END"))
 
     def test_the_truncation_marker_is_exact(self) -> None:
-        event = {"type": "tool_call", "out": "x" * 1_100}
-        line = json.dumps(event, separators=(",", ":")).encode() + b"\n"
-        shrunk = shrink_event(event, len(line), 1_024)
-        assert shrunk is not None
-        self.assertEqual(json.loads(shrunk)["relay_truncated_bytes"], len(line) - len(shrunk))
+        # Sizes around 1,000 removed bytes cross the marker's digit boundary.
+        for size in (1_100, *range(2_000, 2_080)):
+            with self.subTest(size=size):
+                event = {"type": "tool_call", "out": "x" * size}
+                line = json.dumps(event, separators=(",", ":")).encode() + b"\n"
+                shrunk = shrink_event(event, len(line), 1_024)
+                assert shrunk is not None
+                self.assertLessEqual(len(shrunk), 1_024)
+                self.assertEqual(json.loads(shrunk)["relay_truncated_bytes"], len(line) - len(shrunk))
+
+    def test_a_line_cut_to_fit_the_tail_keeps_its_end(self) -> None:
+        self.write("text", [b"h" * 9_000 + b"\n", b"w" * 13_000 + b"FINAL_ANSWER\n"], 20_000, 1_024)
+        self.assertTrue(self.path.read_bytes().rstrip(b"\n").endswith(b"FINAL_ANSWER"))
 
     def test_unparseable_lines_pass_through(self) -> None:
         self.write("cursor-jsonl", [b"not json\n"], 1_000_000, 8_000)

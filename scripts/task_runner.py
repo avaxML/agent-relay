@@ -30,6 +30,7 @@ from isolation import (
     validate_globs,
 )
 from providers import (
+    MAX_LOG_BYTES,
     RelayCancelled,
     RelayError,
     RelayStopped,
@@ -63,8 +64,6 @@ READ_LOG_BYTES, READ_EVENT_BYTES = 4_000_000, 32_000
 TOOL_LOG_BYTES, TOOL_EVENT_BYTES = 16_000_000, 64_000
 # Output past this multiple of the persisted cap is a runaway, not verbosity.
 HARD_CEILING_FACTOR = 16
-# Far beyond any real log; it also keeps the values JSON can record (Python caps integer digits).
-MAX_LOG_BYTES = 1 << 30
 
 
 @dataclass(frozen=True)

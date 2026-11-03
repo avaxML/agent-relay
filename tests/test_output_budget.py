@@ -433,6 +433,18 @@ class BoundedLogTests(unittest.TestCase):
             self.assertEqual(log.stats["dropped_answer_events"], 1)
             self.assertLessEqual(len(log.pending), 1_000)
 
+    def test_a_text_line_past_the_line_buffer_keeps_its_end(self) -> None:
+        with mock.patch.object(execution, "MAX_LINE_BUFFER", 1_000):
+            log = self.write("text", [b"w" * 5_000 + b"FINAL_ANSWER"], 1_000_000, 8_000)
+        self.assertEqual(log.stats["truncated_answer_events"], 1)
+        self.assertTrue(self.path.read_bytes().rstrip(b"\n").endswith(b"FINAL_ANSWER"))
+
+    def test_decoding_many_small_events_keeps_only_what_it_needs(self) -> None:
+        raw = "{}\n" * 300_000 + json.dumps({"type": "result", "subtype": "success", "result": "ok"}) + "\n"
+        self.assertEqual(decode_response(raw, "cursor-jsonl")[0], "ok")
+        tail = cursor_stream(0, "half")[-2].decode()
+        self.assertEqual(decode_partial("{}\n" * 300_000 + tail, "cursor-jsonl"), "half")
+
     def test_exit_signatures_survive_a_dropped_stderr_middle(self) -> None:
         signature = "listen tcp 127.0.0.1:0: bind: operation not permitted"
         log = BoundedLog(self.path, "text", 100_000, 8_000, (signature,))
@@ -779,6 +791,8 @@ class BudgetResolutionTests(unittest.TestCase):
     def test_adapter_limits_are_validated(self) -> None:
         validate_adapter(self.adapter(limits={"max_log_bytes": 8_000_000}), "fake")
         for limits in (
+            {"max_log_bytes": 2 << 30},
+            {"max_event_bytes": 1 << 30},
             {"max_event_bytes": 1000},
             {"max_log_bytes": 0},
             {"max_log_bytes": True},

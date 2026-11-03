@@ -269,19 +269,25 @@ class BoundedLog:
     def _append(self, piece: bytes) -> None:
         if not piece:
             return
-        if self.overflow:
-            self.stats["dropped_bytes" if self.protected else "truncated_bytes"] += len(piece)
+        if self.overflow and self.protected is not None:
+            self.stats["dropped_bytes"] += len(piece)
             self.overflow_blank = self.overflow_blank and self._blank_so_far(piece)
             return
         self.pending += piece
         if len(self.pending) > self.line_limit:
+            if self.protected is None:
+                # Text keeps a rolling end of the line, where a final answer usually is, in bounded memory.
+                excess = len(self.pending) - self.line_limit
+                del self.pending[:excess]
+                self.stats["truncated_bytes"] += excess
+                self.overflow = True
+                return
             # Incremental, so a character split across reads is judged whole; invalid UTF-8 is never blank.
             self.overflow_decoder = codecs.getincrementaldecoder("utf-8")()
             self.overflow_blank = self._blank_so_far(bytes(self.pending))
-            # Bound memory for a line with no newline yet: text keeps a prefix, JSONL cannot be cut.
-            excess = len(self.pending) - (self.line_limit if self.protected is None else 0)
-            del self.pending[len(self.pending) - excess :]
-            self.stats["dropped_bytes" if self.protected else "truncated_bytes"] += excess
+            # JSONL cannot be cut: the line is dropped and, unless blank, fails the run closed.
+            self.stats["dropped_bytes"] += len(self.pending)
+            self.pending.clear()
             self.overflow = True
 
     def _blank_so_far(self, data: bytes, final: bool = False) -> bool:
@@ -356,7 +362,7 @@ class BoundedLog:
     # stdout, whitespace included, counts as answer loss, and invoke_provider fails the run.
     def _text_line(self, line: bytes, overflowed: bool) -> None:
         if overflowed or len(line) > self.line_limit:
-            line = self._cut(line, self.line_limit)
+            line = self._cut(line, self.line_limit, keep_end=True)
         if not self.tail and self.written + len(line) <= self.head_limit:
             self._write(line)
             return

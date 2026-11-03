@@ -21,6 +21,8 @@ BLANKET_FLAGS = frozenset(
     {"--force", "--yolo", "--trust", "--auto", "--auto-review", "--dangerously-skip-permissions", "--approve-mcps"}
 )
 LIMIT_FIELDS = frozenset({"max_log_bytes", "max_event_bytes"})
+# Far beyond any real log, and the most an adapter, flag or default may set.
+MAX_LOG_BYTES = 1 << 30
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -120,6 +122,10 @@ def validate_limits(config: Any) -> None:
     for field, value in config.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise RelayError(f"Adapter limits.{field} must be a positive integer number of bytes.")
+    if config.get("max_log_bytes", 0) > MAX_LOG_BYTES or config.get("max_event_bytes", 0) > MAX_LOG_BYTES // 4:
+        raise RelayError(
+            f"Adapter limits must keep max_log_bytes at most {MAX_LOG_BYTES} (1 GiB) and max_event_bytes at most a quarter of that."
+        )
     if config.get("max_event_bytes", 1024) < 1024:
         raise RelayError("Adapter limits.max_event_bytes must be at least 1024 bytes.")
     if set(config) >= LIMIT_FIELDS and config["max_event_bytes"] * 4 > config["max_log_bytes"]:
@@ -434,13 +440,28 @@ def decode_exit_failure(
     return RelayError(f"Worker exited with code {code}; inspect stdout.log and stderr.log.")
 
 
+def _lines(raw: str) -> Iterator[str]:
+    """LF-separated lines, as the bounded writer frames events, without materialising a list of all of them."""
+    start = 0
+    while start <= len(raw):
+        end = raw.find("\n", start)
+        if end < 0:
+            end = len(raw)
+        yield raw[start:end]
+        start = end + 1
+
+
 def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if output == "text":
         if not raw.strip():
             raise RelayError("Worker returned no text.")
         return raw.strip(), {}
-    events = []
-    for line in raw.split("\n"):  # LF only, exactly as the bounded writer frames events
+    # One pass that keeps only what the decision needs, so millions of small events cannot exhaust memory.
+    results: list[Any] = []
+    parts: list[Any] = []
+    session_ids: set[str] = set()
+    failed = False
+    for line in _lines(raw):
         if not line.strip():
             continue
         try:
@@ -449,9 +470,19 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             raise RelayError("Worker returned malformed JSON output; inspect stdout.log.") from exc
         if not isinstance(event, dict):
             raise RelayError("Worker event must be an object.")
-        events.append(event)
+        if output == "agy-jsonl":
+            if event.get("event") == "result":
+                results.append(event.get("result"))
+        elif output == "cursor-jsonl":
+            if event.get("type") == "result":
+                results.append(event)
+        else:
+            failed = failed or event.get("type") == "error" or bool(event.get("error"))
+            if event.get("type") == "text" and isinstance(event.get("part"), dict):
+                parts.append(event["part"].get("text"))
+            if isinstance(event.get("sessionID"), str):
+                session_ids.add(event["sessionID"])
     if output == "agy-jsonl":
-        results = [e.get("result") for e in events if e.get("event") == "result"]
         if len(results) != 1 or not isinstance(results[0], dict):
             raise RelayError("Antigravity did not return exactly one terminal result.")
         agy_result = results[0]
@@ -462,10 +493,9 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             key: agy_result[key] for key in ("conversation_id", "usage", "duration_seconds") if key in agy_result
         }
     elif output == "cursor-jsonl":
-        cursor_results = [event for event in events if event.get("type") == "result"]
-        if len(cursor_results) != 1:
+        if len(results) != 1:
             raise RelayError("Cursor did not return exactly one terminal result.")
-        cursor_result = cursor_results[0]
+        cursor_result = results[0]
         if cursor_result.get("is_error") or cursor_result.get("subtype") != "success":
             raise RelayError("Cursor reported failure; inspect stdout.log.")
         answer = cursor_result.get("result")
@@ -475,15 +505,12 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             if key in cursor_result
         }
     else:
-        if any(e.get("type") == "error" or e.get("error") for e in events):
+        if failed:
             raise RelayError("OpenCode reported failure; inspect stdout.log.")
-        parts = [
-            e.get("part", {}).get("text") for e in events if e.get("type") == "text" and isinstance(e.get("part"), dict)
-        ]
         if not all(isinstance(p, str) for p in parts):
             raise RelayError("OpenCode returned an invalid text event.")
         answer = "\n".join(parts)
-        metadata = {"session_ids": sorted({e["sessionID"] for e in events if isinstance(e.get("sessionID"), str)})}
+        metadata = {"session_ids": sorted(session_ids)}
     if not isinstance(answer, str) or not answer.strip():
         raise RelayError("Worker returned no answer.")
     return answer.strip(), metadata
@@ -523,14 +550,21 @@ def event_classifier(output: str) -> Callable[[dict[str, Any]], int] | None:
     return EVENT_LEVELS.get(output)
 
 
-def _decodable_events(raw: str) -> list[dict[str, Any]]:
+def _answer_events(raw: str, output: str) -> list[dict[str, Any]]:
+    """The parseable events that can carry answer text; ordinary events are not kept, bounding memory."""
     events = []
-    for line in raw.split("\n"):
+    for line in _lines(raw):
         try:
             event = json.loads(line)
         except (ValueError, RecursionError):
             continue
-        if isinstance(event, dict):
+        if isinstance(event, dict) and (
+            event.get("type") in ("result", "assistant")
+            if output == "cursor-jsonl"
+            else event.get("event") == "result"
+            if output == "agy-jsonl"
+            else event.get("type") == "text"
+        ):
             events.append(event)
     return events
 
@@ -550,7 +584,7 @@ def decode_partial(raw: str, output: str) -> str | None:
     """Best-effort answer from a stopped worker's log; malformed or missing events are skipped."""
     if output == "text":
         return raw.strip() or None
-    events = _decodable_events(raw)
+    events = _answer_events(raw, output)
     level = EVENT_LEVELS[output]
     # A terminal event Relay clipped to fit would decode as a shortened answer; then prefer the unclipped text.
     clipped = [event for event in events if level(event) == TERMINAL and "relay_truncated_bytes" in event]

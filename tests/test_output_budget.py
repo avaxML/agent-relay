@@ -794,9 +794,9 @@ class BudgetResolutionTests(unittest.TestCase):
     def test_adapter_limits_are_validated(self) -> None:
         validate_adapter(self.adapter(limits={"max_log_bytes": 8_000_000}), "fake")
         for limits in (
-            {"max_log_bytes": 2 << 30},
+            {"max_log_bytes": 512 << 20},
             {"max_log_bytes": 1},
-            {"max_event_bytes": 1 << 30},
+            {"max_event_bytes": 128 << 20},
             {"max_event_bytes": 1000},
             {"max_log_bytes": 0},
             {"max_log_bytes": True},

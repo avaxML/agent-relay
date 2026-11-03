@@ -145,7 +145,7 @@ def resolve_log_budget(
         return {"cli": flag, "adapter": f"adapter limits.{name}", "kind": f"the {kind} default"}[source]
 
     if budget["max_log_bytes"] > MAX_LOG_BYTES:
-        raise RelayError(f"max_log_bytes from {origin('max_log_bytes')} must be at most {MAX_LOG_BYTES} (1 GiB).")
+        raise RelayError(f"max_log_bytes from {origin('max_log_bytes')} must be at most {MAX_LOG_BYTES} (256 MiB).")
     if budget["max_event_bytes"] < 1024 or budget["max_event_bytes"] * 4 > budget["max_log_bytes"]:
         raise RelayError(
             "max_event_bytes must be at least 1024 and at most a quarter of max_log_bytes; got "
@@ -789,8 +789,11 @@ def run_prepared(
                 try:
                     remove_clone(clone.directory)
                 except (RelayError, OSError) as exc:
+                    # Still on disk, so say where.
                     result["cleanup_error"] = str(exc)
-                result["clone"] = None
+                    result["clone"] = str(clone.work)
+                else:
+                    result["clone"] = None
         finally:
             # Published even if a second signal interrupts the clone removal.
             result["duration_seconds"] = round(time.monotonic() - started, 3)

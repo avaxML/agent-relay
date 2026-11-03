@@ -21,8 +21,9 @@ BLANKET_FLAGS = frozenset(
     {"--force", "--yolo", "--trust", "--auto", "--auto-review", "--dangerously-skip-permissions", "--approve-mcps"}
 )
 LIMIT_FIELDS = frozenset({"max_log_bytes", "max_event_bytes"})
-# Far beyond any real log, and the most an adapter, flag or default may set.
-MAX_LOG_BYTES = 1 << 30
+# Sixteen times the default probe/execute budget, and the most an adapter, flag or default may set; the decoders
+# read a whole log at once, so this also bounds their memory.
+MAX_LOG_BYTES = 256 << 20
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -124,7 +125,7 @@ def validate_limits(config: Any) -> None:
             raise RelayError(f"Adapter limits.{field} must be a positive integer number of bytes.")
     if config.get("max_log_bytes", 0) > MAX_LOG_BYTES or config.get("max_event_bytes", 0) > MAX_LOG_BYTES // 4:
         raise RelayError(
-            f"Adapter limits must keep max_log_bytes at most {MAX_LOG_BYTES} (1 GiB) and max_event_bytes at most a quarter of that."
+            f"Adapter limits must keep max_log_bytes at most {MAX_LOG_BYTES} (256 MiB) and max_event_bytes at most a quarter of that."
         )
     if config.get("max_log_bytes", 4096) < 4096:
         raise RelayError("Adapter limits.max_log_bytes must be at least 4096 bytes (four 1024-byte events).")

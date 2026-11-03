@@ -362,9 +362,12 @@ class BoundedLog:
     # Text has no framing, so Relay cannot tell which lines were the answer: any byte cut or dropped from a text
     # stdout, whitespace included, counts as answer loss, and invoke_provider fails the run.
     def _text_line(self, line: bytes, overflowed: bool) -> None:
-        if overflowed or len(line) > self.line_limit:
+        cut = overflowed or len(line) > self.line_limit
+        if cut:
             line = self._cut(line, self.line_limit, keep_end=True)
-        if not self.tail and self.written + len(line) <= self.head_limit:
+        # A cut line goes to the tail even if the head has room: the run will fail, and the partial answer is
+        # read from the tail, so the line's kept end must be there.
+        if not cut and not self.tail and self.written + len(line) <= self.head_limit:
             self._write(line)
             return
         if not self.tail:

@@ -45,6 +45,7 @@ class PackagingTests(unittest.TestCase):
             "chaos-monkey",
             "delegate",
             "executor",
+            "plan-research",
             "propose-patch",
             "relay-doctor",
             "second-opinion",

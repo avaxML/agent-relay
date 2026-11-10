@@ -1,6 +1,6 @@
 # Contributing
 
-Agent Relay keeps the runtime small and auditable. Production code uses the Python standard library, provider behavior lives in declarative adapters, and external output remains advisory.
+Agent Relay keeps the runtime small and auditable. Production code uses the Python standard library, provider behavior lives in declarative adapters, and provider claims remain advisory: Relay's own capture and checks decide a tool run's status, and the lead verifies before applying anything.
 
 Before opening a pull request:
 
@@ -8,5 +8,6 @@ Before opening a pull request:
 2. Run `./scripts/check.sh`.
 3. Update both plugin manifests and the marketplace version together for a release.
 4. Document any new provider's input format, output format, model IDs, effort mappings, log paths, listener requirements, and permission behavior.
+5. Add a `tools` block only after a live probe and execute on a synthetic fixture, and record the result in the adapter reference. Never put an auto-approval flag outside that block.
 
 Do not commit credentials, provider logs, job snapshots, source corpora, or generated answer artifacts. New runtime dependencies require a concrete justification and should remain avoidable where possible.

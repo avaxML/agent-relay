@@ -1251,6 +1251,56 @@ class ForumTests(unittest.TestCase):
                 max_answer_chars=2000,
             )
 
+    def test_open_validates_member_effort_and_honors_slow_effort_default_timeout(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        adapter = json.loads(left.read_text(encoding="utf-8"))
+        adapter["effort"] = {
+            "models": ["fake-model"],
+            "levels": {"xhigh": {"args": ["--slow"], "timeout": 600}},
+        }
+        left.write_text(json.dumps(adapter), encoding="utf-8")
+
+        with self.assertRaises(RelayError):
+            forum.open_topic(
+                kind="plan",
+                question="How should we cache GET /items?",
+                root=self.project,
+                files=["source.txt"],
+                members=[
+                    forum.parse_member(f"member_id=alpha,provider=alpha,effort=bogus,adapter_file={left}"),
+                    forum.parse_member(f"member_id=beta,provider=beta,adapter_file={right}"),
+                ],
+                forums_dir=self.forums,
+                jobs_dir=self.jobs,
+                max_rounds=2,
+                threshold="unanimous",
+                timeout=None,
+                max_input_bytes=400000,
+                max_answer_chars=12000,
+            )
+
+        opened = forum.open_topic(
+            kind="plan",
+            question="How should we cache GET /items?",
+            root=self.project,
+            files=["source.txt"],
+            members=[
+                forum.parse_member(f"member_id=alpha,provider=alpha,effort=xhigh,adapter_file={left}"),
+                forum.parse_member(f"member_id=beta,provider=beta,adapter_file={right}"),
+            ],
+            forums_dir=self.forums,
+            jobs_dir=self.jobs,
+            max_rounds=2,
+            threshold="unanimous",
+            timeout=None,
+            max_input_bytes=400000,
+            max_answer_chars=12000,
+        )
+        with forum.database(self.forums) as connection:
+            row = connection.execute("SELECT timeout FROM topics WHERE topic_id=?", (opened["topic_id"],)).fetchone()
+        self.assertEqual(row["timeout"], 600)
+
     def test_open_topic_rejects_path_member_ids(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")
         right = self._adapter("beta", "redis", "Use Redis")

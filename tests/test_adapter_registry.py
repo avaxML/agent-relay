@@ -15,7 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from providers import RelayError, list_adapters, load_adapter, registry_directory
+from providers import RelayError, install_adapter, list_adapters, load_adapter, registry_directory
 
 
 def adapter_payload(name: str, executable: str = "fake-cli", default_model: str = "test-model") -> dict[str, object]:
@@ -267,6 +267,19 @@ class AdapterRegistryTests(unittest.TestCase):
         xdg = self.directory / "xdg"
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}, clear=True):
             self.assertEqual(registry_directory(), (xdg / "agent-relay" / "adapters").resolve())
+
+    def test_registry_rejects_blanket_auto_approval_flags(self) -> None:
+        source = self.write_adapter("custom", args=["--dangerously-skip-permissions"])
+        with self.assertRaises(RelayError):
+            install_adapter(source, registry_dir=self.registry)
+        self.assertFalse((self.registry / "custom.json").exists())
+
+        self.registry.mkdir(parents=True)
+        payload = adapter_payload("custom")
+        payload["args"] = ["--force"]
+        (self.registry / "custom.json").write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(RelayError):
+            load_adapter("custom", registry_dir=self.registry)
 
 
 if __name__ == "__main__":

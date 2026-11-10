@@ -9,7 +9,7 @@ Use this skill before a consequential implementation decision or when a fresh re
 
 Give the reviewer the exact question and relevant files. For an independent review, omit your conclusions; include a hypothesis when the task is specifically to challenge it. Ask for findings first, then evidence, severity, and a recommendation. Use `--kind review`; do not ask it to edit files or apply a patch.
 
-Choose a provider independently of the lead agent where practical. Compare the response with your own reasoning and verify every material finding in source. An empty or truncated answer is inconclusive. Keep credentials inherited from the user's configured CLI; do not add auto-approval flags.
+Choose a provider independently of the lead agent where practical. Compare the response with your own reasoning and verify every material finding in source. An empty or truncated answer is inconclusive. Keep credentials inherited from the user's configured CLI; do not add auto-approval flags (they belong only in an adapter's verified `tools` block, which reviews never use).
 
 Resolve the plugin root as the directory two levels above the directory containing this `SKILL.md` and invoke `agent-relay` when available, otherwise `python3 <plugin-root>/scripts/relay.py`. Read [adding-adapters.md](../../references/adding-adapters.md) for adapter-specific model selection.
 

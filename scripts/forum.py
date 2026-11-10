@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import jobs
-from providers import RelayError, load_adapter, validate_provider_name
+from providers import RelayError, load_adapter, resolve_effort, resolve_timeout, validate_provider_name
 from task_runner import build_request, snapshot_sources, write_json
 
 SCHEMA_VERSION = 1
@@ -370,7 +370,7 @@ def open_topic(
     jobs_dir: Path | None,
     max_rounds: int,
     threshold: str,
-    timeout: int,
+    timeout: int | None,
     max_input_bytes: int,
     max_answer_chars: int,
 ) -> dict[str, Any]:
@@ -380,6 +380,10 @@ def open_topic(
         raise RelayError("Threshold must be unanimous or majority.")
     if not 1 <= max_rounds <= MAX_ROUNDS:
         raise RelayError(f"max_rounds must be between 1 and {MAX_ROUNDS}.")
+    if timeout is not None and timeout <= 0:
+        raise RelayError("timeout must be positive.")
+    if max_input_bytes <= 0 or max_answer_chars <= 0:
+        raise RelayError("max_input_bytes and max_answer_chars must be positive.")
     question = question.strip()
     if not question:
         raise RelayError("Question must not be empty.")
@@ -389,6 +393,7 @@ def open_topic(
         raise RelayError("A forum needs at least two members.")
     seen: set[str] = set()
     prepared: list[dict[str, str | None]] = []
+    member_timeouts: list[int] = []
     for member in members:
         member_id = member["member_id"]
         if member_id is None or member_id in seen:
@@ -398,11 +403,15 @@ def open_topic(
         seen.add(member_id)
         adapter_path = Path(member["adapter_file"]).expanduser().resolve() if member["adapter_file"] else None
         registry_path = Path(member["registry_dir"]).expanduser().resolve() if member["registry_dir"] else None
-        load_adapter(member["provider"] or "", adapter_path, registry_path)
+        adapter = load_adapter(member["provider"] or "", adapter_path, registry_path)
+        requested_model = member["model"] or adapter["default_model"]
+        resolved_model, _effort_args = resolve_effort(adapter, requested_model, member["effort"])
+        member_timeouts.append(resolve_timeout(adapter, member["effort"], resolved_model, timeout))
         resolved = dict(member)
         resolved["adapter_file"] = str(adapter_path) if adapter_path else None
         resolved["registry_dir"] = str(registry_path) if registry_path else None
         prepared.append(resolved)
+    effective_timeout = max(member_timeouts)
     resolved_root = root.expanduser().resolve(strict=True)
     if not resolved_root.is_dir():
         raise RelayError("--root must be a directory.")
@@ -445,7 +454,7 @@ def open_topic(
                 now,
                 now,
                 jobs_path,
-                timeout,
+                effective_timeout,
                 max_input_bytes,
                 max_answer_chars,
             ),
@@ -1409,7 +1418,11 @@ def register_cli(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
     open_cmd.add_argument("--member", action="append", required=True, dest="members")
     open_cmd.add_argument("--max-rounds", type=int, default=2)
     open_cmd.add_argument("--threshold", choices=sorted(THRESHOLDS), default="unanimous")
-    open_cmd.add_argument("--timeout", type=int, default=180)
+    open_cmd.add_argument(
+        "--timeout",
+        type=int,
+        help="Worker seconds; defaults to the slowest member effort level's declared timeout, else 180.",
+    )
     open_cmd.add_argument("--max-input-bytes", type=int, default=400000)
     open_cmd.add_argument("--max-answer-chars", type=int, default=12000)
     open_cmd.add_argument("--jobs-dir", type=Path)

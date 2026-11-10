@@ -57,7 +57,7 @@ SCHEMA = [
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         jobs_dir TEXT,
-        timeout INTEGER NOT NULL,
+        timeout INTEGER,
         max_input_bytes INTEGER NOT NULL,
         max_answer_chars INTEGER NOT NULL
     )
@@ -393,7 +393,6 @@ def open_topic(
         raise RelayError("A forum needs at least two members.")
     seen: set[str] = set()
     prepared: list[dict[str, str | None]] = []
-    member_timeouts: list[int] = []
     for member in members:
         member_id = member["member_id"]
         if member_id is None or member_id in seen:
@@ -406,12 +405,11 @@ def open_topic(
         adapter = load_adapter(member["provider"] or "", adapter_path, registry_path)
         requested_model = member["model"] or adapter["default_model"]
         resolved_model, _effort_args = resolve_effort(adapter, requested_model, member["effort"])
-        member_timeouts.append(resolve_timeout(adapter, member["effort"], resolved_model, timeout))
+        resolve_timeout(adapter, member["effort"], resolved_model, timeout)
         resolved = dict(member)
         resolved["adapter_file"] = str(adapter_path) if adapter_path else None
         resolved["registry_dir"] = str(registry_path) if registry_path else None
         prepared.append(resolved)
-    effective_timeout = max(member_timeouts)
     resolved_root = root.expanduser().resolve(strict=True)
     if not resolved_root.is_dir():
         raise RelayError("--root must be a directory.")
@@ -454,7 +452,7 @@ def open_topic(
                 now,
                 now,
                 jobs_path,
-                effective_timeout,
+                timeout,
                 max_input_bytes,
                 max_answer_chars,
             ),
@@ -827,6 +825,7 @@ def _write_round_task(
         }
         for message in messages
         if not (message["kind"] in {"claim", "rebuttal"} and (message["sender"], message["round"]) in in_candidates)
+        and not (message["kind"] == "consensus" and candidates and message["body"].get("status") == "split")
     ]
     task = (
         topic["question"].rstrip()
@@ -837,7 +836,8 @@ def _write_round_task(
         + "\nEligible ballot claim_ids:\n"
         + json.dumps(sorted(candidate["claim_id"] for candidate in candidates), ensure_ascii=False)
         + f"\nRelay records your answer as claim_id {claim_id_for(str(member['member_id']), round_no)}. "
-        + "Vote for at most one eligible claim_id; other ballots are ignored. "
+        + "Vote 'agree' for at most one eligible claim_id (including your own prior claim if you still endorse it), "
+        + "and optionally 'dissent' or 'abstain' on other eligible claim_ids; other ballots are ignored. "
         + "Round 1 has no eligible ballots.\n"
     )
     path = directory / "task.txt"
@@ -1233,22 +1233,19 @@ def settle_topic(
             raise RelayError("Topic is already settled.")
         members = _members(connection, topic_id)
         member_ids = [member["member_id"] for member in members]
-        claims = [
+        all_claims = [
             row_dict(row)
             for row in connection.execute(
-                """
-                SELECT c.* FROM claims c
-                JOIN (
-                    SELECT member_id, MAX(round) AS round FROM claims WHERE topic_id=? GROUP BY member_id
-                ) latest ON c.member_id=latest.member_id AND c.round=latest.round
-                WHERE c.topic_id=?
-                ORDER BY c.member_id
-                """,
-                (topic_id, topic_id),
+                "SELECT * FROM claims WHERE topic_id=? ORDER BY round, member_id",
+                (topic_id,),
             ).fetchall()
         ]
-        if not claims:
+        if not all_claims:
             raise RelayError("No claims to settle; run and ingest a round first.")
+        latest_by_member: dict[str, dict[str, Any]] = {}
+        for claim in all_claims:
+            latest_by_member[claim["member_id"]] = claim
+        claims = [latest_by_member[member_id] for member_id in sorted(latest_by_member)]
         chosen = threshold or topic["threshold"]
         if chosen not in THRESHOLDS:
             raise RelayError("Threshold must be unanimous or majority.")
@@ -1261,11 +1258,13 @@ def settle_topic(
         ]
         reviewed_candidates = _candidate_set(connection, topic_id, latest_round)
         voting_claims = (
-            [
+            all_claims
+            if claim_id is not None
+            else [
                 {**candidate, "evidence": json.dumps(candidate["evidence"], ensure_ascii=False)}
                 for candidate in reviewed_candidates
             ]
-            if latest_round > 1 and claim_id is None and reviewed_candidates
+            if latest_round > 1 and reviewed_candidates
             else claims
         )
         target, chair_override, sole_winner = _select_claim(voting_claims, ballots, member_ids, claim_id, chosen)
@@ -1311,7 +1310,7 @@ def settle_topic(
                 (topic_id, payload["status"], json.dumps(payload, ensure_ascii=False), str(export_path), now),
             )
             connection.execute(
-                "DELETE FROM messages WHERE topic_id=? AND kind='consensus'",
+                "DELETE FROM messages WHERE topic_id=? AND kind='consensus' AND delivered_at IS NULL",
                 (topic_id,),
             )
             for member_id in member_ids:
@@ -1421,7 +1420,7 @@ def register_cli(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
     open_cmd.add_argument(
         "--timeout",
         type=int,
-        help="Worker seconds; defaults to the slowest member effort level's declared timeout, else 180.",
+        help="Worker seconds; defaults to each member effort level's declared timeout, else 180.",
     )
     open_cmd.add_argument("--max-input-bytes", type=int, default=400000)
     open_cmd.add_argument("--max-answer-chars", type=int, default=12000)

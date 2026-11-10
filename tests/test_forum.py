@@ -1297,9 +1297,45 @@ class ForumTests(unittest.TestCase):
             max_input_bytes=400000,
             max_answer_chars=12000,
         )
+        launched = forum.start_round(opened["topic_id"], self.forums)
+        self._track(launched)
+        jobs_by_member = {item["member_id"]: item["job_id"] for item in launched["jobs"]}
+        alpha_task = json.loads((self.jobs / jobs_by_member["alpha"] / "task.json").read_text(encoding="utf-8"))
+        beta_task = json.loads((self.jobs / jobs_by_member["beta"] / "task.json").read_text(encoding="utf-8"))
+        self.assertEqual(alpha_task["timeout"], 600)
+        self.assertEqual(beta_task["timeout"], 180)
+        forum.wait_round(opened["topic_id"], self.forums, 8)
+
+    def test_split_consensus_keeps_delivered_history_and_allows_chair_override_on_prior_round_claim(self) -> None:
+        left = self._adapter("alpha", "etag", "Use ETag")
+        right = self._adapter("beta", "redis", "Use Redis")
+        topic_id = self._open(left, right)
+        self._track(forum.start_round(topic_id, self.forums))
+        forum.wait_round(topic_id, self.forums, 8)
+        forum.ingest_round(topic_id, self.forums)
+        first_split = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(first_split["status"], "split")
+
+        self._track(forum.start_round(topic_id, self.forums))
+        forum.wait_round(topic_id, self.forums, 8)
+        task_text = (self.forums / topic_id / "rounds" / "2" / "alpha" / "task.txt").read_text(encoding="utf-8")
+        self.assertNotIn('"kind": "consensus"', task_text)
+        self.assertIn("Vote 'agree' for at most one eligible claim_id (including your own prior claim", task_text)
+        forum.ingest_round(topic_id, self.forums)
+
+        second_split = forum.settle_topic(topic_id, self.forums)
+        self.assertEqual(second_split["status"], "split")
         with forum.database(self.forums) as connection:
-            row = connection.execute("SELECT timeout FROM topics WHERE topic_id=?", (opened["topic_id"],)).fetchone()
-        self.assertEqual(row["timeout"], 600)
+            delivered_consensus = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE topic_id=? AND kind='consensus' AND delivered_at IS NOT NULL",
+                (topic_id,),
+            ).fetchone()[0]
+        self.assertEqual(delivered_consensus, 2)
+
+        agreed = forum.settle_topic(topic_id, self.forums, claim_id="alpha-r1")
+        self.assertEqual(agreed["status"], "agreed")
+        self.assertEqual(agreed["claim_id"], "alpha-r1")
+        self.assertTrue(agreed["chair_override"])
 
     def test_open_topic_rejects_path_member_ids(self) -> None:
         left = self._adapter("alpha", "etag", "Use ETag")

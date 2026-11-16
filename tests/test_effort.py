@@ -85,6 +85,22 @@ class EffortTests(unittest.TestCase):
             self.assertEqual(result["model"], "gemini-4-hydrogen-high")
             self.assertEqual(json.loads(result["answer"]), ["--model", "gemini-4-hydrogen-high", "--effort", "high"])
 
+    def test_grok_passes_reasoning_effort_without_changing_the_model(self) -> None:
+        adapter = load_adapter("grok")
+        for model in ("grok-4.7", "grok-4.7-build-fast", "grok-4.6"):
+            for level in ("low", "medium", "high", "xhigh"):
+                with self.subTest(model=model, level=level):
+                    self.assertEqual(resolve_effort(adapter, model, level), (model, ["--reasoning-effort", level]))
+        with self.assertRaises(RelayError):
+            resolve_effort(adapter, "grok-4.7", "max")
+        with self.assertRaises(RelayError):
+            resolve_effort(adapter, "grok-4.7-high", "high")
+        # grok-4.5 rejects xhigh live, so it has no effort mapping; it still runs with --model and no --effort.
+        with self.assertRaises(RelayError):
+            resolve_effort(adapter, "grok-4.5", "low")
+        self.assertEqual(resolve_effort(adapter, "grok-4.5", None), ("grok-4.5", []))
+        self.assertEqual(resolve_effort(adapter, "grok-4.7", None), ("grok-4.7", []))
+
     def test_opencode_selects_variant(self) -> None:
         adapter = load_adapter("opencode")
         for level in ("low", "medium", "high", "max"):

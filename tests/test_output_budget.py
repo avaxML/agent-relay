@@ -57,6 +57,18 @@ def opencode_stream(tool_events: int, answer: str = "final answer") -> list[byte
     return [json.dumps(line).encode() + b"\n" for line in lines]
 
 
+def grok_stream(tool_events: int, answer: str = "final answer") -> list[bytes]:
+    lines: list[dict[str, Any]] = [{"type": "text", "data": "first "}]
+    for index in range(tool_events):
+        lines.append({"type": "thought", "data": "hmm"})
+        lines.append(
+            {"type": "tool_call_update", "toolCallId": str(index), "status": "completed", "content": TOOL_RESULT}
+        )
+    lines += [{"type": "text", "data": piece} for piece in (answer[:5], answer[5:])]
+    lines.append({"type": "end", "stopReason": "end_turn", "sessionId": "s"})
+    return [json.dumps(line).encode() + b"\n" for line in lines]
+
+
 def text_stream(lines: int, answer: str = "final answer") -> list[bytes]:
     return [f"progress line {index} {'.' * 200}\n".encode() for index in range(lines)] + [answer.encode() + b"\n"]
 
@@ -83,6 +95,7 @@ class BoundedLogTests(unittest.TestCase):
             "cursor-jsonl": (cursor_stream(120), "final answer"),
             "agy-jsonl": (agy_stream(120), "final answer"),
             "opencode-jsonl": (opencode_stream(120), "first\nfinal answer"),
+            "grok-jsonl": (grok_stream(120), "first final answer"),
         }
         for output, (chunks, expected) in cases.items():
             with self.subTest(output=output):
@@ -248,8 +261,21 @@ class BoundedLogTests(unittest.TestCase):
         answer = decode_response(provider_stdout(self.path.parent, {"stdout": log.stats}), "text")[0]
         self.assertTrue(answer.startswith("first half of the answer"))
 
+    def test_grok_partial_answer_joins_deltas_without_separators(self) -> None:
+        chunks = grok_stream(3, "7319 at a.py:1")[:-1]
+        log = self.write("grok-jsonl", chunks, 1_000_000, 8_000)
+        self.assertEqual(log.stats["dropped_answer_events"], 0)
+        self.assertEqual(decode_partial(self.path.read_text(encoding="utf-8"), "grok-jsonl"), "first 7319 at a.py:1")
+
+    def test_grok_answer_events_are_protected_from_the_drop_threshold(self) -> None:
+        chunks = grok_stream(60)
+        log = self.write("grok-jsonl", chunks, 100_000, 2_000)
+        self.assertGreater(log.stats["dropped_events"], 0)
+        self.assertEqual(log.stats["dropped_answer_events"], 0)
+        self.assertEqual(decode_response(self.path.read_text(encoding="utf-8"), "grok-jsonl")[0], "first final answer")
+
     def test_unhashable_discriminators_do_not_crash_classification(self) -> None:
-        for output in ("cursor-jsonl", "opencode-jsonl", "agy-jsonl"):
+        for output in ("cursor-jsonl", "opencode-jsonl", "agy-jsonl", "grok-jsonl"):
             with self.subTest(output=output):
                 event = {"type": [], "event": {}, "pad": "x" * 20_000}
                 log = self.write(output, [json.dumps(event).encode() + b"\n"], 1_000_000, 8_000)

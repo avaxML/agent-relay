@@ -53,7 +53,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
         adapters = {path.stem for path in (ROOT / "adapters").glob("*.json")}
-        self.assertEqual(adapters, {"antigravity", "cursor", "opencode"})
+        self.assertEqual(adapters, {"antigravity", "cursor", "grok", "opencode"})
 
     def test_release_tag_must_match_every_manifest(self) -> None:
         project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -24,14 +25,20 @@ class EffortTests(unittest.TestCase):
 
     def test_antigravity_selects_matching_model_and_effort(self) -> None:
         adapter = load_adapter("antigravity")
-        self.assertEqual(
-            resolve_effort(adapter, "gemini-3.8-flash-low", "high"),
-            ("gemini-3.8-flash-high", ["--effort", "high"]),
-        )
-        self.assertEqual(
-            resolve_effort(adapter, "gemini-3.8-flash-high", "low"),
-            ("gemini-3.8-flash-low", ["--effort", "low"]),
-        )
+        for model, effort, selected in (
+            ("gemini-4-argon-low", "high", "gemini-4-argon-high"),
+            ("gemini-4-hydrogen-low", "xhigh", "gemini-4-hydrogen-xhigh"),
+            ("gemini-4-hydrogen-high", "low", "gemini-4-hydrogen-low"),
+            ("gemini-3.8-flash-low", "high", "gemini-3.8-flash-high"),
+            ("gemini-3.8-flash-high", "low", "gemini-3.8-flash-low"),
+        ):
+            with self.subTest(model=model, effort=effort):
+                self.assertEqual(resolve_effort(adapter, model, effort), (selected, ["--effort", effort]))
+
+    def test_antigravity_rejects_levels_outside_requested_family(self) -> None:
+        with self.assertRaises(RelayError) as raised:
+            resolve_effort(load_adapter("antigravity"), "gemini-4-argon-low", "xhigh")
+        self.assertEqual(str(raised.exception), "Unsupported effort xhigh; supported: low, medium, high.")
 
     def test_antigravity_unknown_model_preserves_error_text(self) -> None:
         with self.assertRaises(RelayError) as raised:
@@ -40,6 +47,43 @@ class EffortTests(unittest.TestCase):
             str(raised.exception),
             "No effort mapping for antigravity model unknown-model; omit --effort or add a verified mapping.",
         )
+
+    def test_antigravity_default_family_reaches_fake_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = root / "worker.py"
+            script.write_text("import json, sys; print(json.dumps(sys.argv[1:]))\n")
+            adapter = load_adapter("antigravity")
+            adapter.update(
+                executable=sys.executable,
+                args=[str(script), "--model", "{model}"],
+                input="stdin",
+                output="text",
+            )
+            adapter_file = root / "adapter.json"
+            adapter_file.write_text(json.dumps(adapter))
+            task = root / "task.txt"
+            task.write_text("Return your invocation arguments.")
+            result = run(
+                argparse.Namespace(
+                    provider="antigravity",
+                    adapter_file=adapter_file,
+                    model=None,
+                    effort="high",
+                    root=root,
+                    files=[],
+                    task_file=task,
+                    kind="read",
+                    max_input_bytes=10000,
+                    output=root / "result",
+                    timeout=None,
+                    max_answer_chars=1000,
+                )
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["requested_model"], "gemini-4-hydrogen-low")
+            self.assertEqual(result["model"], "gemini-4-hydrogen-high")
+            self.assertEqual(json.loads(result["answer"]), ["--model", "gemini-4-hydrogen-high", "--effort", "high"])
 
     def test_opencode_selects_variant(self) -> None:
         adapter = load_adapter("opencode")
@@ -75,6 +119,24 @@ class EffortTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 report = inspect_provider(provider, None, None, probe=False)
                 self.assertEqual(json.dumps(report["effort"]), json.dumps(effort))
+
+    def test_antigravity_doctor_reports_all_effort_families(self) -> None:
+        report = inspect_provider("antigravity", None, None, probe=False)
+        expected: list[dict[str, Any]] = []
+        for prefix, levels in (
+            ("gemini-4-hydrogen", ("low", "medium", "high", "xhigh")),
+            ("gemini-4-argon", ("low", "medium", "high")),
+            ("gemini-3.8-flash", ("low", "medium", "high")),
+        ):
+            expected.append(
+                {
+                    "models": [f"{prefix}-{level}" for level in levels],
+                    "levels": {level: {"args": ["--effort", level], "model": f"{prefix}-{level}"} for level in levels},
+                }
+            )
+        expected[0]["levels"]["xhigh"]["timeout"] = 600
+        self.assertEqual(report["effort"], expected)
+        self.assertEqual(report["default_model"], "gemini-4-hydrogen-low")
 
     def test_cursor_selects_exact_grok_model_without_extra_arguments(self) -> None:
         adapter = load_adapter("cursor")
@@ -177,6 +239,10 @@ class EffortTests(unittest.TestCase):
     def test_slow_bundled_levels_declare_longer_timeouts(self) -> None:
         cursor = load_adapter("cursor")
         opencode = load_adapter("opencode")
+        antigravity = load_adapter("antigravity")
+        self.assertEqual(resolve_timeout(antigravity, "xhigh", "gemini-4-hydrogen-low", None), 600)
+        self.assertEqual(resolve_timeout(antigravity, "high", "gemini-4-hydrogen-high", None), 180)
+        self.assertEqual(resolve_timeout(antigravity, "xhigh", "gemini-4-hydrogen-low", 90), 90)
         deepseek = "opencode-go/deepseek-v4.1-flash"
         self.assertEqual(resolve_timeout(cursor, "xhigh", "grok-4.7-xhigh", None), 600)
         self.assertEqual(resolve_timeout(opencode, "max", f"{deepseek}#max", None), 600)
@@ -231,6 +297,8 @@ class EffortTests(unittest.TestCase):
         self.assertEqual(resolve_timeout(adapter, "missing", "base#max", None), DEFAULT_TIMEOUT)
 
     def test_directly_selected_slow_variant_implies_its_timeout(self) -> None:
+        self.assertEqual(resolve_timeout(load_adapter("antigravity"), None, "gemini-4-hydrogen-xhigh", None), 600)
+        self.assertEqual(resolve_timeout(load_adapter("antigravity"), None, "gemini-4-hydrogen-high", None), 180)
         self.assertEqual(resolve_timeout(load_adapter("cursor"), None, "grok-4.7-xhigh", None), 600)
         self.assertEqual(
             resolve_timeout(load_adapter("opencode"), None, "opencode-go/deepseek-v4.1-flash#max", None), 600

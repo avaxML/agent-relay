@@ -1,7 +1,7 @@
 {
   "name": "antigravity",
   "executable": "agy",
-  "default_model": "gemini-3.8-flash-low",
+  "default_model": "gemini-4-hydrogen-low",
   "args": [
     "--input-format",
     "stream-json",
@@ -49,34 +49,105 @@
     ],
     "env": {}
   },
-  "effort": {
-    "models": [
-      "gemini-3.8-flash-low",
-      "gemini-3.8-flash-medium",
-      "gemini-3.8-flash-high"
-    ],
-    "levels": {
-      "low": {
-        "args": [
-          "--effort",
-          "low"
-        ],
-        "model": "gemini-3.8-flash-low"
-      },
-      "medium": {
-        "args": [
-          "--effort",
-          "medium"
-        ],
-        "model": "gemini-3.8-flash-medium"
-      },
-      "high": {
-        "args": [
-          "--effort",
-          "high"
-        ],
-        "model": "gemini-3.8-flash-high"
+  "effort": [
+    {
+      "models": [
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh"
+      ],
+      "levels": {
+        "low": {
+          "args": [
+            "--effort",
+            "low"
+          ],
+          "model": "gemini-4-hydrogen-low"
+        },
+        "medium": {
+          "args": [
+            "--effort",
+            "medium"
+          ],
+          "model": "gemini-4-hydrogen-medium"
+        },
+        "high": {
+          "args": [
+            "--effort",
+            "high"
+          ],
+          "model": "gemini-4-hydrogen-high"
+        },
+        "xhigh": {
+          "args": [
+            "--effort",
+            "xhigh"
+          ],
+          "model": "gemini-4-hydrogen-xhigh",
+          "timeout": 600
+        }
+      }
+    },
+    {
+      "models": [
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high"
+      ],
+      "levels": {
+        "low": {
+          "args": [
+            "--effort",
+            "low"
+          ],
+          "model": "gemini-4-argon-low"
+        },
+        "medium": {
+          "args": [
+            "--effort",
+            "medium"
+          ],
+          "model": "gemini-4-argon-medium"
+        },
+        "high": {
+          "args": [
+            "--effort",
+            "high"
+          ],
+          "model": "gemini-4-argon-high"
+        }
+      }
+    },
+    {
+      "models": [
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-high"
+      ],
+      "levels": {
+        "low": {
+          "args": [
+            "--effort",
+            "low"
+          ],
+          "model": "gemini-3.8-flash-low"
+        },
+        "medium": {
+          "args": [
+            "--effort",
+            "medium"
+          ],
+          "model": "gemini-3.8-flash-medium"
+        },
+        "high": {
+          "args": [
+            "--effort",
+            "high"
+          ],
+          "model": "gemini-3.8-flash-high"
+        }
       }
     }
-  }
+  ]
 }

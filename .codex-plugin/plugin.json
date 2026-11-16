@@ -1,7 +1,7 @@
 {
   "name": "agent-relay",
   "version": "0.6.0",
-  "description": "Delegate bounded coding tasks to OpenCode, Antigravity, Cursor, and extensible CLI adapters.",
+  "description": "Delegate bounded coding tasks to OpenCode, Antigravity, Cursor, Grok Build, and extensible CLI adapters.",
   "author": {
     "name": "avaxML",
     "url": "https://github.com/avaxML"
@@ -9,12 +9,12 @@
   "homepage": "https://github.com/avaxML/agent-relay",
   "repository": "https://github.com/avaxML/agent-relay",
   "license": "MIT",
-  "keywords": ["agents", "delegation", "opencode", "antigravity", "cursor", "chaos-engineering"],
+  "keywords": ["agents", "delegation", "opencode", "antigravity", "cursor", "grok", "chaos-engineering"],
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Relay",
     "shortDescription": "Delegate coding work across agent CLIs.",
-    "longDescription": "Delegate bulk reading, independent review, bounded chaos analysis, and patch proposals to OpenCode, Antigravity, or Cursor. Choose reasoning effort, run detached jobs, inspect status, collect results, and cancel work through extensible CLI adapters.",
+    "longDescription": "Delegate bulk reading, independent review, bounded chaos analysis, and patch proposals to OpenCode, Antigravity, Cursor, or Grok Build. Choose reasoning effort, run detached jobs, inspect status, collect results, and cancel work through extensible CLI adapters.",
     "developerName": "avaxML",
     "category": "Productivity",
     "capabilities": [],

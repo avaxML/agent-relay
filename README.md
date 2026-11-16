@@ -14,6 +14,7 @@ The bundled adapters are:
 | `opencode` | `opencode-go/deepseek-v4.1-flash` | code and log triage |
 | `antigravity` | `gemini-4-hydrogen-low` | broad extraction and corpus reading |
 | `cursor` | `grok-4.7-high` | independent review through Cursor Agent |
+| `grok` | `grok-4.7` | independent review through Grok Build, Cursor's merged agent CLI |
 
 Use the bundled skills for common workflows: `delegate`, `executor`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
 
@@ -52,6 +53,7 @@ python3 scripts/relay.py doctor
 python3 scripts/relay.py models --provider opencode
 python3 scripts/relay.py models --provider antigravity
 python3 scripts/relay.py models --provider cursor
+python3 scripts/relay.py models --provider grok
 ```
 
 Create a task file containing one bounded question, then run it with explicit files and a fresh output directory:
@@ -92,7 +94,7 @@ Relay bounds provider logs rather than stopping verbose providers. Oversized eve
 A tracked change in a probe, a change outside `--owns`, or any `.git` change is a violation. Empty provider output is an error. Apply an `execute` result yourself with `git apply --check` and `git apply` after reading the diff.
 
 To spread several tasks across providers as subagents, use the `executor` skill:
-- `relay.py dispatch --manifest FILE --root REPO --providers antigravity opencode cursor` assigns tasks equally and submits them as background jobs.
+- `relay.py dispatch --manifest FILE --root REPO --providers antigravity opencode grok` assigns tasks equally and submits them as background jobs.
 - `relay.py collect --dispatch LEDGER` waits with a bound and aggregates the results.
 - `relay.py cleanup --dispatch LEDGER` removes kept clones.
 
@@ -127,6 +129,7 @@ The orchestrator can choose `--effort low`, `medium`, or `high` for each task. O
 | Antigravity, Gemini 4 Argon low/medium/high IDs | `low`, `medium`, `high` | Selects `gemini-4-argon-LEVEL` and passes `--effort LEVEL` |
 | Antigravity, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL` and passes `--effort LEVEL` |
 | Cursor, Grok 4.7 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `grok-4.7-LEVEL`; no additional effort argument; `xhigh` defaults to a 600-second timeout, also for `--model grok-4.7-xhigh` without `--effort` |
+| Grok Build, `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6` | `low`, `medium`, `high`, `xhigh` | Keeps the model and passes `--reasoning-effort LEVEL`; omitting `--effort` keeps Grok's configured default. `grok-4.5` rejects `xhigh`, so it has no effort mapping; use `--model grok-4.5` without `--effort` |
 
 Explicit effort overrides the Antigravity or Cursor variant within the same model family. Cursor's `composer-2.5` is reachable with `--model composer-2.5` and no `--effort`; it has no effort mapping because every level selects a fixed Grok ID. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. Antigravity Hydrogen `xhigh`, Cursor `xhigh`, and OpenCode `max` can take several minutes, so their levels declare a 600-second default timeout; an explicit `--timeout` still wins. Prefer `submit` for these levels so a long worker does not hold the orchestrator's turn. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
 
@@ -138,11 +141,13 @@ The file bundle is data, not instructions. Keep delegated questions narrow, requ
 
 For tool-free kinds the provider process runs from a temporary working directory. This is an execution convenience, not a hard security boundary. The process inherits the host environment and may access host files or the network subject to the CLI's permissions. Relay never applies returned patches or tool-kind diffs, and it does not provide OS-level sandboxing; tool kinds run in a clone and Relay disables hooks in its own git calls there. The small excluded-path list is not a secret scanner: select only files authorized for the chosen provider. Treat local output artifacts and the provider's own session history as potentially sensitive and manage retention accordingly.
 
+Cursor's agent CLI and Grok Build now ship as one product. Use the `grok` provider when `grok` is installed and signed in (`grok models` lists models), and `cursor` when `cursor-agent` is. They are separate adapters because the two CLIs differ in flags, output, model IDs, and sign-in. The `grok` adapter calls `grok`, never `agent`, because `agent` can resolve to either CLI depending on `PATH` order. Its tool-free invocation feeds the request through `--prompt-file /dev/stdin`, holds `--permission-mode plan` under the built-in `--sandbox strict` profile, and allows only the `read_file`, `list_dir`, and `grep` tools. It removes Grok's MCP gateway (`search_tool`, `use_tool`), web search, and subagents. Its environment turns off Grok's scanning of Claude and Cursor MCP servers, hooks, agents, rules, and skills; Grok plugins the user has enabled still load. Its tools mode, used only by `probe` and `execute`, runs in the clone (`--cwd {clone}`) under `--sandbox workspace` with `--always-approve`. Grok treats an unknown `--sandbox` name as a warning and runs unsandboxed, so the adapter names only built-in profiles. On macOS these profiles do not block child-process network access.
+
 The bundled Cursor adapter targets locally verified `cursor-agent` version `2026.10.01-e373342`. Its tool-free invocation uses stdin, ask mode, Cursor's enabled sandbox, and stream JSON. Cursor runs against a stable Relay-owned workspace at `$AGENT_RELAY_PROVIDER_WORKSPACES_DIR/cursor`, `$XDG_STATE_HOME/agent-relay/providers/cursor`, or `~/.local/state/agent-relay/providers/cursor`. Before the first run, open `cursor-agent` interactively in that empty directory and approve Cursor's normal workspace-trust prompt. That invocation never passes `--trust`, `--force`, `--yolo`, `--auto-review`, `--approve-mcps`, or the source project workspace. Cursor's tools mode, used only by `probe` and `execute`, passes `--trust` for a fresh Relay clone and never `--force` or `--yolo`. The provider still inherits host permissions, so this is not an OS security boundary.
 
 Timeouts stop the worker process group. The runner checks combined stdout/stderr size against a 4 MB threshold every 50 ms; this is a stop threshold, not a filesystem quota. It refuses to parse oversized logs. No automatic retries, provider fallback, or shared conversation reuse occur.
 
-The design is informed by [Spotify's Shunt work](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt), but this plugin contains its own implementation and no copied source. OpenCode and Antigravity passed a live synthetic file-reading check on September 13, 2026. Cursor passed its help probe, model listing, and a live synthetic file-reading check through Agent Relay on September 15, 2026. On October 6, 2026, all three providers also passed live tool-mode checks on a synthetic fixture: a `probe` returned `ok` with only an untracked file and a passing Relay check, and an `execute --owns app.py` returned `ok` with a diff only in `app.py`. Cursor `--effort xhigh` (`grok-4.7-xhigh`, 600-second timeout) and `--model composer-2.5` passed read checks. Do not infer support for other coding-agent CLIs without the same checks.
+The design is informed by [Spotify's Shunt work](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt), but this plugin contains its own implementation and no copied source. OpenCode and Antigravity passed a live synthetic file-reading check on September 13, 2026. Cursor passed its help probe, model listing, and a live synthetic file-reading check through Agent Relay on September 15, 2026. On October 6, 2026, all three providers also passed live tool-mode checks on a synthetic fixture: a `probe` returned `ok` with only an untracked file and a passing Relay check, and an `execute --owns app.py` returned `ok` with a diff only in `app.py`. Cursor `--effort xhigh` (`grok-4.7-xhigh`, 600-second timeout) and `--model composer-2.5` passed read checks. On November 16, 2026, the `grok` adapter passed with Grok Build 1.0.77: help probe, model listing, a synthetic read returning `7319` on the default model and on every mapped model and level (`grok-4.7`, `grok-4.7-build-fast`, and `grok-4.6` at `low` through `xhigh`, each in 3 to 6 seconds), `--model grok-4.5` without `--effort`, a `probe` that left only an untracked file with a passing Relay check, a probe asked to edit a tracked file (refused, no changes), and an `execute --owns app.py` with a diff only in `app.py`. Its `workspace` sandbox refused a write to the home directory (`PermissionError: Operation not permitted`). Do not infer support for other coding-agent CLIs without the same checks.
 
 ## Verification
 

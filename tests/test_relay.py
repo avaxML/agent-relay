@@ -611,6 +611,8 @@ class AdapterToolsTests(unittest.TestCase):
             {"models": ["auto"], "levels": {"low": {"args": ["--permission-mode={model}"]}}},
             {"models": ["m", "bypassPermissions"], "levels": {"low": {"args": ["--permission-mode", "{model}"]}}},
             {"models": ["--force"], "levels": {"high": {"args": ["{model}"]}}},
+            {"models": ["m"], "levels": {"high": {"model": "--always-approve"}}},
+            {"models": ["--yolo"], "levels": {"high": {"model": "{model}", "args": ["--x"]}}},
         ]
         for effort in cases:
             with self.subTest(effort=effort), self.assertRaisesRegex(RelayError, "auto-approval flag"):

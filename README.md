@@ -94,7 +94,7 @@ Relay bounds provider logs rather than stopping verbose providers. Oversized eve
 A tracked change in a probe, a change outside `--owns`, or any `.git` change is a violation. Empty provider output is an error. Apply an `execute` result yourself with `git apply --check` and `git apply` after reading the diff.
 
 To spread several tasks across providers as subagents, use the `executor` skill:
-- `relay.py dispatch --manifest FILE --root REPO --providers antigravity opencode grok` assigns tasks equally and submits them as background jobs.
+- `relay.py dispatch --manifest FILE --root REPO --providers antigravity opencode cursor` assigns tasks equally and submits them as background jobs.
 - `relay.py collect --dispatch LEDGER` waits with a bound and aggregates the results.
 - `relay.py cleanup --dispatch LEDGER` removes kept clones.
 

@@ -79,6 +79,7 @@ class AdapterRegistryTests(unittest.TestCase):
                 ("antigravity", "bundled"),
                 ("cursor", "bundled"),
                 ("custom", "registered"),
+                ("grok", "bundled"),
                 ("opencode", "bundled"),
             ],
         )

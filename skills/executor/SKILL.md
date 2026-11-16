@@ -48,7 +48,7 @@ Assignment is equal. Each task without an explicit `provider` goes to the eligib
 
 `dispatch` also accepts `--max-log-bytes` and `--max-event-bytes`. Verbose provider output is truncated and counted rather than stopped, so these flags are rarely needed.
 
-Slow levels (Cursor `xhigh`, OpenCode `max`) can run for several minutes; do not escalate to them unless the user asks. Pass `--effort` or `--model` per task in the manifest when needed.
+Slow levels (Antigravity Hydrogen `xhigh`, Cursor `xhigh`, OpenCode `max`) can run for several minutes; do not escalate to them unless the user asks. Pass `--effort` or `--model` per task in the manifest when needed.
 
 ## 4. Collect
 

@@ -12,7 +12,7 @@ The bundled adapters are:
 | Provider | Default model | Good first use |
 | --- | --- | --- |
 | `opencode` | `opencode-go/deepseek-v4.1-flash` | code and log triage |
-| `antigravity` | `gemini-3.8-flash-low` | broad extraction and corpus reading |
+| `antigravity` | `gemini-4-hydrogen-low` | broad extraction and corpus reading |
 | `cursor` | `grok-4.7-high` | independent review through Cursor Agent |
 
 Use the bundled skills for common workflows: `delegate`, `executor`, `background-tasks`, `bulk-read`, `second-opinion`, `chaos-monkey`, `propose-patch`, `relay-doctor`, and `add-cli-adapter`.
@@ -123,10 +123,12 @@ The orchestrator can choose `--effort low`, `medium`, or `high` for each task. O
 | Adapter and supported models | Levels | CLI mapping |
 | --- | --- | --- |
 | OpenCode, `opencode-go/deepseek-v4.1-flash` | `low`, `medium`, `high`, `max` | Appends `#LEVEL` to the model ID; `max` defaults to a 600-second timeout |
+| Antigravity, Gemini 4 Hydrogen low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects `gemini-4-hydrogen-LEVEL` and passes `--effort LEVEL`; `xhigh` defaults to a 600-second timeout, also for a bare `--model gemini-4-hydrogen-xhigh` |
+| Antigravity, Gemini 4 Argon low/medium/high IDs | `low`, `medium`, `high` | Selects `gemini-4-argon-LEVEL` and passes `--effort LEVEL` |
 | Antigravity, Gemini 3.8 Flash low/medium/high IDs | `low`, `medium`, `high` | Selects the matching `gemini-3.8-flash-LEVEL` and passes `--effort LEVEL` |
 | Cursor, Grok 4.7 low/medium/high/xhigh IDs | `low`, `medium`, `high`, `xhigh` | Selects the matching `grok-4.7-LEVEL`; no additional effort argument; `xhigh` defaults to a 600-second timeout, also for `--model grok-4.7-xhigh` without `--effort` |
 
-Explicit effort overrides the Antigravity or Cursor variant within the same model family. Cursor's `composer-2.5` is reachable with `--model composer-2.5` and no `--effort`; it has no effort mapping because every level selects a fixed Grok ID. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. Cursor `xhigh` and OpenCode `max` can take several minutes, so their levels declare a 600-second default timeout; an explicit `--timeout` still wins. Prefer `submit` for these levels so a long worker does not hold the orchestrator's turn. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
+Explicit effort overrides the Antigravity or Cursor variant within the same model family. Cursor's `composer-2.5` is reachable with `--model composer-2.5` and no `--effort`; it has no effort mapping because every level selects a fixed Grok ID. Combining an OpenCode model ID that already contains `#variant` with `--effort` is rejected; select the base model and effort separately. Unknown models or levels fail before invocation. Antigravity Hydrogen `xhigh`, Cursor `xhigh`, and OpenCode `max` can take several minutes, so their levels declare a 600-second default timeout; an explicit `--timeout` still wins. Prefer `submit` for these levels so a long worker does not hold the orchestrator's turn. `doctor` reports the available mappings. `result.json` records `requested_model`, `model` as sent to the CLI, and `effort`; these describe invocation settings, not independently measured provider reasoning.
 
 OpenCode's variant mechanism and provider-specific effort behavior are documented in [its model guide](https://opencode.ai/docs/models/) and [provider transforms](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts). The local Antigravity CLI help documents its effort flag.
 

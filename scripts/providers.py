@@ -348,7 +348,30 @@ def remove_adapter(name: str, registry_dir: Path | None = None) -> dict[str, str
     return {"status": "removed", "provider": name, "path": str(destination)}
 
 
+def _effort_families(config: Any) -> list[dict[str, Any]]:
+    return config if isinstance(config, list) else [config]
+
+
 def validate_effort(config: Any) -> None:
+    families = _effort_families(config)
+    if not families:
+        raise RelayError("effort must contain models and levels.")
+    seen_ids: set[str] = set()
+    for family in families:
+        _validate_effort_family(family)
+        family_ids = set(family["models"])
+        family_ids.update(
+            settings.get("model", "{model}").format(model=base)
+            for settings in family["levels"].values()
+            for base in family["models"]
+        )
+        for model in family_ids:
+            if model in seen_ids:
+                raise RelayError(f"effort model ID appears in multiple families: {model}")
+        seen_ids.update(family_ids)
+
+
+def _validate_effort_family(config: Any) -> None:
     if not isinstance(config, dict) or set(config) != {"models", "levels"}:
         raise RelayError("effort must contain models and levels.")
     if (
@@ -387,8 +410,11 @@ def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> t
     """Map a requested level explicitly; omission preserves the original invocation."""
     if effort is None:
         return model, []
-    config = adapter.get("effort")
-    if not config or model not in config["models"]:
+    config = next(
+        (family for family in _effort_families(adapter.get("effort", [])) if model in family["models"]),
+        None,
+    )
+    if config is None:
         raise RelayError(
             f"No effort mapping for {adapter['name']} model {model}; omit --effort or add a verified mapping."
         )
@@ -407,15 +433,21 @@ def resolve_timeout(adapter: dict[str, Any], effort: str | None, model: str, tim
     """
     if timeout is not None:
         return timeout
-    config = adapter.get("effort")
-    if not config:
-        return DEFAULT_TIMEOUT
+    families = _effort_families(adapter.get("effort", []))
     if effort is not None:
-        return int(config["levels"][effort].get("timeout", DEFAULT_TIMEOUT))
-    for settings in config["levels"].values():
-        variant = settings.get("model", "{model}")
-        if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
-            return int(settings.get("timeout", DEFAULT_TIMEOUT))
+        for config in families:
+            settings = config["levels"].get(effort, {})
+            if model in config["models"] or (
+                settings
+                and any(settings.get("model", "{model}").format(model=base) == model for base in config["models"])
+            ):
+                return int(settings.get("timeout", DEFAULT_TIMEOUT))
+        return DEFAULT_TIMEOUT
+    for config in families:
+        for settings in config["levels"].values():
+            variant = settings.get("model", "{model}")
+            if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
+                return int(settings.get("timeout", DEFAULT_TIMEOUT))
     return DEFAULT_TIMEOUT
 
 

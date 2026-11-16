@@ -595,6 +595,30 @@ class AdapterToolsTests(unittest.TestCase):
             with self.subTest(values=values):
                 validate_adapter(self.adapter(args=values), "fake")
 
+    def test_grok_tool_free_mode_offers_no_file_shell_or_mcp_tool(self) -> None:
+        args, _env = resolve_invocation(load_adapter("grok"), False)
+        # An empty or unknown --tools value makes Grok offer every tool, so the allowlist must name a real one.
+        self.assertEqual(args[args.index("--tools") + 1], "todo_write")
+        self.assertEqual(args[args.index("--disallowed-tools") + 1], "search_tool,use_tool")
+        self.assertEqual(args[args.index("--permission-mode") + 1], "plan")
+        self.assertEqual(args[args.index("--sandbox") + 1], "strict")
+        tools_args, _tools_env = resolve_invocation(load_adapter("grok"), True)
+        self.assertNotIn("--tools", tools_args)
+        self.assertEqual(tools_args[tools_args.index("--disallowed-tools") + 1], "search_tool,use_tool")
+
+    def test_effort_args_are_checked_after_model_substitution(self) -> None:
+        cases = [
+            {"models": ["auto"], "levels": {"low": {"args": ["--permission-mode={model}"]}}},
+            {"models": ["m", "bypassPermissions"], "levels": {"low": {"args": ["--permission-mode", "{model}"]}}},
+            {"models": ["--force"], "levels": {"high": {"args": ["{model}"]}}},
+        ]
+        for effort in cases:
+            with self.subTest(effort=effort), self.assertRaisesRegex(RelayError, "auto-approval flag"):
+                validate_adapter(self.adapter(effort=effort), "fake")
+        validate_adapter(
+            self.adapter(effort={"models": ["m"], "levels": {"low": {"args": ["--reasoning", "{model}-low"]}}}), "fake"
+        )
+
     def test_always_approve_is_an_auto_approval_flag(self) -> None:
         self.assertIn("--always-approve", BLANKET_FLAGS)
 

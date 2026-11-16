@@ -12,7 +12,7 @@
     "--sandbox",
     "strict",
     "--tools",
-    "read_file,list_dir,grep",
+    "todo_write",
     "--disallowed-tools",
     "search_tool,use_tool",
     "--disable-web-search",
@@ -88,19 +88,22 @@
         "args": [
           "--reasoning-effort",
           "medium"
-        ]
+        ],
+        "timeout": 900
       },
       "high": {
         "args": [
           "--reasoning-effort",
           "high"
-        ]
+        ],
+        "timeout": 1200
       },
       "xhigh": {
         "args": [
           "--reasoning-effort",
           "xhigh"
-        ]
+        ],
+        "timeout": 1500
       }
     }
   }

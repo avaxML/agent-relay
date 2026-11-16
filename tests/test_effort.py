@@ -100,6 +100,12 @@ class EffortTests(unittest.TestCase):
             resolve_effort(adapter, "grok-4.5", "low")
         self.assertEqual(resolve_effort(adapter, "grok-4.5", None), ("grok-4.5", []))
         self.assertEqual(resolve_effort(adapter, "grok-4.7", None), ("grok-4.7", []))
+        # Measured on a 172 KB review: medium 580 s, high 838 s, xhigh 987 s.
+        for level, seconds in (("low", DEFAULT_TIMEOUT), ("medium", 900), ("high", 1200), ("xhigh", 1500)):
+            with self.subTest(level=level):
+                self.assertEqual(resolve_timeout(adapter, level, "grok-4.7", None), seconds)
+        self.assertEqual(resolve_timeout(adapter, None, "grok-4.7", None), DEFAULT_TIMEOUT)
+        self.assertEqual(resolve_timeout(adapter, "xhigh", "grok-4.7", 60), 60)
 
     def test_opencode_selects_variant(self) -> None:
         adapter = load_adapter("opencode")

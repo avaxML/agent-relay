@@ -417,6 +417,9 @@ def _validate_effort_family(config: Any) -> None:
             for _, key, spec, conversion in Formatter().parse(argument):
                 if key is not None and (key != "model" or spec or conversion):
                     raise RelayError("Effort settings support only the {model} placeholder.")
+        # A placeholder can turn into an auto-approval flag or value once a listed model fills it.
+        for base in config["models"]:
+            _reject_blanket_flags([arg.format(model=base) for arg in args], f"effort.levels.{level}.args")
 
 
 def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> tuple[str, list[str]]:

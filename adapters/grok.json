@@ -1,0 +1,110 @@
+{
+  "name": "grok",
+  "executable": "grok",
+  "default_model": "grok-4.7",
+  "args": [
+    "--prompt-file",
+    "/dev/stdin",
+    "--model",
+    "{model}",
+    "--permission-mode",
+    "plan",
+    "--sandbox",
+    "strict",
+    "--tools",
+    "todo_write",
+    "--disallowed-tools",
+    "search_tool,use_tool",
+    "--disable-web-search",
+    "--no-subagents",
+    "--output-format",
+    "streaming-json"
+  ],
+  "input": "stdin",
+  "output": "grok-jsonl",
+  "env": {
+    "GROK_CLAUDE_MCPS_ENABLED": "false",
+    "GROK_CLAUDE_HOOKS_ENABLED": "false",
+    "GROK_CLAUDE_AGENTS_ENABLED": "false",
+    "GROK_CLAUDE_RULES_ENABLED": "false",
+    "GROK_CLAUDE_SKILLS_ENABLED": "false",
+    "GROK_CURSOR_MCPS_ENABLED": "false",
+    "GROK_CURSOR_HOOKS_ENABLED": "false",
+    "GROK_CURSOR_AGENTS_ENABLED": "false",
+    "GROK_CURSOR_RULES_ENABLED": "false",
+    "GROK_CURSOR_SKILLS_ENABLED": "false"
+  },
+  "models_args": [
+    "models"
+  ],
+  "probe_args": [
+    "--help"
+  ],
+  "tools": {
+    "args": [
+      "--prompt-file",
+      "/dev/stdin",
+      "--model",
+      "{model}",
+      "--cwd",
+      "{clone}",
+      "--sandbox",
+      "workspace",
+      "--always-approve",
+      "--disallowed-tools",
+      "search_tool,use_tool",
+      "--disable-web-search",
+      "--no-subagents",
+      "--output-format",
+      "streaming-json"
+    ],
+    "env": {
+      "GROK_CLAUDE_MCPS_ENABLED": "false",
+      "GROK_CLAUDE_HOOKS_ENABLED": "false",
+      "GROK_CLAUDE_AGENTS_ENABLED": "false",
+      "GROK_CLAUDE_RULES_ENABLED": "false",
+      "GROK_CLAUDE_SKILLS_ENABLED": "false",
+      "GROK_CURSOR_MCPS_ENABLED": "false",
+      "GROK_CURSOR_HOOKS_ENABLED": "false",
+      "GROK_CURSOR_AGENTS_ENABLED": "false",
+      "GROK_CURSOR_RULES_ENABLED": "false",
+      "GROK_CURSOR_SKILLS_ENABLED": "false"
+    }
+  },
+  "effort": {
+    "models": [
+      "grok-4.7",
+      "grok-4.7-build-fast",
+      "grok-4.6"
+    ],
+    "levels": {
+      "low": {
+        "args": [
+          "--reasoning-effort",
+          "low"
+        ]
+      },
+      "medium": {
+        "args": [
+          "--reasoning-effort",
+          "medium"
+        ],
+        "timeout": 900
+      },
+      "high": {
+        "args": [
+          "--reasoning-effort",
+          "high"
+        ],
+        "timeout": 1200
+      },
+      "xhigh": {
+        "args": [
+          "--reasoning-effort",
+          "xhigh"
+        ],
+        "timeout": 1500
+      }
+    }
+  }
+}

@@ -573,7 +573,7 @@ class DoctorToolsTests(unittest.TestCase):
     def test_doctor_reports_whether_each_bundled_adapter_has_a_tools_mode(self) -> None:
         from relay import inspect_provider
 
-        for name in ("antigravity", "cursor", "opencode"):
+        for name in ("antigravity", "cursor", "grok", "opencode"):
             with self.subTest(provider=name):
                 self.assertIs(inspect_provider(name, None, None, False)["tools"], True)
 

@@ -268,6 +268,8 @@ def task_arguments(task: Mapping[str, Any], ledger: Mapping[str, Any]) -> argpar
         checks=task["checks"],
         setup=task["setup"],
         check_timeout=settings.get("check_timeout", 180),
+        max_log_bytes=settings.get("max_log_bytes"),
+        max_event_bytes=settings.get("max_event_bytes"),
     )
 
 
@@ -357,6 +359,7 @@ def _summary(task: Mapping[str, Any], status: Lookup, result: Lookup) -> dict[st
         "job_id": task["job_id"],
         "job_status": job_status,
         "status": outcome.get("status"),
+        "stop_reason": outcome.get("stop_reason"),
         "violations": outcome.get("violations"),
         "checks": outcome.get("checks"),
         "diff_path": outcome.get("diff_path"),

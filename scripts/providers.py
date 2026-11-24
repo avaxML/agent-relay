@@ -8,8 +8,8 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from string import Formatter
 from typing import Any
@@ -18,8 +18,23 @@ DEFAULT_TIMEOUT = 180
 PLACEHOLDERS = frozenset({"model", "request_file", "timeout", "workdir", "provider_workspace"})
 TOOLS_PLACEHOLDERS = PLACEHOLDERS | {"clone"}
 BLANKET_FLAGS = frozenset(
-    {"--force", "--yolo", "--trust", "--auto", "--auto-review", "--dangerously-skip-permissions", "--approve-mcps"}
+    {
+        "--force",
+        "--yolo",
+        "--trust",
+        "--auto",
+        "--auto-review",
+        "--dangerously-skip-permissions",
+        "--approve-mcps",
+        "--always-approve",
+    }
 )
+# Flag values that approve tool calls without asking: Grok's bypassPermissions approves all, auto lets a classifier decide.
+BLANKET_VALUES = {"--permission-mode": frozenset({"bypassPermissions", "auto"})}
+LIMIT_FIELDS = frozenset({"max_log_bytes", "max_event_bytes"})
+# Sixteen times the default probe/execute budget, and the most an adapter, flag or default may set; the decoders
+# read a whole log at once, so this also bounds their memory.
+MAX_LOG_BYTES = 256 << 20
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -27,8 +42,19 @@ class RelayError(Exception):
     """A delegation cannot produce a usable result."""
 
 
-class RelayCancelled(RelayError):
+class RelayStopped(RelayError):
+    """Relay stopped a running provider; the worker's partial work may still be salvaged."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class RelayCancelled(RelayStopped):
     """The owner requested that the worker stop."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, "cancelled")
 
 
 def bundled_adapter_directory() -> Path:
@@ -69,8 +95,9 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         "models_args",
         "probe_args",
     }
-    if not isinstance(adapter, dict) or not required <= set(adapter) or set(adapter) - required - {"effort", "tools"}:
-        raise RelayError(f"Adapter requires {', '.join(sorted(required))}; only effort and tools are optional.")
+    optional = {"effort", "tools", "limits"}
+    if not isinstance(adapter, dict) or not required <= set(adapter) or set(adapter) - required - optional:
+        raise RelayError(f"Adapter requires {', '.join(sorted(required))}; only effort, tools and limits are optional.")
     if adapter["name"] != name:
         raise RelayError("Adapter name does not match --provider.")
     for field in ("name", "executable", "default_model"):
@@ -78,7 +105,7 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
             raise RelayError(f"Adapter {field} must be a nonempty string.")
     if adapter["input"] not in ("file", "stdin", "agy-stream"):
         raise RelayError("Unknown adapter input format.")
-    if adapter["output"] not in ("opencode-jsonl", "agy-jsonl", "cursor-jsonl", "text"):
+    if adapter["output"] not in ("opencode-jsonl", "agy-jsonl", "cursor-jsonl", "grok-jsonl", "text"):
         raise RelayError("Unknown adapter output format.")
     for field in ("args", "models_args", "probe_args"):
         value = adapter[field]
@@ -96,7 +123,27 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
         validate_effort(adapter["effort"])
     if "tools" in adapter:
         validate_tools(adapter["tools"], adapter["input"])
+    if "limits" in adapter:
+        validate_limits(adapter["limits"])
     return adapter
+
+
+def validate_limits(config: Any) -> None:
+    if not isinstance(config, dict) or set(config) - LIMIT_FIELDS:
+        raise RelayError("Adapter limits may set only max_log_bytes and max_event_bytes.")
+    for field, value in config.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise RelayError(f"Adapter limits.{field} must be a positive integer number of bytes.")
+    if config.get("max_log_bytes", 0) > MAX_LOG_BYTES or config.get("max_event_bytes", 0) > MAX_LOG_BYTES // 4:
+        raise RelayError(
+            f"Adapter limits must keep max_log_bytes at most {MAX_LOG_BYTES} (256 MiB) and max_event_bytes at most a quarter of that."
+        )
+    if config.get("max_log_bytes", 4096) < 4096:
+        raise RelayError("Adapter limits.max_log_bytes must be at least 4096 bytes (four 1024-byte events).")
+    if config.get("max_event_bytes", 1024) < 1024:
+        raise RelayError("Adapter limits.max_event_bytes must be at least 1024 bytes.")
+    if set(config) >= LIMIT_FIELDS and config["max_event_bytes"] * 4 > config["max_log_bytes"]:
+        raise RelayError("Adapter limits.max_event_bytes must be at most a quarter of limits.max_log_bytes.")
 
 
 def _check_placeholders(values: list[str], allowed: frozenset[str]) -> None:
@@ -107,11 +154,13 @@ def _check_placeholders(values: list[str], allowed: frozenset[str]) -> None:
 
 
 def _reject_blanket_flags(values: list[str], field: str) -> None:
-    for arg in values:
-        name = arg.split("=", 1)[0]
-        if name in BLANKET_FLAGS:
+    for index, arg in enumerate(values):
+        name, equals, inline = arg.partition("=")
+        value = inline if equals else (values[index + 1] if index + 1 < len(values) else None)
+        if name in BLANKET_FLAGS or value in BLANKET_VALUES.get(name, ()):
+            shown = name if name in BLANKET_FLAGS else f"{name} {value}"
             raise RelayError(
-                f"Adapter {field} must not contain auto-approval flag {name}; declare it only in tools.args."
+                f"Adapter {field} must not contain auto-approval flag {shown}; declare it only in tools.args."
             )
 
 
@@ -312,7 +361,30 @@ def remove_adapter(name: str, registry_dir: Path | None = None) -> dict[str, str
     return {"status": "removed", "provider": name, "path": str(destination)}
 
 
+def _effort_families(config: Any) -> list[dict[str, Any]]:
+    return config if isinstance(config, list) else [config]
+
+
 def validate_effort(config: Any) -> None:
+    families = _effort_families(config)
+    if not families:
+        raise RelayError("effort must contain models and levels.")
+    seen_ids: set[str] = set()
+    for family in families:
+        _validate_effort_family(family)
+        family_ids = set(family["models"])
+        family_ids.update(
+            settings.get("model", "{model}").format(model=base)
+            for settings in family["levels"].values()
+            for base in family["models"]
+        )
+        for model in family_ids:
+            if model in seen_ids:
+                raise RelayError(f"effort model ID appears in multiple families: {model}")
+        seen_ids.update(family_ids)
+
+
+def _validate_effort_family(config: Any) -> None:
     if not isinstance(config, dict) or set(config) != {"models", "levels"}:
         raise RelayError("effort must contain models and levels.")
     if (
@@ -345,14 +417,22 @@ def validate_effort(config: Any) -> None:
             for _, key, spec, conversion in Formatter().parse(argument):
                 if key is not None and (key != "model" or spec or conversion):
                     raise RelayError("Effort settings support only the {model} placeholder.")
+        # A placeholder can turn into an auto-approval flag or value once a listed model fills it, and the level's
+        # model reaches the CLI as an argument of its own.
+        for base in config["models"]:
+            _reject_blanket_flags([arg.format(model=base) for arg in args], f"effort.levels.{level}.args")
+            _reject_blanket_flags([model.format(model=base)], f"effort.levels.{level}.model")
 
 
 def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> tuple[str, list[str]]:
     """Map a requested level explicitly; omission preserves the original invocation."""
     if effort is None:
         return model, []
-    config = adapter.get("effort")
-    if not config or model not in config["models"]:
+    config = next(
+        (family for family in _effort_families(adapter.get("effort", [])) if model in family["models"]),
+        None,
+    )
+    if config is None:
         raise RelayError(
             f"No effort mapping for {adapter['name']} model {model}; omit --effort or add a verified mapping."
         )
@@ -371,22 +451,39 @@ def resolve_timeout(adapter: dict[str, Any], effort: str | None, model: str, tim
     """
     if timeout is not None:
         return timeout
-    config = adapter.get("effort")
-    if not config:
-        return DEFAULT_TIMEOUT
+    families = _effort_families(adapter.get("effort", []))
     if effort is not None:
-        return int(config["levels"][effort].get("timeout", DEFAULT_TIMEOUT))
-    for settings in config["levels"].values():
-        variant = settings.get("model", "{model}")
-        if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
-            return int(settings.get("timeout", DEFAULT_TIMEOUT))
+        for config in families:
+            settings = config["levels"].get(effort, {})
+            if model in config["models"] or (
+                settings
+                and any(settings.get("model", "{model}").format(model=base) == model for base in config["models"])
+            ):
+                return int(settings.get("timeout", DEFAULT_TIMEOUT))
+        return DEFAULT_TIMEOUT
+    for config in families:
+        for settings in config["levels"].values():
+            variant = settings.get("model", "{model}")
+            if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
+                return int(settings.get("timeout", DEFAULT_TIMEOUT))
     return DEFAULT_TIMEOUT
 
 
-def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -> RelayError:
+AGY_LISTENER_BLOCKED = "listen tcp 127.0.0.1:0: bind: operation not permitted"
+# Exit diagnostics decode_exit_failure looks for, watched while stderr streams: a bounded stderr.log may drop them.
+EXIT_SIGNATURES = {"antigravity": (AGY_LISTENER_BLOCKED,)}
+
+
+def exit_signatures(adapter: dict[str, Any]) -> tuple[str, ...]:
+    return EXIT_SIGNATURES.get(adapter["name"], ())
+
+
+def decode_exit_failure(
+    adapter: dict[str, Any], code: int, stderr_path: Path, seen: Collection[str] = ()
+) -> RelayError:
     if adapter["name"] == "antigravity" and (
-        "listen tcp 127.0.0.1:0: bind: operation not permitted"
-        in stderr_path.read_text(encoding="utf-8", errors="replace")
+        AGY_LISTENER_BLOCKED in seen
+        or AGY_LISTENER_BLOCKED in stderr_path.read_text(encoding="utf-8", errors="replace")
     ):
         return RelayError(
             "Antigravity could not start: the host sandbox blocked its localhost listener. "
@@ -396,27 +493,64 @@ def decode_exit_failure(adapter: dict[str, Any], code: int, stderr_path: Path) -
     return RelayError(f"Worker exited with code {code}; inspect stdout.log and stderr.log.")
 
 
+def _lines(raw: str) -> Iterator[str]:
+    """LF-separated lines, as the bounded writer frames events, without materialising a list of all of them."""
+    start = 0
+    while start <= len(raw):
+        end = raw.find("\n", start)
+        if end < 0:
+            end = len(raw)
+        yield raw[start:end]
+        start = end + 1
+
+
 def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
     if output == "text":
         if not raw.strip():
             raise RelayError("Worker returned no text.")
         return raw.strip(), {}
-    events = []
-    for line in raw.splitlines():
+    # One pass that keeps only what the decision needs, so millions of small events cannot exhaust memory.
+    # Only the first terminal result and a count: more than one is already a failure.
+    first_result: Any = None
+    result_count = 0
+    parts: list[Any] = []
+    session_ids: set[str] = set()
+    failed = False
+    for line in _lines(raw):
         if not line.strip():
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
             raise RelayError("Worker returned malformed JSON output; inspect stdout.log.") from exc
         if not isinstance(event, dict):
             raise RelayError("Worker event must be an object.")
-        events.append(event)
+        if output == "agy-jsonl":
+            if event.get("event") == "result":
+                result_count += 1
+                first_result = event.get("result") if result_count == 1 else first_result
+        elif output == "cursor-jsonl":
+            if event.get("type") == "result":
+                result_count += 1
+                first_result = event if result_count == 1 else first_result
+        elif output == "grok-jsonl":
+            kind = event.get("type")
+            failed = failed or kind == "error"
+            if kind == "text":
+                parts.append(event.get("data"))
+            elif kind == "end":
+                result_count += 1
+                first_result = event if result_count == 1 else first_result
+        else:
+            failed = failed or event.get("type") == "error" or bool(event.get("error"))
+            if event.get("type") == "text" and isinstance(event.get("part"), dict):
+                parts.append(event["part"].get("text"))
+            if isinstance(event.get("sessionID"), str):
+                session_ids.add(event["sessionID"])
     if output == "agy-jsonl":
-        results = [e.get("result") for e in events if e.get("event") == "result"]
-        if len(results) != 1 or not isinstance(results[0], dict):
+        if result_count != 1 or not isinstance(first_result, dict):
             raise RelayError("Antigravity did not return exactly one terminal result.")
-        agy_result = results[0]
+        agy_result = first_result
         if agy_result.get("status") != "SUCCESS":
             raise RelayError("Antigravity reported failure; inspect stdout.log.")
         answer = agy_result.get("response")
@@ -424,10 +558,9 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             key: agy_result[key] for key in ("conversation_id", "usage", "duration_seconds") if key in agy_result
         }
     elif output == "cursor-jsonl":
-        cursor_results = [event for event in events if event.get("type") == "result"]
-        if len(cursor_results) != 1:
+        if result_count != 1:
             raise RelayError("Cursor did not return exactly one terminal result.")
-        cursor_result = cursor_results[0]
+        cursor_result = first_result
         if cursor_result.get("is_error") or cursor_result.get("subtype") != "success":
             raise RelayError("Cursor reported failure; inspect stdout.log.")
         answer = cursor_result.get("result")
@@ -436,16 +569,126 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             for key in ("session_id", "request_id", "usage", "duration_ms")
             if key in cursor_result
         }
+    elif output == "grok-jsonl":
+        if failed:
+            raise RelayError("Grok reported an error; inspect stdout.log.")
+        if result_count != 1:
+            raise RelayError("Grok did not return exactly one end event.")
+        if first_result.get("stopReason") != "end_turn":
+            raise RelayError("Grok stopped before finishing its turn; inspect stdout.log.")
+        if not all(isinstance(p, str) for p in parts):
+            raise RelayError("Grok returned an invalid text event.")
+        # Text events are streamed deltas; Grok's own json output joins them without separators.
+        answer = "".join(parts)
+        metadata = {
+            key: first_result[key]
+            for key in ("sessionId", "requestId", "usage", "num_turns", "total_cost_usd")
+            if key in first_result
+        }
     else:
-        if any(e.get("type") == "error" or e.get("error") for e in events):
+        if failed:
             raise RelayError("OpenCode reported failure; inspect stdout.log.")
-        parts = [
-            e.get("part", {}).get("text") for e in events if e.get("type") == "text" and isinstance(e.get("part"), dict)
-        ]
         if not all(isinstance(p, str) for p in parts):
             raise RelayError("OpenCode returned an invalid text event.")
         answer = "\n".join(parts)
-        metadata = {"session_ids": sorted({e["sessionID"] for e in events if isinstance(e.get("sessionID"), str)})}
+        metadata = {"session_ids": sorted(session_ids)}
     if not isinstance(answer, str) or not answer.strip():
         raise RelayError("Worker returned no answer.")
     return answer.strip(), metadata
+
+
+# Protection levels for bounded provider logs. Ordinary events are clipped past max_event_bytes and stop at three
+# quarters of the cap. Partial-answer events may use half the reserve and terminal events (the final answer or a
+# failure) the whole cap; neither is clipped for size, only to fit the space left, and a clipped or dropped terminal
+# event fails the run.
+ORDINARY, PARTIAL, TERMINAL = 0, 1, 2
+
+
+# Comparisons, not hashing: a hostile event may carry a list or object where a type string belongs.
+def _cursor_level(event: dict[str, Any]) -> int:
+    kind = event.get("type")
+    return TERMINAL if kind == "result" else PARTIAL if kind == "assistant" else ORDINARY
+
+
+def _agy_level(event: dict[str, Any]) -> int:
+    return TERMINAL if event.get("event") == "result" else ORDINARY
+
+
+def _opencode_level(event: dict[str, Any]) -> int:
+    # Exactly the decoder's failure test: a truthy error, not merely an error key.
+    return TERMINAL if event.get("type") in ("text", "error") or event.get("error") else ORDINARY
+
+
+def _grok_level(event: dict[str, Any]) -> int:
+    return TERMINAL if event.get("type") in ("text", "end", "error") else ORDINARY
+
+
+EVENT_LEVELS: dict[str, Callable[[dict[str, Any]], int]] = {
+    "cursor-jsonl": _cursor_level,
+    "agy-jsonl": _agy_level,
+    "opencode-jsonl": _opencode_level,
+    "grok-jsonl": _grok_level,
+}
+# How a partial answer joins its pieces: Grok streams token deltas, the others whole messages.
+ANSWER_SEPARATORS = {"grok-jsonl": ""}
+
+
+def event_classifier(output: str) -> Callable[[dict[str, Any]], int] | None:
+    """Return how decode_response depends on each event of a JSONL output, or None for unstructured text."""
+    return EVENT_LEVELS.get(output)
+
+
+def _assistant_texts(event: dict[str, Any]) -> list[Any]:
+    message = event.get("message")
+    if (
+        event.get("type") != "assistant"
+        or not isinstance(message, dict)
+        or not isinstance(message.get("content"), list)
+    ):
+        return []
+    return [item.get("text") for item in message["content"] if isinstance(item, dict)]
+
+
+def _answer_texts(event: dict[str, Any], output: str) -> list[Any]:
+    """The answer text one event carries, if any."""
+    if output == "cursor-jsonl":
+        if event.get("type") == "assistant":
+            return _assistant_texts(event)
+        # A failed, malformed or clipped result still carries the provider's last words.
+        return [event.get("result")] if event.get("type") == "result" else []
+    if output == "agy-jsonl":
+        result = event.get("result")
+        return [result.get("response")] if event.get("event") == "result" and isinstance(result, dict) else []
+    if output == "grok-jsonl":
+        return [event.get("data")] if event.get("type") == "text" else []
+    part = event.get("part")
+    return [part.get("text")] if event.get("type") == "text" and isinstance(part, dict) else []
+
+
+def decode_partial(raw: str, output: str) -> str | None:
+    """Best-effort answer from a stopped worker's log; malformed or missing events are skipped.
+
+    One pass that keeps only answer strings, never event objects, so memory stays near the size of the text.
+    """
+    if output == "text":
+        return raw.strip() or None
+    level = EVENT_LEVELS[output]
+    parts: list[str] = []
+    clipped = False
+    for line in _lines(raw):
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        parts += [text for text in _answer_texts(event, output) if isinstance(text, str)]
+        # A terminal event Relay clipped to fit would decode as if it were whole. Then keep every answer text,
+        # assistant and result alike: the clip may have shortened only other fields.
+        clipped = clipped or (level(event) == TERMINAL and "relay_truncated_bytes" in event)
+    if not clipped:
+        # ValueError and RecursionError: one hostile event (huge integer, deep nesting) must not cost the rest.
+        with suppress(RelayError, ValueError, RecursionError):
+            return decode_response(raw, output)[0]
+    answer = ANSWER_SEPARATORS.get(output, "\n").join(parts).strip()
+    return answer or None

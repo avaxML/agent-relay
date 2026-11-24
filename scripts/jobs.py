@@ -26,6 +26,7 @@ OUTCOMES = {
     "ok": "completed",
     "error": "failed",
     "cancelled": "cancelled",
+    "stopped": "failed",
     "violation": "failed",
     "check_failed": "failed",
 }

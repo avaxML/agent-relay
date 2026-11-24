@@ -199,6 +199,66 @@ class ProviderTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(RelayError):
                 decode_response(raw, "cursor-jsonl")
 
+    def test_decodes_grok_text_deltas_and_end_metadata(self) -> None:
+        raw = "\n".join(
+            json.dumps(event)
+            for event in [
+                {"type": "available_commands", "tools": ["read_file"]},
+                {"type": "thought", "data": "Reading the bundle."},
+                {"type": "text", "data": "Looking"},
+                {"type": "text", "data": " now."},
+                {"type": "usage", "stopReason": "tool_use", "usage": {"input_tokens": 3}},
+                {"type": "tool_call", "toolCallId": "c1", "status": "pending", "rawInput": {"target_file": "a.py"}},
+                {"type": "tool_call_update", "toolCallId": "c1", "status": "completed", "content": []},
+                {"type": "text", "data": "731"},
+                {"type": "text", "data": "9 at a.py:1"},
+                {"type": "max_turns_reached"},
+                {
+                    "type": "end",
+                    "stopReason": "end_turn",
+                    "sessionId": "session-1",
+                    "requestId": "request-1",
+                    "cwd": "/tmp/work",
+                    "usage": {"input_tokens": 7},
+                    "num_turns": 2,
+                    "total_cost_usd": 0.07,
+                },
+            ]
+        )
+        answer, metadata = decode_response(raw, "grok-jsonl")
+        self.assertEqual(answer, "Looking now.7319 at a.py:1")
+        self.assertEqual(
+            metadata,
+            {
+                "sessionId": "session-1",
+                "requestId": "request-1",
+                "usage": {"input_tokens": 7},
+                "num_turns": 2,
+                "total_cost_usd": 0.07,
+            },
+        )
+
+    def test_grok_decoder_rejects_missing_duplicate_failed_and_invalid_events(self) -> None:
+        text = json.dumps({"type": "text", "data": "ok"})
+        end = {"type": "end", "stopReason": "end_turn", "sessionId": "s"}
+        cases = {
+            "no end": text,
+            "two ends": "\n".join((text, json.dumps(end), json.dumps(end))),
+            "cancelled": "\n".join((text, json.dumps({**end, "stopReason": "cancelled"}))),
+            "refusal": "\n".join((text, json.dumps({**end, "stopReason": "refusal"}))),
+            "max tokens": "\n".join((text, json.dumps({**end, "stopReason": "max_tokens"}))),
+            "error event": "\n".join(
+                (json.dumps({"type": "error", "message": "Couldn't set model"}), text, json.dumps(end))
+            ),
+            "non-string text": "\n".join((json.dumps({"type": "text", "data": 7}), json.dumps(end))),
+            "no text": json.dumps(end),
+            "blank text": "\n".join((json.dumps({"type": "text", "data": "  "}), json.dumps(end))),
+            "malformed": "\n".join((text, "not json", json.dumps(end))),
+        }
+        for label, raw in cases.items():
+            with self.subTest(case=label), self.assertRaises(RelayError):
+                decode_response(raw, "grok-jsonl")
+
     def test_decoders_reject_failure_empty_and_malformed_output(self) -> None:
         cases = [
             ('{"event":"result","result":{"status":"FAILURE","response":"x"}}', "agy-jsonl"),
@@ -511,6 +571,59 @@ class AdapterToolsTests(unittest.TestCase):
                 with self.subTest(flag=value, field="tools.args"):
                     validate_adapter(self.adapter(tools={"args": [value]}), "fake")
 
+    def test_bypass_permission_mode_is_allowed_only_in_tools_args(self) -> None:
+        for values in (
+            ["--permission-mode", "bypassPermissions"],
+            ["--permission-mode=bypassPermissions"],
+            ["--permission-mode", "auto"],
+        ):
+            placements = {
+                "args": {"args": values},
+                "models_args": {"models_args": values},
+                "probe_args": {"probe_args": values},
+                "effort": {"effort": {"models": ["m"], "levels": {"high": {"args": values}}}},
+            }
+            for field, changes in placements.items():
+                with (
+                    self.subTest(values=values, field=field),
+                    self.assertRaisesRegex(RelayError, "auto-approval flag"),
+                ):
+                    validate_adapter(self.adapter(**changes), "fake")
+            with self.subTest(values=values, field="tools.args"):
+                validate_adapter(self.adapter(tools={"args": values}), "fake")
+        for values in (["--permission-mode", "plan"], ["--permission-mode=acceptEdits"], ["bypassPermissions"]):
+            with self.subTest(values=values):
+                validate_adapter(self.adapter(args=values), "fake")
+
+    def test_grok_tool_free_mode_offers_no_file_shell_or_mcp_tool(self) -> None:
+        args, _env = resolve_invocation(load_adapter("grok"), False)
+        # An empty or unknown --tools value makes Grok offer every tool, so the allowlist must name a real one.
+        self.assertEqual(args[args.index("--tools") + 1], "todo_write")
+        self.assertEqual(args[args.index("--disallowed-tools") + 1], "search_tool,use_tool")
+        self.assertEqual(args[args.index("--permission-mode") + 1], "plan")
+        self.assertEqual(args[args.index("--sandbox") + 1], "strict")
+        tools_args, _tools_env = resolve_invocation(load_adapter("grok"), True)
+        self.assertNotIn("--tools", tools_args)
+        self.assertEqual(tools_args[tools_args.index("--disallowed-tools") + 1], "search_tool,use_tool")
+
+    def test_effort_args_are_checked_after_model_substitution(self) -> None:
+        cases = [
+            {"models": ["auto"], "levels": {"low": {"args": ["--permission-mode={model}"]}}},
+            {"models": ["m", "bypassPermissions"], "levels": {"low": {"args": ["--permission-mode", "{model}"]}}},
+            {"models": ["--force"], "levels": {"high": {"args": ["{model}"]}}},
+            {"models": ["m"], "levels": {"high": {"model": "--always-approve"}}},
+            {"models": ["--yolo"], "levels": {"high": {"model": "{model}", "args": ["--x"]}}},
+        ]
+        for effort in cases:
+            with self.subTest(effort=effort), self.assertRaisesRegex(RelayError, "auto-approval flag"):
+                validate_adapter(self.adapter(effort=effort), "fake")
+        validate_adapter(
+            self.adapter(effort={"models": ["m"], "levels": {"low": {"args": ["--reasoning", "{model}-low"]}}}), "fake"
+        )
+
+    def test_always_approve_is_an_auto_approval_flag(self) -> None:
+        self.assertIn("--always-approve", BLANKET_FLAGS)
+
     def test_resolve_invocation_without_tools_mode_fails(self) -> None:
         adapter = validate_adapter(self.adapter(), "fake")
         with self.assertRaises(RelayError) as raised:
@@ -518,7 +631,7 @@ class AdapterToolsTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "provider fake has no verified tools mode")
 
     def test_bundled_adapters_still_load(self) -> None:
-        for name in ("antigravity", "cursor", "opencode"):
+        for name in ("antigravity", "cursor", "grok", "opencode"):
             with self.subTest(name=name):
                 self.assertEqual(load_adapter(name)["name"], name)
 

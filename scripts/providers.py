@@ -18,8 +18,19 @@ DEFAULT_TIMEOUT = 180
 PLACEHOLDERS = frozenset({"model", "request_file", "timeout", "workdir", "provider_workspace"})
 TOOLS_PLACEHOLDERS = PLACEHOLDERS | {"clone"}
 BLANKET_FLAGS = frozenset(
-    {"--force", "--yolo", "--trust", "--auto", "--auto-review", "--dangerously-skip-permissions", "--approve-mcps"}
+    {
+        "--force",
+        "--yolo",
+        "--trust",
+        "--auto",
+        "--auto-review",
+        "--dangerously-skip-permissions",
+        "--approve-mcps",
+        "--always-approve",
+    }
 )
+# Flag values that approve tool calls without asking: Grok's bypassPermissions approves all, auto lets a classifier decide.
+BLANKET_VALUES = {"--permission-mode": frozenset({"bypassPermissions", "auto"})}
 LIMIT_FIELDS = frozenset({"max_log_bytes", "max_event_bytes"})
 # Sixteen times the default probe/execute budget, and the most an adapter, flag or default may set; the decoders
 # read a whole log at once, so this also bounds their memory.
@@ -94,7 +105,7 @@ def validate_adapter(adapter: Any, name: str) -> dict[str, Any]:
             raise RelayError(f"Adapter {field} must be a nonempty string.")
     if adapter["input"] not in ("file", "stdin", "agy-stream"):
         raise RelayError("Unknown adapter input format.")
-    if adapter["output"] not in ("opencode-jsonl", "agy-jsonl", "cursor-jsonl", "text"):
+    if adapter["output"] not in ("opencode-jsonl", "agy-jsonl", "cursor-jsonl", "grok-jsonl", "text"):
         raise RelayError("Unknown adapter output format.")
     for field in ("args", "models_args", "probe_args"):
         value = adapter[field]
@@ -143,11 +154,13 @@ def _check_placeholders(values: list[str], allowed: frozenset[str]) -> None:
 
 
 def _reject_blanket_flags(values: list[str], field: str) -> None:
-    for arg in values:
-        name = arg.split("=", 1)[0]
-        if name in BLANKET_FLAGS:
+    for index, arg in enumerate(values):
+        name, equals, inline = arg.partition("=")
+        value = inline if equals else (values[index + 1] if index + 1 < len(values) else None)
+        if name in BLANKET_FLAGS or value in BLANKET_VALUES.get(name, ()):
+            shown = name if name in BLANKET_FLAGS else f"{name} {value}"
             raise RelayError(
-                f"Adapter {field} must not contain auto-approval flag {name}; declare it only in tools.args."
+                f"Adapter {field} must not contain auto-approval flag {shown}; declare it only in tools.args."
             )
 
 
@@ -348,7 +361,30 @@ def remove_adapter(name: str, registry_dir: Path | None = None) -> dict[str, str
     return {"status": "removed", "provider": name, "path": str(destination)}
 
 
+def _effort_families(config: Any) -> list[dict[str, Any]]:
+    return config if isinstance(config, list) else [config]
+
+
 def validate_effort(config: Any) -> None:
+    families = _effort_families(config)
+    if not families:
+        raise RelayError("effort must contain models and levels.")
+    seen_ids: set[str] = set()
+    for family in families:
+        _validate_effort_family(family)
+        family_ids = set(family["models"])
+        family_ids.update(
+            settings.get("model", "{model}").format(model=base)
+            for settings in family["levels"].values()
+            for base in family["models"]
+        )
+        for model in family_ids:
+            if model in seen_ids:
+                raise RelayError(f"effort model ID appears in multiple families: {model}")
+        seen_ids.update(family_ids)
+
+
+def _validate_effort_family(config: Any) -> None:
     if not isinstance(config, dict) or set(config) != {"models", "levels"}:
         raise RelayError("effort must contain models and levels.")
     if (
@@ -381,14 +417,22 @@ def validate_effort(config: Any) -> None:
             for _, key, spec, conversion in Formatter().parse(argument):
                 if key is not None and (key != "model" or spec or conversion):
                     raise RelayError("Effort settings support only the {model} placeholder.")
+        # A placeholder can turn into an auto-approval flag or value once a listed model fills it, and the level's
+        # model reaches the CLI as an argument of its own.
+        for base in config["models"]:
+            _reject_blanket_flags([arg.format(model=base) for arg in args], f"effort.levels.{level}.args")
+            _reject_blanket_flags([model.format(model=base)], f"effort.levels.{level}.model")
 
 
 def resolve_effort(adapter: dict[str, Any], model: str, effort: str | None) -> tuple[str, list[str]]:
     """Map a requested level explicitly; omission preserves the original invocation."""
     if effort is None:
         return model, []
-    config = adapter.get("effort")
-    if not config or model not in config["models"]:
+    config = next(
+        (family for family in _effort_families(adapter.get("effort", [])) if model in family["models"]),
+        None,
+    )
+    if config is None:
         raise RelayError(
             f"No effort mapping for {adapter['name']} model {model}; omit --effort or add a verified mapping."
         )
@@ -407,15 +451,21 @@ def resolve_timeout(adapter: dict[str, Any], effort: str | None, model: str, tim
     """
     if timeout is not None:
         return timeout
-    config = adapter.get("effort")
-    if not config:
-        return DEFAULT_TIMEOUT
+    families = _effort_families(adapter.get("effort", []))
     if effort is not None:
-        return int(config["levels"][effort].get("timeout", DEFAULT_TIMEOUT))
-    for settings in config["levels"].values():
-        variant = settings.get("model", "{model}")
-        if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
-            return int(settings.get("timeout", DEFAULT_TIMEOUT))
+        for config in families:
+            settings = config["levels"].get(effort, {})
+            if model in config["models"] or (
+                settings
+                and any(settings.get("model", "{model}").format(model=base) == model for base in config["models"])
+            ):
+                return int(settings.get("timeout", DEFAULT_TIMEOUT))
+        return DEFAULT_TIMEOUT
+    for config in families:
+        for settings in config["levels"].values():
+            variant = settings.get("model", "{model}")
+            if variant != "{model}" and any(variant.format(model=base) == model for base in config["models"]):
+                return int(settings.get("timeout", DEFAULT_TIMEOUT))
     return DEFAULT_TIMEOUT
 
 
@@ -483,6 +533,14 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             if event.get("type") == "result":
                 result_count += 1
                 first_result = event if result_count == 1 else first_result
+        elif output == "grok-jsonl":
+            kind = event.get("type")
+            failed = failed or kind == "error"
+            if kind == "text":
+                parts.append(event.get("data"))
+            elif kind == "end":
+                result_count += 1
+                first_result = event if result_count == 1 else first_result
         else:
             failed = failed or event.get("type") == "error" or bool(event.get("error"))
             if event.get("type") == "text" and isinstance(event.get("part"), dict):
@@ -510,6 +568,22 @@ def decode_response(raw: str, output: str) -> tuple[str, dict[str, Any]]:
             key: cursor_result[key]
             for key in ("session_id", "request_id", "usage", "duration_ms")
             if key in cursor_result
+        }
+    elif output == "grok-jsonl":
+        if failed:
+            raise RelayError("Grok reported an error; inspect stdout.log.")
+        if result_count != 1:
+            raise RelayError("Grok did not return exactly one end event.")
+        if first_result.get("stopReason") != "end_turn":
+            raise RelayError("Grok stopped before finishing its turn; inspect stdout.log.")
+        if not all(isinstance(p, str) for p in parts):
+            raise RelayError("Grok returned an invalid text event.")
+        # Text events are streamed deltas; Grok's own json output joins them without separators.
+        answer = "".join(parts)
+        metadata = {
+            key: first_result[key]
+            for key in ("sessionId", "requestId", "usage", "num_turns", "total_cost_usd")
+            if key in first_result
         }
     else:
         if failed:
@@ -545,11 +619,18 @@ def _opencode_level(event: dict[str, Any]) -> int:
     return TERMINAL if event.get("type") in ("text", "error") or event.get("error") else ORDINARY
 
 
+def _grok_level(event: dict[str, Any]) -> int:
+    return TERMINAL if event.get("type") in ("text", "end", "error") else ORDINARY
+
+
 EVENT_LEVELS: dict[str, Callable[[dict[str, Any]], int]] = {
     "cursor-jsonl": _cursor_level,
     "agy-jsonl": _agy_level,
     "opencode-jsonl": _opencode_level,
+    "grok-jsonl": _grok_level,
 }
+# How a partial answer joins its pieces: Grok streams token deltas, the others whole messages.
+ANSWER_SEPARATORS = {"grok-jsonl": ""}
 
 
 def event_classifier(output: str) -> Callable[[dict[str, Any]], int] | None:
@@ -578,6 +659,8 @@ def _answer_texts(event: dict[str, Any], output: str) -> list[Any]:
     if output == "agy-jsonl":
         result = event.get("result")
         return [result.get("response")] if event.get("event") == "result" and isinstance(result, dict) else []
+    if output == "grok-jsonl":
+        return [event.get("data")] if event.get("type") == "text" else []
     part = event.get("part")
     return [part.get("text")] if event.get("type") == "text" and isinstance(part, dict) else []
 
@@ -607,5 +690,5 @@ def decode_partial(raw: str, output: str) -> str | None:
         # ValueError and RecursionError: one hostile event (huge integer, deep nesting) must not cost the rest.
         with suppress(RelayError, ValueError, RecursionError):
             return decode_response(raw, output)[0]
-    answer = "\n".join(parts).strip()
+    answer = ANSWER_SEPARATORS.get(output, "\n").join(parts).strip()
     return answer or None

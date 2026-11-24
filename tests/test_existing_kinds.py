@@ -19,11 +19,12 @@ from task_runner import run
 
 GOLDEN = ROOT / "tests" / "fixtures" / "existing_kinds.json"
 EXISTING_KINDS = ("read", "review", "patch", "chaos")
-BUNDLED = ("antigravity", "cursor", "opencode")
+BUNDLED = ("antigravity", "cursor", "grok", "opencode")
 RESPONSES = {
     "agy-jsonl": {"event": "result", "result": {"status": "SUCCESS", "response": "ok"}},
     "cursor-jsonl": {"type": "result", "subtype": "success", "is_error": False, "result": "ok"},
     "opencode-jsonl": {"type": "text", "part": {"text": "ok"}},
+    "grok-jsonl": [{"type": "text", "data": "ok"}, {"type": "end", "stopReason": "end_turn"}],
 }
 FAKE = """#!{python}
 import json, os, pathlib, re, sys
@@ -41,7 +42,9 @@ record = {{
     "env": {{key: os.environ.get(key) for key in ("OPENCODE_CONFIG_CONTENT",)}},
 }}
 pathlib.Path(os.environ["FAKE_RECORD"]).write_text(json.dumps(record), encoding="utf-8")
-print({response})
+response = {response}
+for event in response if isinstance(response, list) else [response]:
+    print(json.dumps(event))
 """
 
 
@@ -60,7 +63,7 @@ def record_invocations(directory: Path) -> dict[str, dict[str, object]]:
         adapter = json.loads((ROOT / "adapters" / f"{provider}.json").read_text(encoding="utf-8"))
         script = bin_dir / adapter["executable"]
         script.write_text(
-            FAKE.format(python=sys.executable, response=repr(json.dumps(RESPONSES[adapter["output"]]))),
+            FAKE.format(python=sys.executable, response=repr(RESPONSES[adapter["output"]])),
             encoding="utf-8",
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR)
